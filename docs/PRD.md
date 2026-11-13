@@ -1,9 +1,9 @@
 ---
 title: "Lost and Found — Product Requirements Document"
 status: final
-version: "1.2"
+version: "1.3"
 created: 2026-11-05
-updated: 2026-11-07
+updated: 2026-11-13
 ---
 
 # Lost and Found — Product Requirements Document
@@ -12,7 +12,7 @@ updated: 2026-11-07
 
 Lost and Found helps people locate belongings in offices and shared spaces using a manually operated camera robot and a laptop application. The operator supplies a reference image, drives the robot through connected rooms, and reviews AI-generated potential matches. A human decision establishes that a belonging has been found; visual similarity alone never changes its status to Found.
 
-This PRD defines the complete system for a university project assessed through a report and demonstration: application behavior, device firmware, robot movement through software, connections, records, safety, and measurable acceptance. Physical assembly, wiring, power design, charging, component selection and electrical review are Alisa-owned external work; the software project consumes the relevant hardware handoff. It is an approved requirements baseline, not evidence of implemented or qualified performance. The approved copy is maintained at `docs/PRD.md`.
+This PRD defines the software scope for a university project assessed through a report and demonstration: the application, AI, device firmware, motion commands, software integration, records, stopping/recovery behavior, and measurable acceptance. Physical wiring and assembly are handled externally by Alisa. This requirements baseline includes the authorized 2026-11-13 amendment in section 9; it is not evidence of implemented or qualified performance. The canonical copy is maintained at `docs/PRD.md`.
 
 ## 2. User and operating boundary
 
@@ -127,7 +127,7 @@ Acceptance: reconnection alone never restarts movement. Resume cannot bypass an 
 
 **FR-18 — Show an obstacle proximity warning.** During Searching, use the HC-SR04 to show a silent on-screen warning when an obstacle is within a calibrated warning distance. The warning is advisory only: it does not stop, pause, or steer the robot. Clear it after the sensor consistently reports a clear path.
 
-Acceptance: the warning distance and clear condition are set through controlled testing before movement qualification; no arbitrary distance is assumed. Sensor data or warning faults never masquerade as a confirmed clear path.
+Acceptance: the warning distance and clear condition are calibrated and verified through controlled integration tests; no arbitrary distance is assumed. Sensor data or warning faults never masquerade as a confirmed clear path. Synthetic readings verify warning logic but do not establish real distance accuracy.
 
 ## 5. Cross-cutting requirements
 
@@ -138,13 +138,13 @@ Acceptance: the warning distance and clear condition are set through controlled 
 | NFR-3 | Support Windows on the team's laptop with a dedicated NVIDIA GPU. | Record exact laptop/GPU specifications; qualify on that laptop. |
 | NFR-4 | Persist local records/evidence until registration-based retention expires; default seven days. | Restart and expiry checks under FR-13/FR-15. |
 | NFR-5 | Furnished-room testing uses stationary obstacles, people clear of the path, and visible floor/low-shelf targets. | Record layout and object placements with acceptance evidence. |
-| NFR-6 | Stop, video, detection, and endurance targets apply to the complete system. | Execute section 7; isolated component results do not establish a pass. |
+| NFR-6 | Stop, video, detection, and application-stability targets require the evidence specified in section 7. Physical wheel stopping and battery endurance remain external product integration targets. | Record software verification separately from real-device measurements; isolated component or simulator results do not establish a complete-system pass. |
 
 ## 6. Scope and constraints
 
 ### In scope
 
-Four-wheel manual movement; laptop-webcam gestures; PS4 DualShock 4 control; live robot video; HC-SR04 proximity warning; reference-image target selection; similarity alerts/bounding boxes; screenshot review; confirmation/rejection; session controls; emergency stop/failure recovery; local searchable history; configurable retention; offline runtime.
+Manual forward/backward/left/right/stop commands; laptop-webcam gestures; PS4 DualShock 4 control; live robot video; HC-SR04 proximity warning; reference-image target selection; similarity alerts/bounding boxes; screenshot review; confirmation/rejection; session controls; emergency stop/failure recovery; local searchable history; configurable retention; offline runtime.
 
 ### Non-goals
 
@@ -153,39 +153,38 @@ Four-wheel manual movement; laptop-webcam gestures; PS4 DualShock 4 control; liv
 - Concurrent operators, robots, or targets; changing control mode within a session.
 - Public/social sharing, cloud accounts, and operating systems beyond Windows.
 
-### Delivery responsibilities and software-facing equipment
+### Delivery context and required software capabilities
 
 As of 2026-11-06, Alisa reported a four-week completion window. The conditional planning target is 2026-12-04 if that window starts on 2026-11-06; the exact assessment date remains unconfirmed. The final result is demonstrated through supervised manual testing.
 
-On 2026-11-07, Alisa assigned all physical assembly, wiring, power design, charging, component selection and electrical review to herself outside the software execution backlog. Any associated human approvals remain her responsibility. This ownership statement does not assert that hardware is ready. Software development may use clearly labeled fixtures/simulators without waiting for hardware; real-device activities require the relevant T2 handoff.
+Software development can proceed with clearly labeled fixtures and simulators without devices. Real-device software integration checks selected endpoints, protocol versions and firmware compatibility at T2; it does not require a physical-work handoff.
 
-| Software-facing dependency | Required capability / handoff |
+| Software capability | Required interface behavior |
 | --- | --- |
-| Windows laptop with NVIDIA GPU | Reported LOQ 15IRH8, Windows 11 Pro, RTX 4050, 16 GB RAM; record actual environment and measured compatibility at T1/T3. |
-| Laptop webcam | Fresh gesture frames under backend ownership. |
-| PS4 DualShock 4 | Actual CUH unit/profile, D-pad and Circle mapping, connection behavior; PS5 remains out of scope. |
-| Arduino Uno, HC-05 and motor output interface | Versioned serial command/response path, supplied pin/output mapping and operating limits, disabled outputs on boot/reset and independent command expiry. |
-| ESP32-CAM OV2640 | Programming access and local Wi-Fi endpoint; custom firmware supplies capture identity, freshness metadata and clock-age exchange. Exact variant comes from the handoff. |
-| HC-SR04 | Supplied access/telemetry arrangement and validity information for FR-18; warning/clear criteria are calibrated, not inferred. |
-| Supplied four-wheel robot and network | Identifiable hardware configuration and scoped readiness from Alisa; command/video coverage and physical performance require integrated measurement. |
-
-The [Phase 01 handoff specification](specs/PHASE-01-device-interface-handoff-spec.md) defines the software-facing record. Firmware consumes supplied pin assignments rather than inventing wiring. Physical hardware details retained in the [superseded baseline archive](archive/software-scope-transition-2026-11-07/README.md) are historical references, not current ratings or software tasks.
+| Local application and AI runtime | Windows/NVIDIA compatibility, local models/assets and offline operation; exact environment verified at T1/T3. |
+| Motion commands | Versioned command/response path to Uno firmware through HC-05 serial; logical direction/stop handling, disabled output state on boot/reset, independent command expiry and explicit recovery. |
+| Camera frames | Fresh laptop-webcam frames for gestures and ESP32-CAM frames for search; capture identity, freshness metadata, clock-age exchange and visible stale-feed handling. |
+| Controller input | Selected PS4 DualShock 4 identity/profile, D-pad/Circle mapping, fresh samples and disconnect handling; PS5 remains out of scope. |
+| Proximity observations | Distance units, validity and freshness for HC-SR04 telemetry; calibrated warning/clear criteria for FR-18. |
+| Connection status | Selected serial/video/input endpoints, compatibility errors and recovery state; command/video coverage is measured on the connected-room route. |
 
 ## 7. Success metrics and acceptance protocol
 
-These are selected targets, not measured capabilities. Use the prescribed hardware, selected laptop, and recorded connected-room route. All functional requirements must also pass.
+These are selected targets, not measured capabilities. All functional requirements must also pass. Label evidence as software/simulator verification or real-device integration measurement, with the selected laptop, endpoints, versions and conditions. Section 9 records the acceptance wording amendment; no simulator result establishes physical performance.
 
 | ID | Target and method | Supports |
 | --- | --- | --- |
 | SM-1 | Five agreed test objects, ten clearly visible presentations each. Per object, at least seven must produce an alert within three seconds of clear visibility in live view. Record misses/late alerts. | FR-1, FR-2, FR-9 |
 | SM-C1 | Ten separate ten-second scenes with no visually similar target. At most one scene may produce any false alert; count an alerted scene once. | FR-9; counterbalances SM-1 |
-| SM-2 | Wheels stop within 0.5 seconds of input release, emergency stop, or actual loss of a required command/input/video path, including loss-detection time. | FR-5, FR-6, FR-7, FR-17 |
-| SM-3 | Complete system runs twenty minutes without recharge, restart, or crash, exercising movement, video, AI, review, and history. | FR-3–FR-13, NFR-6 |
+| SM-2 | External product integration target: wheels stop within 0.5 seconds of input release, emergency stop, or actual loss of a required command/input/video path, including loss-detection time. Software verification separately measures permission revocation, command expiry and logical stop output; it does not prove wheel stopping. | FR-5, FR-6, FR-7, FR-17 |
+| SM-3 | Software acceptance: the application runs twenty minutes without restart or crash, exercising movement commands, video, AI, review and history. Record whether inputs are simulated or device-connected. The original twenty-minute operation without recharge remains an external battery-endurance target, outside software implementation and separately measured. | FR-3–FR-13, NFR-6 |
 | SM-4 | Camera events appear in laptop live view within 0.5 seconds while movement control and AI are active. | FR-3, FR-7 |
 
 Before SM-1/SM-C1, freeze the objects, reference images, placements, lighting, and matching settings. Negative scenes must not contain similar candidates the product is intended to suggest. Use fresh presentations/sessions as needed so rejection suppression does not contaminate counts. Record every trial, including failures.
 
-For SM-2, test every direction in both modes, emergency stop in both modes, active-input disconnection, command loss, and disconnected/frozen video. Measure observable event/wheel timing; reconnection must also pass FR-17. For SM-4, record an observable camera event and laptop display together. Identify equipment/conditions with all results.
+For SM-2 software verification, test every direction in both modes, emergency stop in both modes, active-input disconnection, command loss, and disconnected/frozen video. Record detection, revocation, transport/expiry and logical output timestamps, including queued/replayed commands and backend failure. Reconnection must also pass FR-17. The 0.5-second target is not reassigned as a software-only limit: external integration measurement must include observable event-to-wheel-stop timing and mechanical stopping. Software traces alone cannot close SM-2.
+
+For SM-3, record application interruptions and the input source during the twenty-minute software run. A simulator run verifies stability only under its recorded load; it cannot prove device coverage, video latency or battery endurance. For SM-4, record an observable camera event and laptop display together under the specified load. Identify equipment/conditions with all results.
 
 The room-to-room demonstration must keep the operator at the fixed desk, maintain video/control along the route, and search in more than one room. A same-room demonstration alone does not establish NFR-2. Record route dimensions and connection arrangement before qualification.
 
@@ -197,20 +196,18 @@ Verify FR-18 during controlled integration: the warning is visible, silent, self
 | --- | --- | --- |
 | Exact assessment date and any additional submission instructions | Team; confirm with supervisor. | Four-week planning window and supervised manual demonstration are recorded; calendar assessment date remains pending. |
 | Exact laptop/GPU/Windows and controller unit | Team; establish before qualification. | LOQ 15IRH8, Windows 11 Pro, RTX 4050, 16 GB RAM and PS4 DualShock 4 are reported; support/performance remain unqualified until measured. |
-| External hardware readiness | Alisa; scoped T2 handoff before each relevant real-device activity. | Physical construction, wiring, power, charging, component decisions and electrical review are externally owned. Record configuration identity, supplied interface details, programming access, permitted activity and unresolved restrictions. Missing hardware does not block independent software development. |
-| Firmware/output interface compatibility | Software/firmware team with supplied configuration from Alisa; T1/T6 before device acceptance. | Pin assignments, direction/disabled behavior and operating limits must be supplied. Unknown values block the affected board-specific work; logical output reports do not prove physical wheel movement or stopping. |
-| Fixed-desk two-room coverage, 0.5-second stops/video, twenty-minute endurance | Team; conduct controlled integration trials. | Two adjacent rooms and local Wi-Fi are reported; coverage and performance remain unqualified. |
-| Obstacle-warning distance and clear threshold | Software/integration team; T4/T6 controlled tests before movement qualification. | Consume the supplied forward-facing HC-SR04 arrangement. Calibrate separate warning/clearing distances at the selected indoor speed. Silent visual advice only; invalid readings are unknown, never clear. |
+| Device interface configuration and compatibility | Software/firmware team; T2 before accepting the affected device connection, with T1/T6 runtime and protocol locks. | Record selected endpoints/device identities, firmware build targets, protocol versions and validation/errors. Unknown or incompatible configuration blocks the dependent software connection; independent development continues with labeled simulators. Logical output reports do not prove wheel movement or stopping. |
+| Fixed-desk two-room coverage, 0.5-second stops/video, twenty-minute stability | Team; controlled software and integration trials with evidence separated as in section 7. | Two adjacent rooms and local Wi-Fi are reported; coverage, latency and wheel stopping remain unqualified. Battery endurance is an external measurement. |
+| Obstacle-warning distance and clear threshold | Software/integration team; T4/T6 controlled integration tests. | Validate distance units, validity/freshness and separate warning/clearing criteria. Silent visual advice only; invalid readings are unknown, never clear. |
 | Five objects, references, route, lighting/placements | Team with doctor; freeze before qualification. | Defines the conditions where detection results apply. |
 | Input calibration, actual controller profile, UI layout and matching settings | Team; measure/verify before functional testing. | Direction/button mappings and image-format limits are already adopted in the architecture/TRD; remaining thresholds and equipment behavior need qualification. |
 
 AI failure, backend restart and unreviewed Stop outcomes are resolved by AD-6/TRD section 5; they are not deferred product decisions. Robotics-lab visual direction and the proposed accessibility targets were accepted during the 2026-11-06 interview; detailed visual choices and implemented accessibility evidence remain pending.
 
-The 2026-11-07 responsibility change supersedes earlier hardware-first scheduling and electrical-design tasks. T2 is an external handoff, not a software-authored electrical review. T1/T3–T7 and all complete-system measurements remain open where unverified. Hardware ownership, a successful connection or a supplied configuration does not establish a product acceptance pass.
+T2 now checks software interface configuration and compatibility. T1–T7 and integration measurements remain open where unverified. Alisa reports motors and Bluetooth working; that report does not establish camera freshness, watchdog/recovery behavior, connected-room coverage or any full product acceptance pass.
 
 ## 9. Approval
 
-Version 1.0 was approved by Alisa on 2026-11-05. Version 1.1 records Alisa's 2026-11-06 scope and inventory decisions: PS4-only controller support (supervisor-approved), the purchased hardware, and the advisory HC-SR04 warning. This amendment does not close T2 or establish measured performance. The former electrical-work allocation is superseded by v1.2; warning calibration and measured performance remain pending.
+Version 1.0 was approved by Alisa on 2026-11-05. Version 1.1 records the 2026-11-06 decisions for PS4-only support (supervisor-approved) and the advisory HC-SR04 warning. Version 1.2 records Alisa's 2026-11-07 approval of the complete software scope and external ownership of physical work. Those approvals apply to their dated baselines.
 
-
-Version 1.2 records Alisa's explicit 2026-11-07 approval of the complete software scope and external hardware ownership. It supersedes the earlier wiring/procurement work allocation and hardware-first scheduling. FR-1–FR-18, NFR-1–NFR-6 and all five metric targets remain required; no readiness or performance pass is claimed.
+Version 1.3 implements Alisa's approved cleanup plan on 2026-11-13. It removes physical-work procedures and handoff dependencies from the three core documents and replaces T2 with software interface configuration/compatibility. FR-1–FR-18, NFR-1–NFR-6 and metric IDs are retained. NFR-6 and SM-2/SM-3 now explicitly distinguish software verification from external measurements: the 0.5-second wheel-stop target remains an external integration target; the twenty-minute application stability criterion is separate from the original no-recharge battery-endurance target. This is a current acceptance wording amendment, not a claim that the new wording was approved in earlier versions or that physical targets have passed. Warning calibration, integration measurements and other unverified gates remain pending.

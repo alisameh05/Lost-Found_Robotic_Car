@@ -1,9 +1,9 @@
 ---
 title: "Lost and Found — Technical Requirements Document"
-version: "1.2"
+version: "1.3"
 status: final
 created: 2026-11-05
-updated: 2026-11-07
+updated: 2026-11-13
 audience: Implementation team
 architecture: ARCHITECTURE.md
 requirements: PRD.md
@@ -14,18 +14,18 @@ qualification: Pending; explicit gates T1–T7
 
 ## 1. Purpose, authority and readiness
 
-This TRD defines the implementation contract for the Windows laptop application and manually driven camera robot. It covers presentation, backend services, local records, device connections, stopping, security, deployment and measurable acceptance. It describes required behavior, not an existing implementation or a qualified hardware system.
+This TRD defines the software implementation contract for the Windows laptop application, AI, firmware and logical device interfaces of the manually driven camera robot. It covers presentation, backend services, local records, software connections, stopping/recovery, security, deployment and measurable acceptance. It describes required behavior, not an existing implementation or a qualified complete system. Physical wiring and assembly are handled externally by Alisa.
 
 Read sources in this order:
 
-1. [Approved PRD v1.2](PRD.md): scope, FR-1–FR-18, NFR-1–NFR-6 and success metrics.
-2. [Architecture decision record](ARCHITECTURE.md): AD-1–AD-14 adopted by Alisa on 2026-11-05 and AD-15 adopted on 2026-11-06. This is the technical source of truth.
+1. [PRD v1.3](PRD.md): scope, FR-1–FR-18, NFR-1–NFR-6 and success metrics, including the authorized 2026-11-13 acceptance wording amendment in section 9.
+2. [Architecture v1.3](ARCHITECTURE.md): AD-1–AD-14 adopted by Alisa on 2026-11-05 and AD-15 adopted on 2026-11-06, with dated amendments to AD-3/AD-5/AD-14 on 2026-11-13. This is the technical source of truth.
 3. This TRD: detailed contracts derived under Alisa's explicit authorization.
-4. [EXPERIENCE.md](../_bmad-output/planning-artifacts/ux-designs/ux-Robotics-2026-11-05/EXPERIENCE.md) and [DESIGN.md](../_bmad-output/planning-artifacts/ux-designs/ux-Robotics-2026-11-05/DESIGN.md): application flows and functional visual guidance. Their stated assumptions remain proposals unless adopted below. Branding is still deferred.
+4. Historical UX inputs: `EXPERIENCE.md` and `DESIGN.md` were referenced under `_bmad-output/planning-artifacts/ux-designs/ux-Robotics-2026-11-05/`. They are absent from the tracked baseline. The adopted flow, input and accessibility rules are retained in sections 4–6 and 12; this contract does not depend on retrieving those missing artifacts. Branding is still deferred.
 
-This session resolved UX G1–G3 through AD-6, input/image rules in G4 through AD-10/AD-11, and G5 through AD-9. PRD v1.1 and AD-15 record the PS4-only, purchased-inventory and advisory proximity-warning decisions. G4 thresholds/device qualification, G6 branding/accessibility qualification and G7 equipment/performance remain explicit gates. The active UX pair is reconciled to these decisions; its prior snapshot and dated reviews remain historical references. The addendum's former stack proposals are adopted only to the extent explicitly recorded in AD-2/AD-8. Original component PDFs/photos are historical product references; PRD v1.2 defines software scope and externally supplied device dependencies.
+The earlier design session resolved UX G1–G3 through AD-6, input/image rules in G4 through AD-10/AD-11, and G5 through AD-9. PRD v1.1 and AD-15 record the PS4-only and advisory proximity-warning decisions. G4 thresholds/device qualification, G6 branding/accessibility qualification and G7 equipment/performance remain explicit gates. Historical UX proposals apply only where explicitly adopted here; PRD v1.3 and architecture v1.3 govern this software contract. The addendum's former stack proposals are adopted only to the extent explicitly recorded in AD-2/AD-8.
 
-Alisa authorized completion with the section 13 gates open. Software and simulator development can proceed against this contract. Real-device activities await their scoped T2 handoff and applicable software gates; assessed acceptance still requires measured complete-system results. Physical work and electrical reviews are Alisa-owned external responsibilities. A failure to meet a target requires evidence and an explicit requirement/architecture revision, not a smaller demonstration presented as a pass.
+Alisa authorized documentation completion with the section 13 gates open and the 2026-11-13 cleanup plan implemented here. Software and simulator development can proceed independently of device availability. Device-connected software checks T2 interface configuration/compatibility and the applicable runtime, firmware and protocol gates. Assessed acceptance requires the software and real-device evidence specified in PRD section 7; simulator results cannot establish wheel stopping, battery endurance or room-to-room coverage. A failure to meet a target requires evidence and an explicit requirement/architecture revision, not a smaller demonstration presented as a pass.
 
 ## 2. Operating scope and technology stack
 
@@ -44,7 +44,7 @@ No autonomous navigation, obstacle avoidance/steering, servo functionality, mapp
 | Candidate matching | Ultralytics YOLOE visual prompting, PyTorch | Prompt with the selected reference region; use the laptop's NVIDIA GPU after compatibility and performance checks. Exact checkpoint/settings at T1/T5. |
 | Controller | Pygame/SDL | Backend reads the selected PS4 DualShock 4 and handles hotplug/disconnect. Qualify the actual device mapping. |
 | Movement connection | pySerial; HC-05 Bluetooth serial | Bounded command/response I/O to Arduino; no browser Bluetooth requirement. |
-| Firmware | Arduino Uno firmware; ESP32-CAM firmware | Command-expiry stopping; camera acquisition/freshness metadata and local video. Toolchain/board-core versions at T1/T6; board identity supplied at T2. |
+| Firmware | Arduino Uno firmware; ESP32-CAM firmware | Command-expiry stopping; camera acquisition/freshness metadata and local video. Toolchain/board-core versions at T1/T6; selected identity and firmware build target at T2. |
 
 No exact package/runtime combination has been approved or installed by this document. AD-8 expressly defers that lock until early laptop benchmarking. T1 records exact versions, dependency locks, GPU/runtime compatibility, model files and checksums. All required models, fonts, scripts and frontend assets are installed locally. Neither development nor release may add a mandatory hosted inference service.
 
@@ -76,15 +76,15 @@ flowchart TB
     Cam[ESP32-CAM: local Wi-Fi video] --> Devices
     Devices --> HC[HC-05 Bluetooth serial]
     HC --> Uno[Uno: expiring command permission]
-    Uno --> Driver[L298N and four-wheel chassis]
+    Uno --> Output[Logical direction and stop output]
 ```
 
-This is a software/data topology, not an approved electrical diagram. PRD section 6 defines the software-facing device dependencies. Section 6.5 defines the external hardware handoff; historical electrical inventories are not current implementation inputs.
+This software/data topology ends at firmware and logical output interfaces. PRD section 6 defines the required software capabilities. Section 6.5 defines device interface configuration and compatibility; no physical-work handoff is an implementation dependency.
 
 | Unit | Owns | Must not do |
 | --- | --- | --- |
-| Browser | Screens, image/ROI editing, accessibility, display transforms, visible/focused workspace heartbeat and displayed-frame acknowledgment | Open hardware, write records, assert Found, manufacture freshness, or grant motor permission locally |
-| Next.js server | Local frontend rendering/assets and automatic launch bootstrap | Write SQLite, run an independent search state machine or expose hardware controls as a second backend |
+| Browser | Screens, image/ROI editing, accessibility, display transforms, visible/focused workspace heartbeat and displayed-frame acknowledgment | Open device connections, write records, assert Found, manufacture freshness, or grant motor permission locally |
+| Next.js server | Local frontend rendering/assets and automatic launch bootstrap | Write SQLite, run an independent search state machine or expose device controls as a second backend |
 | API/session coordinator | Backend-issued IDs, state transitions, readiness, controlling-client lease, latches, validation and ordered actions | Trust a browser's claimed eligibility or a worker's stale result |
 | Motion safety gate | Immediate permission revocation, fresh-input arbitration, command renewal and loss deadlines | Wait for AI inference, media encoding, database commit, Next.js rendering or an ordinary action queue to stop |
 | Data writer/cleanup coordinator | Serialized transactions, idempotent writes, evidence preparation, retention and recovery | Treat SQLite and filesystem operations as one atomic transaction |
@@ -92,7 +92,7 @@ This is a software/data topology, not an approved electrical diagram. PRD sectio
 | Device adapters | Device observations, bounded buffers, source timestamps, connection generations and failures | Convert reconnection into Resume or reuse the previous movement command |
 | Uno firmware | Default-disabled outputs, bounded parser, command expiry, stop handling and handshake | Continue a last direction indefinitely or accept an obsolete command as fresh |
 
-Use a single backend owner lock for the configured data directory and physical devices. A second backend instance refuses ownership. One browser lease can control the active session; another tab may read state but cannot silently take control. Transfer after disconnect requires explicit acquisition, restoration/acknowledgment and Resume; it never auto-rearms motion.
+Use a single backend owner lock for the configured data directory and device connections. A second backend instance refuses ownership. One browser lease can control the active session; another tab may read state but cannot silently take control. Transfer after disconnect requires explicit acquisition, restoration/acknowledgment and Resume; it never auto-rearms motion.
 
 The coordinator serializes logical state changes and submits disk work to the sole write owner. Safety permission can be revoked immediately without waiting on that disk work. If the durable state cannot be updated, the effective operational state is stopped/Paused with a storage failure; the UI must distinguish this from a successfully saved outcome. Restart reconciles durable unfinished sessions under section 5.
 
@@ -173,35 +173,35 @@ While Searching, permit movement only when both backend acquisition freshness an
 
 Use three independent revocation points: browser workspace lease, backend safety gate and Uno command-expiry watchdog. An ordinary REST request cannot authorize indefinite movement. Every movement renewal requires currently healthy gates, fresh selected-mode held input and a valid session/control generation. STOP has priority and bypasses ordinary revision-conflict handling.
 
-The serial protocol is versioned and bounded. Commands include boot/control generation, strictly increasing sequence, direction and a device-issued expiring challenge. Uno accepts a challenge only before its own monotonic deadline and never extends that deadline because an old packet arrived. Stop/expiry invalidates the armed generation; stale/queued/replayed movement frames cannot rearm it. Initial Start and fault recovery require their approved user gates, then neutral input and a fresh hold. An ordinary release/recognition stop while otherwise healthy Searching does not latch a fault: the backend may perform a new generation/ARM handshake for the next neutral-then-fresh hold without Pause/Resume. An emergency, expired command or required-path failure never uses that ordinary rearm path. Check framing/integrity and ranges before updating permission; invalid/oversized/partial packets do not refresh the watchdog. Stop outputs on boot/reset, loss of valid renewal or parser failure. Protocol encoding, maximum packet length, serial rate, timers and motor output behavior are frozen at T6 for the selected hardware.
+The serial protocol is versioned and bounded. Commands include boot/control generation, strictly increasing sequence, direction and a device-issued expiring challenge. Uno accepts a challenge only before its own monotonic deadline and never extends that deadline because an old packet arrived. Stop/expiry invalidates the armed generation; stale/queued/replayed movement frames cannot rearm it. Initial Start and fault recovery require their approved user gates, then neutral input and a fresh hold. An ordinary release/recognition stop while otherwise healthy Searching does not latch a fault: the backend may perform a new generation/ARM handshake for the next neutral-then-fresh hold without Pause/Resume. An emergency, expired command or required-path failure never uses that ordinary rearm path. Check framing/integrity and ranges before updating permission; invalid/oversized/partial packets do not refresh the watchdog. Stop outputs on boot/reset, loss of valid renewal or parser failure. Protocol encoding, maximum packet length, serial rate, timers and logical direction/stop output behavior are frozen at T6 for the selected firmware build target. Board-specific code settings, including speed/PWM configuration, remain versioned build configuration.
 
 The Uno response identifies firmware/protocol version, boot generation, challenge, accepted sequence and logical output/armed state. This reports commanded output, not sensed wheel movement; no encoder/stop telemetry is assumed. A missing/invalid command acknowledgment causes backend failure handling. The firmware loop must remain nonblocking so command expiry is checked even if a message never completes.
 
-For every SM-2 path, qualify a worst-case budget from the actual release/loss event to wheels stopped:
+For every SM-2 path, software verification measures loss/input detection, permission revocation, transport or last-valid-device-lease expiry, and logical output change. Exercise backend termination, queued/replayed packets and missing acknowledgments independently; a fast explicit STOP is insufficient. Record whether timing comes from simulation or the selected firmware/device. No software-only 0.5-second limit replaces the wheel-stop requirement.
+
+External product integration must measure the full SM-2 budget from the actual release/loss event to wheels stopped:
 
 `loss/input detection + permission revocation/transport or last-valid-device-lease expiry + output change + measured mechanical stopping <= 0.5 seconds`.
 
-Conservatively include outstanding valid challenges/commands, scheduling delay and clock-age uncertainty. Backend failure and queued-message cases must pass independently; a fast explicit STOP is not enough. Timers cannot each consume the full 0.5-second allowance. T6 selects measured component budgets with positive remaining margin and records every number; no numeric watchdog value or stopping capability is asserted here.
+Conservatively include outstanding valid challenges/commands, scheduling delay and clock-age uncertainty. Timers cannot each consume the full 0.5-second allowance, and the software allocation must leave margin for mechanical stopping. T6 records measured component timings and their allocation; the full target remains unverified until external event-to-wheel measurements establish positive remaining margin. Logical output reports do not prove wheel stopping. No numeric watchdog value or stopping capability is asserted here.
 
 ### 6.4 Advisory proximity warning
 
-The HC-SR04 supplies proximity observations for FR-18 and is mounted facing forward. Alisa supplies the sensor access/pin arrangement through T2; firmware and telemetry encoding are implemented and frozen at T6. Software does not select a physical connection topology. T4 calibrates separate warning and clearing distances at the selected indoor speed to prevent flicker; no distance is inferred from the component photos. The workspace displays a silent warning and clears it only after valid readings meet the tested clear condition. Missing/invalid readings are unknown, never clear. This advisory path has no authority over movement, session state or motion readiness.
+The HC-SR04 telemetry supplies proximity observations for FR-18. T2 identifies the configured observation endpoint and compatible message version; T6 defines bounded distance units, validity, sample identity and freshness handling. T4 calibrates separate warning and clearing distances and a consistent-clear condition through controlled integration tests to prevent flicker. Synthetic readings verify threshold/clearing logic, not real distance accuracy. The workspace displays a silent warning and clears it only after fresh valid readings meet the tested clear condition. Missing, stale or invalid readings are unknown, never clear. This advisory path has no authority over movement, session state or motion readiness.
 
-### 6.5 External hardware handoff (T2)
+### 6.5 Device interface configuration and compatibility (T2)
 
-Physical assembly, wiring, power design, charging, component selection and electrical review are Alisa-owned external work. Software agents do not recreate those tasks. Use the [Phase 01 specification](specs/PHASE-01-device-interface-handoff-spec.md) to record a scoped handoff, separately for camera, command/output and sensor paths where possible.
+Configure and validate each software connection independently. T2 defines compatibility inputs for adapters and firmware; it does not certify physical performance.
 
-| Record | Required information |
+| Configuration | Required software information and checks |
 | --- | --- |
-| Identity | Actual board/camera/controller/sensor variants, hardware configuration ID/revision, Alisa as supplying owner and record date. |
-| Firmware-facing configuration | Supplied pin assignments, motor direction/output mapping, disabled/reset behavior, operating limits and sensor access/telemetry arrangement with validity information. These are received configuration, not a wiring design authored by software. |
-| Access | Programming method and selected board target, Windows serial identity/settings where supplied, camera endpoint and protected local-network setup. Store credentials outside Git. |
-| Permitted activity | Alisa's readiness statement identifying programming, stationary device testing or controlled movement, relevant subsystem/configuration and restrictions. Movement additionally requires Phase 12/T4/T6 entry gates. |
-| Unknowns and changes | Missing information, owner, affected activity, next action and superseded configuration. A changed identity, mapping, limit or permitted activity invalidates affected prior handoff/test evidence until reconciled. |
+| Selected endpoints and identities | Windows serial identity/settings for the selected HC-05/Uno path, ESP32-CAM stream endpoint, selected webcam/controller profile and proximity observation endpoint. Keep credentials in protected local configuration outside Git. |
+| Firmware build compatibility | Selected Uno/ESP32 build targets, board-core/library versions, firmware hashes and versioned code configuration. Cross-check T1/T6; logical direction/disabled/reset behavior must match the adapter contract. |
+| Protocol compatibility | Command/response and telemetry versions, frame envelope/clock-age mechanism, units and negotiated bounds. Reject unsupported required-path versions before arming motion. Reject incompatible proximity messages as unknown observations without changing motion readiness. |
+| Validation and errors | Check identity/generation, framing, payload lengths, field types/ranges, sequence/challenge expiry, timestamps and acknowledgment semantics. Required-path incompatibility leaves the path unavailable and motion disarmed; malformed proximity data remains unknown under section 6.4. Report actionable compatibility errors without secrets. |
+| Changes and evidence | Record configuration revision, observed versions, affected adapter and test result. Changed endpoints/builds/protocols invalidate affected compatibility evidence until rechecked. Connection success alone is not functional or performance qualification. |
 
-No handoff or readiness statement is recorded yet. Do not assume that external ownership means completion. Missing information blocks only the work that consumes it: camera readiness can permit stationary camera tests while the command path remains blocked. Software development, parser tests, synthetic telemetry and frame fixtures can proceed without physical devices. Simulated output is not actual hardware feedback. Successful programming/communication, handoff acceptance and integrated qualification are separate results.
-
-Keep outputs disabled during stationary device work. No application-driven movement occurs before Phase 12. Hardware faults or incompatible supplied interfaces are reported to Alisa with configuration and observed symptoms; physical redesign remains external.
+Missing or incompatible configuration blocks only the software connection that consumes it. Application, AI, parser/protocol tests, synthetic telemetry and frame fixtures can proceed without devices. Label simulator results explicitly; simulated output is not device feedback. A successful firmware build, a compatible connection, software behavior checks and complete product measurements are distinct results. Keep all runtime arming, expiry and recovery rules in sections 5–6 regardless of connection source.
 
 ## 7. Database schema and relationships
 
@@ -311,7 +311,7 @@ Every recovery occurrence has a unique backend-issued `failure_id`, owning nulla
 | PS4 DualShock 4 | Selected device identity/profile, D-pad/Circle state, connection generation and sample age | Disconnect pauses; unknown mapping blocks readiness; another controller does not silently replace it |
 | HC-05/Uno | Paired Windows serial port; versioned expiring protocol in section 6 | Missing/invalid responses or new Uno boot invalidate readiness and latch recovery |
 | ESP32-CAM | Existing protected Wi-Fi, bounded frame envelope and clock-age exchange | Capture/display staleness or uncertain timing stops/pauses; reconnect alone does not Resume |
-| HC-SR04 | Supplied T2 sensor access arrangement; bounded T6 observations with distance units and validity; calibrated T4 warning/clear criteria | Missing/invalid data is unknown, never clear. Advisory feedback cannot change motion, session or readiness state |
+| HC-SR04 | Configured T2 observation endpoint/version; bounded T6 observations with distance units, validity and freshness; calibrated T4 warning/clear criteria | Missing/stale/invalid data is unknown, never clear. Advisory feedback cannot change motion, session or readiness state |
 | YOLOE/MediaPipe assets | Locally installed approved files/checksums and reproducible configuration | Missing/corrupt/incompatible assets block Start; runtime AI failure stops/pauses; no online fallback |
 
 No runtime SaaS integration, cloud database, email, public API or telemetry upload is required. Logs support local troubleshooting and acceptance evidence; they do not publish video or reference images.
@@ -340,7 +340,7 @@ Use parameterized queries, escaped object names, allowlisted formats, content/si
 
 ### 10.5 Devices and network
 
-Use the selected paired HC-05 and configured camera endpoint on the protected local network. Store Wi-Fi/device secrets outside source control and ordinary logs. Pairing and Wi-Fi protection do not by themselves prove authenticated or encrypted application video/serial traffic; validate the supplied device identities/access and selected network at T2/T3 and restrict local access. No public port forwarding or new network hardware is authorized. Untrusted or incompatible device messages fail closed.
+Use the selected paired HC-05 and configured camera endpoint on the protected local network. Store Wi-Fi/device secrets outside source control and ordinary logs. Pairing and Wi-Fi protection do not by themselves prove authenticated or encrypted application video/serial traffic; validate selected identities, endpoint access and protocol compatibility at T2/T3 and restrict local access. No public port forwarding is authorized. Untrusted or incompatible required-path messages fail closed; invalid proximity observations remain unknown without motion authority under section 6.4.
 
 ### 10.6 Assets and maintenance
 
@@ -350,8 +350,8 @@ Pin dependencies/model hashes and retain applicable license notices, including t
 
 | Concern | Required approach |
 | --- | --- |
-| Infrastructure | The Windows laptop, its existing Wi-Fi/Bluetooth connectivity and prescribed robot components. No cloud infrastructure or container platform is required. |
-| Development | Separate frontend/backend dependency environments and fixtures; development reload is permitted only with motors disabled. Never start multiple hardware-owning workers. |
+| Infrastructure | Local Windows services, existing Wi-Fi/Bluetooth endpoints, firmware connections and local model/assets. No cloud infrastructure or container platform is required. |
+| Development | Separate frontend/backend dependency environments and labeled fixtures/simulators; development reload requires motion permission revoked and firmware outputs logically disabled. Never start multiple device-owning workers. |
 | Release | Production Next.js build plus supported Node runtime, Python environment, local AI assets, schema migrations and versioned firmware. A documented Windows launcher starts both services and opens the local UI. |
 | Data layout | Under the Windows user's local application-data root, e.g. `%LOCALAPPDATA%/LostAndFound/`: SQLite, managed media/staging and minimal diagnostics. Keep live data outside source/build directories and cloud-synced project folders. Exact root is recorded in release configuration. |
 | Configuration | Nonsecret settings identify local ports, data root and device endpoints. Protected local configuration holds secrets. Qualified input/timing/model configuration is versioned with the release. No framework default establishes a safety threshold. |
@@ -364,20 +364,20 @@ Release instructions must list exact laptop/OS/GPU/driver, browser, Node/Python/
 
 ## 12. Measurable non-functional requirements and verification
 
-These are required targets and checks, not observed results. Qualification uses the complete prescribed system on the recorded laptop and route, with movement, video and AI active where specified.
+These are required targets and checks, not observed results. Retain software/simulator evidence separately from real-device integration and external physical measurements. Software checks can proceed without devices; complete-system claims require the recorded laptop, route, actual connections and specified load. PRD v1.3 section 9 records the SM-2/SM-3 and NFR-6 acceptance wording amendment.
 
 | ID / source | Required result | Verification and retained evidence |
 | --- | --- | --- |
 | SM-1 | For each of five agreed objects, at least 7/10 clearly visible presentations alert within three seconds | Fifty trial records with visibility-to-alert timing, misses/late alerts, references, placements, lighting and frozen model/settings |
 | SM-C1 | At most one alerted scene among ten separate ten-second scenes with no visually similar target | Record all ten scenes/counts; exclude similar candidates the product is intended to suggest |
-| SM-2 | Wheels stop within 0.5 seconds of release, emergency stop or actual required-path loss, including detection | Every direction in both modes; both emergency paths; selected-device, command, frozen/disconnected video failures; observable event/wheel timing and component budgets |
-| SM-3 | Twenty minutes without recharge, restart or crash | Exercise movement, video, AI, review and history continuously as a complete system; record every interruption |
+| SM-2 | External integration target: wheels stop within 0.5 seconds of release, emergency stop or actual required-path loss, including detection. Software separately verifies revocation/expiry/logical output | Software/simulator traces for every direction in both modes, both emergency paths and required-path failures, including queued packets/backend loss; label source and measured component timing. External observable event/wheel timing is required to close the full target; no software-only 0.5-second substitute |
+| SM-3 | Software acceptance: twenty minutes without application restart or crash; original twenty-minute no-recharge battery endurance remains external | Exercise movement commands, video, AI, review and history; record every interruption, load and whether inputs are simulated or device-connected. A stability pass cannot establish battery endurance; retain any external battery measurement separately |
 | SM-4 | Camera event appears in laptop live view within 0.5 seconds under movement and AI load | Record observable scene event and display together; include capture, transport, queue and render latency |
 | NFR-1 / FR-16 | All normal search and history operations work with internet disconnected after setup; no normal reference/video/evidence upload | Complete registration, both modes, review, history and restart offline; inspect required connections and absence of hosted asset/inference dependency |
 | NFR-2 | Operator remains at fixed desk while robot operates/searches in more than one connected room | Recorded route dimensions, connection arrangement and dropouts; a same-room result is insufficient |
-| NFR-3 | Qualified operation on team's Windows/NVIDIA laptop | Exact machine/OS/GPU/driver/browser and package manifest; demonstrate both controller families required by the PRD |
+| NFR-3 | Qualified operation on team's Windows/NVIDIA laptop | Exact machine/OS/GPU/driver/browser and package manifest; demonstrate gesture mode and PS4 DualShock 4 mode required by the PRD |
 | NFR-4 / FR-13/FR-15 | Unexpired committed records survive restart; expired owner data/images are actually removed with correct active grace | Restart/save-response-loss trials; startup expiry; shorten/lengthen settings; expiry during Searching/Paused and immediate eligibility denial at Ended; crash during purge |
-| NFR-5/NFR-6 | Stated stationary-obstacle/people-clear/visible-target conditions and whole-system testing | Layout, target placement and complete-system evidence; no inference benchmark alone establishes acceptance |
+| NFR-5/NFR-6 | Stated stationary-obstacle/people-clear/visible-target conditions and explicit software/integration evidence boundaries | Layout and target placement for real-device trials; software stability/timing results labeled separately from external wheel-stop/battery measurements; no inference benchmark alone establishes acceptance |
 | AD-5/AD-6/AD-13 | No uncommanded restart or duplicate terminal result | Kill browser/backend/AI worker, hide/unfocus tab, inject stale frames/commands/retries and reconnect; verify stop/latch/neutral-reapply, one session and one committed outcome |
 | AD-11 | JPEG/PNG only; 10 MiB and 20 MP limits; correct ROI after orientation/scaling | Boundary and malformed-image checks on frontend/backend; drag and keyboard selection agree in normalized pixels |
 | AD-12 | No login; services laptop-local; unauthorized web requests cannot control/change data | Check listeners, Host/origin/capability rejection, expired tokens and second-tab lease behavior |
@@ -385,7 +385,9 @@ These are required targets and checks, not observed results. Qualification uses 
 
 Freeze objects/references, placement, lighting and matching configuration before SM-1/SM-C1. Use fresh presentations/sessions as needed so rejection suppression cannot alter the counts. Record failures, not just successful trials. Test suppression across pause/resume, occlusion/continuity loss and actual exit/re-entry. Test same-session mode lock, found re-registration, corrupted/missing media and storage full/denied scenarios. For safety tests include backend process loss, delayed/queued serial packets, camera epoch change, AI overload and a browser that stops acknowledging displayed frames while its network connection remains open.
 
-No additional latency percentile, storage capacity, frame-rate or recognition confidence target is invented. T4–T6 establish reproducible settings and component timing allocations within the approved system targets. A failed target remains failed until repaired/retested or explicitly revised.
+Software/simulator verification covers protocol parsing/version rejection, command expiry, replay/queue failures, input arbitration, video-age/epoch failures, proximity validity/clearing, state transitions, offline behavior, persistence and twenty-minute stability. Repeat affected adapter/firmware checks on selected compatible devices; record build/configuration identity and actual timing. SM-1/SM-C1 recognition, SM-4 camera-to-display latency and NFR-2 connected-room coverage require their stated real-world evidence. External event-to-wheel stopping and battery endurance remain separately measured; a fixture pass cannot close either target.
+
+No additional latency percentile, storage capacity, frame-rate or recognition confidence target is invented. T4–T6 establish reproducible settings and component timing allocations within the stated targets. A failed target remains failed until repaired/retested or explicitly revised.
 
 ## 13. Open gates, owners and exit evidence
 
@@ -394,14 +396,14 @@ These are intentionally open under AD-14, not unspecified implementation default
 | Gate | Required decision/evidence | Owner and deadline |
 | --- | --- | --- |
 | T1 Runtime and dependency lock | Exact supported Windows/browser/Node/Python/packages/SQLite/GPU runtime combination; selected firmware toolchains/board cores/libraries, coordinated with T6; local asset/model inventory, hashes and license notices; reproducible environment and durable SQLite settings. Do not choose versions solely because a machine currently has them installed. | Software team; early laptop benchmark before functional implementation is baselined/tested; device toolchain lock before corresponding firmware acceptance |
-| T2 External hardware handoff for device testing | Scoped record under section 6.5: actual configuration/variants, supplied pin/output mappings and operating limits, programming/serial/camera/sensor access, Alisa's permitted-activity readiness statement and unresolved restrictions. Keep programming, stationary tests and movement scopes distinct; no software-authored electrical review is required. | Alisa supplies hardware readiness; software/integration records and checks the handoff before the affected real-device activity |
-| T3 Equipment and route | LOQ 15IRH8 / Windows 11 Pro / RTX 4050 / 16 GB, laptop camera, one PS4 DualShock 4, existing Bluetooth/Wi-Fi capability, protected network and camera endpoint, fixed-desk route through two adjacent rooms. Measure coverage on both links. | Team; early integration before route qualification |
+| T2 Device interface configuration and compatibility | Section 6.5 configuration: selected endpoints/device identities, firmware build targets/hashes, compatible command/video/telemetry versions and bounds; message validation and actionable errors. Recheck affected evidence after configuration changes. | Software/integration team; before accepting the affected device connection; fixtures proceed independently |
+| T3 Runtime environment and connected-room coverage | Verify reported LOQ 15IRH8 / Windows 11 Pro / RTX 4050 / 16 GB, selected webcam/PS4 profiles, serial/video endpoints and protected network. Measure command/video coverage with the operator at a fixed desk through two adjacent rooms. | Team; early runtime/integration checks before route acceptance |
 | T4 Input and UI operating setup | Gesture orientation/ambiguity/neutral thresholds; PS4 DualShock 4 mapping; release/reapply behavior; HC-SR04 warning/clear thresholds; camera/scaling/minimum usable operational layout; mode-independent stop accessibility. | Input/frontend team; before driving/function tests |
 | T5 Matching and continuity | YOLOE visual-prompt checkpoint, compatible assets, inference/candidate thresholds, frame policy, tracking association/exit criteria and continuity-loss recovery; freeze five objects/references/lighting/placements with supervisor. | Vision team; early benchmark and before SM-1/SM-C1 |
-| T6 Firmware, protocol and timing | Serial encoding/rate/length/sequence/challenge/lease and command acknowledgment; camera epoch/sequence/age protocol and clock uncertainty; browser display acknowledgments; motor speed/output handling, any HC-SR04 telemetry transport, and physical stop budget. Freeze exact numbers and versions, then execute end-to-end stop/video/endurance trials. | Integration/firmware team; before moving tests and assessed qualification |
+| T6 Firmware, protocol and timing | Serial encoding/rate/length/sequence/challenge/lease and acknowledgment; camera epoch/sequence/age protocol and clock uncertainty; browser display acknowledgments; firmware speed/logical output configuration and HC-SR04 telemetry validity/freshness. Freeze numbers/versions; verify expiry/revocation/failure timings and application stability. Retain component budgets for comparison with external SM-2 wheel-stop measurement; device SM-4 latency also requires measurement. | Integration/firmware team; before dependent device behavior acceptance and assessed qualification |
 | T7 Visual approval and assessment | Alisa's branding/density/icon/type choices, actual contrast/keyboard/reflow/scaling evidence, exact assessment date and final report/demo plan. | Alisa/team with supervisor; before visual sign-off and assessed demonstration |
 
-A missing or incompatible T2 handoff is reported to Alisa and blocks the affected real-device activity. Physical redesign, electrical review and any associated human approvals remain external; software agents do not procure substitutes. Independent software work continues with labeled fixtures. T3/T6 failures cannot be resolved by dropping multi-room scope or relaxing timing without explicit revision. Required measurements stay pending until performed on the recorded equipment.
+A missing or incompatible T2 configuration is reported with the affected endpoint, version and observed error; only the dependent software connection is blocked. Independent software work continues with labeled fixtures. T3/T6 failures cannot be resolved by dropping multi-room scope or relaxing timing without explicit revision. Passing T2 establishes interface compatibility only. Alisa's report of working motors/Bluetooth does not close the remaining software or product acceptance checks. Required measurements stay pending until performed under their recorded conditions.
 
 ## 14. Traceability and technical references
 
@@ -409,7 +411,7 @@ A missing or incompatible T2 handoff is reported to Alisa and blocks the affecte
 
 | Approved requirement | Technical ownership / sections | Decisions |
 | --- | --- | --- |
-| FR-1 Registration | Frontend/backend image validation, ROI and committed reference; 4, 6.1, 7–9 | AD-7, AD-11 |
+| FR-1 Registration | Frontend/backend image validation, ROI and committed reference; 4, 7–9 | AD-7, AD-11 |
 | FR-2 Single target/session | Coordinator and database active-session guard; 3, 5, 7 | AD-2, AD-13 |
 | FR-3 Split live workspace | Backend frames and UI states; 4, 6.2 | AD-2, AD-13 |
 | FR-4 Exclusive modes | Immutable session mode and selected-input arbitration; 5–7 | AD-5, AD-10 |
@@ -427,13 +429,13 @@ A missing or incompatible T2 handoff is reported to Alisa and blocks the affecte
 | FR-16 Local/no login | Offline services, shared local data and no accounts; 2, 10–11 | AD-1, AD-12 |
 | FR-17 Deliberate recovery | All causes restored/acknowledged, Resume and fresh hold; 5–6 | AD-5–AD-6 |
 | FR-18 Proximity warning | Calibrated HC-SR04 reading produces a silent advisory UI warning; clear condition is tested; no motion/session authority; 4, 6, 12 | AD-15 |
-| NFR-1–NFR-6; SM-1/SM-C1/SM-2–SM-4 | Complete verification table and explicit exit gates; 12–13 | AD-1, AD-3–AD-5, AD-8, AD-14 |
+| NFR-1–NFR-6; SM-1/SM-C1/SM-2–SM-4 | Verification table, distinct software/external evidence and explicit exit gates; 6.3, 12–13; PRD section 9 amendment | AD-1, AD-3–AD-5, AD-8, AD-14 |
 
 There is no automatic search-duration limit. No record from a Found object can be reused as a new Lost registration; use a new object ID/time/reference/selection. Stop and rejection never change a Found record back to Lost.
 
 ### 14.2 Official-source checks
 
-Checked on 2026-11-05 to verify selected technology families and mechanisms. These references do not select exact versions or establish laptop/hardware performance; T1 records the final compatibility lock.
+Technology-family checks were recorded on 2026-11-05; these sources were retained for software/protocol context, not revalidated as part of the 2026-11-13 documentation cleanup. They do not select exact versions or establish runtime/device performance; T1 records the final compatibility lock.
 
 | Technology / mechanism | Primary reference |
 | --- | --- |
@@ -446,5 +448,4 @@ Checked on 2026-11-05 to verify selected technology families and mechanisms. The
 | pySerial Windows COM and timeout behavior | [pySerial introduction](https://pyserial.readthedocs.io/en/latest/shortintro.html) |
 | OpenCV capture interface | [Official videoio source](https://github.com/opencv/opencv/blob/4.x/modules/videoio/include/opencv2/videoio.hpp) |
 | Camera local stream and source timestamps | [Espressif CameraWebServer source](https://github.com/espressif/arduino-esp32/blob/master/libraries/ESP32/examples/Camera/CameraWebServer/app_httpd.cpp) |
-| HC-05 serial role | [ITEAD manufacturer datasheet, university-hosted copy](https://eeshop.unl.edu/pdf/Bluetooth_datasheet.pdf); actual supplied variant comes from T2 |
 | Local browser origin/Host controls | [Origin header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Origin), [FastAPI middleware](https://fastapi.tiangolo.com/advanced/middleware/) |

@@ -4,10 +4,11 @@ type: architecture-spine
 purpose: build-substrate
 altitude: system
 paradigm: Layered modular application with one authoritative local service
-scope: Windows laptop application and prescribed camera robot
+scope: Windows laptop application, AI, firmware and logical device interfaces
 status: final
+version: "1.3"
 created: 2026-11-05
-updated: 2026-11-07
+updated: 2026-11-13
 binds: [FR-1–FR-18, NFR-1–NFR-6, SM-1, SM-C1, SM-2, SM-3, SM-4]
 sources: [PRD.md]
 companions: [TRD.md]
@@ -17,7 +18,7 @@ companions: [TRD.md]
 
 ## Authority and design paradigm
 
-This is the canonical technical decision record. Alisa adopted AD-1–AD-14 during the guided architecture session on 2026-11-05 and approved AD-15 on 2026-11-06. The [PRD](PRD.md) owns scope and acceptance. This record governs technical invariants; [TRD.md](TRD.md) derives the implementation contracts. A conflict requires an explicit upstream revision, never an implicit override. Documentation finalization does not establish hardware compatibility or measured performance.
+This is the canonical technical decision record. Alisa adopted AD-1–AD-14 during the guided architecture session on 2026-11-05 and approved AD-15 on 2026-11-06. Version 1.3 implements the authorized 2026-11-13 scope cleanup, amending AD-3/AD-5/AD-14 and the acceptance evidence boundary under [PRD v1.3](PRD.md), section 9. Earlier adoption dates do not imply prior approval of these amendments. The PRD owns scope and acceptance. This record governs technical invariants; [TRD v1.3](TRD.md) derives the implementation contracts. A conflict requires an explicit upstream revision, never an implicit override. Documentation finalization does not establish device compatibility or measured performance.
 
 Use a **layered modular application with one authoritative local service**. Next.js owns presentation. FastAPI owns application state and coordinates adapters for devices, AI and storage. AI runs in a separate worker process and cannot command motors or mutate records. Arduino owns the final command-expiry stop. Implementation contracts below these boundaries live in the TRD.
 
@@ -30,11 +31,11 @@ flowchart LR
     API --> INPUT[Laptop webcam and controller adapters]
     API --> SERIAL[HC-05 command adapter]
     SERIAL --> UNO[Arduino command watchdog]
-    UNO --> MOTORS[L298N and 4WD motors]
+    UNO --> OUTPUT[Logical direction and stop output]
     CAMERA[ESP32-CAM on local Wi-Fi] --> API
 ```
 
-Arrows represent permitted request/data dependencies, not electrical wiring. Next.js never writes the database or drives a device; only FastAPI accesses those adapters. Device and worker outputs are observations, not authoritative session mutations.
+Arrows represent permitted request/data dependencies and end at firmware/logical interfaces. Next.js never writes the database or drives a device; only FastAPI accesses those adapters. Device and worker outputs are observations, not authoritative session mutations.
 
 ## Invariants and rules
 
@@ -50,11 +51,11 @@ Arrows represent permitted request/data dependencies, not electrical wiring. Nex
 - **Prevents:** Competing owners of safety, session state or records.
 - **Rule:** Use Next.js, React and TypeScript for presentation and FastAPI for the Python application service. Backend state and eligibility are authoritative. The browser sends actions and displays backend state; it never establishes Found or motor permission itself.
 
-### AD-3 — Separate wireless command and video paths [ADOPTED]
+### AD-3 — Separate wireless command and video paths [ADOPTED; amended 2026-11-13]
 
 - **Binds:** Communication adapters; FR-7, NFR-2.
 - **Prevents:** Assuming the camera carries motor commands or Bluetooth carries live video.
-- **Rule:** Commands travel through HC-05 Bluetooth serial to Arduino Uno. ESP32-CAM video reaches the backend over existing local Wi-Fi. Fixed-desk multi-room coverage and timing require qualification; wired permission does not waive that scope.
+- **Rule:** Commands travel through the HC-05 Bluetooth serial adapter to Arduino Uno firmware; ESP32-CAM video reaches the backend over existing local Wi-Fi. Configure selected endpoints and validate protocol compatibility at T2. Keep command and video failure handling independent. Fixed-desk multi-room coverage and timing require real-device integration evidence; a permitted wired connection must still meet that scope.
 
 ### AD-4 — Two local release services [ADOPTED]
 
@@ -62,11 +63,11 @@ Arrows represent permitted request/data dependencies, not electrical wiring. Nex
 - **Prevents:** Shipping a static-only frontend or requiring public hosting.
 - **Rule:** Run a local Next.js Node server alongside FastAPI. Ship a production frontend build and locally installed runtime assets. The launcher supervises startup/shutdown; it cannot bypass readiness or automatically resume searching.
 
-### AD-5 — Expiring motion permission [ADOPTED]
+### AD-5 — Expiring motion permission [ADOPTED; amended 2026-11-13]
 
 - **Binds:** Input, browser, backend and Arduino; FR-4–FR-8, FR-17, SM-2.
 - **Prevents:** Continued or replayed motion after input, video, workspace or process failure.
-- **Rule:** Permit movement only with fresh selected-mode input, live video and an operational focused/visible workspace. Browser loss, hidden tab/focus loss or required-path failure stops and pauses. Arduino independently expires commands. Recovery requires acknowledgment, restored readiness, explicit Resume and release/reapply of input. Qualify the full physical stop within 0.5 seconds, including loss detection.
+- **Rule:** Permit movement only with fresh selected-mode input, live video and an operational focused/visible workspace. Browser loss, hidden tab/focus loss or required-path failure stops and pauses. Arduino independently expires commands. Recovery requires acknowledgment, restored readiness, explicit Resume and release/reapply of input. Verify software revocation, firmware expiry and logical stop output with measured timing and failure tests. The full wheel-stop target remains 0.5 seconds including loss detection and requires separate external integration measurement under SM-2; software tests alone cannot establish it or consume the entire allowance as a new software-only limit.
 
 ### AD-6 — Capability failure and interrupted evidence [ADOPTED]
 
@@ -116,11 +117,11 @@ Arrows represent permitted request/data dependencies, not electrical wiring. Nex
 - **Prevents:** Concurrent sessions, blocking inference and incompatible or stale messages.
 - **Rule:** One FastAPI service owns session mutation and serialized data writes; a separate AI worker cannot block stopping. Use REST for ordinary actions, WebSocket for state/readiness, and backend-provided live video. Carry session IDs, revisions and freshness; coordinate evidence, terminal actions and cleanup. The TRD derives schema, API and protocol details under Alisa's explicit authorization.
 
-### AD-14 — Explicit software gates and external hardware handoff [ADOPTED; amended 2026-11-07]
+### AD-14 — Independent software development and interface compatibility [ADOPTED; amended 2026-11-13]
 
 - **Binds:** Software, firmware, device integration and acceptance.
-- **Prevents:** Blocking independent software on physical construction or treating a handoff as measured qualification.
-- **Rule:** Physical assembly, wiring, power design, charging, component selection and electrical review are Alisa-owned external work under PRD v1.2. T2 records scoped hardware readiness and supplied device interface configuration; software agents consume that configuration and report incompatibilities to Alisa. Independent software may proceed with labeled simulators. Missing identity, pin/output mapping, operating limits or readiness blocks only dependent device work. Keep versions, model settings, timing, equipment/route and visual decisions at T1/T3–T7. Real-device acceptance and physical performance require observed tests; neither a document nor a hardware handoff closes them.
+- **Prevents:** Blocking independent software on device availability or treating compatible messages as measured product qualification.
+- **Rule:** Develop application, AI, firmware and integration software against versioned interfaces, using labeled simulators where devices are unavailable. T2 records selected endpoints/device identities, firmware build targets, protocol versions, message validation and compatibility errors. Missing or incompatible configuration blocks only the dependent software connection. Keep runtime versions, model settings, timing, connected-room coverage and visual decisions at T1/T3–T7. Record simulated, software-on-device and external product measurements separately. Physical wiring and assembly are external to this software scope. SM-2 wheel stopping and SM-3 battery endurance remain external measurements; a compatible connection or a twenty-minute application stability run cannot close them.
 
 ### AD-15 — Proximity warning has no motion authority [ADOPTED]
 
@@ -150,7 +151,7 @@ Technology families are adopted, not version pins. **AD-8/AD-14 explicitly defer
 | SQLite / Python sqlite3 | Record bundled engine and Python build at T1 |
 | OpenCV / MediaPipe / Ultralytics YOLOE / PyTorch | Compatible package, model and GPU-runtime lock at T1/T5 |
 | Pygame / SDL / pySerial | Exact versions and controller support at T1/T4 |
-| Arduino / ESP32 toolchains and firmware | Pin selected board cores, libraries and firmware at T1/T6; exact board identity supplied through T2 |
+| Arduino / ESP32 toolchains and firmware | Lock selected board cores, libraries and firmware at T1/T6; device identity, firmware build target and protocol compatibility recorded at T2 |
 
 Official-source technology checks and detailed references are in TRD section 14. Upstream examples establish available mechanisms, not compliance with this system's acceptance targets.
 
@@ -166,4 +167,4 @@ Official-source technology checks and detailed references are in TRD section 14.
 
 ## Deferred
 
-TRD section 13 defines T1–T7, owners, evidence and timing. Exact versions/checkpoints, numeric timing configuration, external hardware handoff, equipment/route and visual approval remain gated. Electrical design and physical work are externally owned by Alisa. API/schema seed is specified in the TRD and becomes code-owned only through a compliant, versioned implementation; structural changes cannot bypass these ADs. No architecture or qualification gate is silently resolved by a framework's defaults.
+TRD section 13 defines T1–T7, owners, evidence and timing. Exact versions/checkpoints, numeric timing configuration, device interface compatibility, runtime/route validation and visual approval remain gated. API/schema seed is specified in the TRD and becomes code-owned only through a compliant, versioned implementation; structural changes cannot bypass these ADs. No architecture or qualification gate is silently resolved by a framework's defaults.
