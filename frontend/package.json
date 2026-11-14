@@ -13,7 +13,8 @@
     "typecheck": "next typegen && tsc --noEmit",
     "lint": "eslint .",
     "contracts:generate": "node scripts/generate-contracts.mjs",
-    "contracts:check": "node scripts/generate-contracts.mjs --check",
+    "contracts:check": "node scripts/generate-contracts.mjs --check && npm run contracts:fixtures",
+    "contracts:fixtures": "vitest run src/lib/fixtures",
     "test": "vitest run",
     "test:e2e": "playwright test",
     "verify": "npm run contracts:check && npm run lint && npm run typecheck && npm test && npm run build && npm run test:e2e"

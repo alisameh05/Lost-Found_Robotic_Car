@@ -1,1 +1,2 @@
-export { readApplication } from "./read-application";
+export { readApplication, readFixtureInspector } from "./read-application";
+export { RuntimeStatus } from "./status";

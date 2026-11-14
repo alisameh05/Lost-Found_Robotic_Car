@@ -1,0 +1,13 @@
+import type { Media } from "@/generated/api-v1";
+
+// Original synthetic 32 × 24 RGB swatch, encoded as JPEG and PNG with System.Drawing.
+// Keep bytes inside the fixture adapter so the preview uses the protected-media path.
+const jpeg = "/9j/4AAQSkZJRgABAQEAYABgAAD/2wBDAAgGBgcGBQgHBwcJCQgKDBQNDAsLDBkSEw8UHRofHh0aHBwgJC4nICIsIxwcKDcpLDAxNDQ0Hyc5PTgyPC4zNDL/2wBDAQkJCQwLDBgNDRgyIRwhMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjIyMjL/wAARCAAYACADASIAAhEBAxEB/8QAHwAAAQUBAQEBAQEAAAAAAAAAAAECAwQFBgcICQoL/8QAtRAAAgEDAwIEAwUFBAQAAAF9AQIDAAQRBRIhMUEGE1FhByJxFDKBkaEII0KxwRVS0fAkM2JyggkKFhcYGRolJicoKSo0NTY3ODk6Q0RFRkdISUpTVFVWV1hZWmNkZWZnaGlqc3R1dnd4eXqDhIWGh4iJipKTlJWWl5iZmqKjpKWmp6ipqrKztLW2t7i5usLDxMXGx8jJytLT1NXW19jZ2uHi4+Tl5ufo6erx8vP09fb3+Pn6/8QAHwEAAwEBAQEBAQEBAQAAAAAAAAECAwQFBgcICQoL/8QAtREAAgECBAQDBAcFBAQAAQJ3AAECAxEEBSExBhJBUQdhcRMiMoEIFEKRobHBCSMzUvAVYnLRChYkNOEl8RcYGRomJygpKjU2Nzg5OkNERUZHSElKU1RVVldYWVpjZGVmZ2hpanN0dXZ3eHl6goOEhYaHiImKkpOUlZaXmJmaoqOkpaanqKmqsrO0tba3uLm6wsPExcbHyMnK0tPU1dbX2Nna4uPk5ebn6Onq8vP09fb3+Pn6/9oADAMBAAIRAxEAPwDzSytXvr+3s4ioknlWJSx4BY4Gfbmux/4VZrn/AD9af/38f/4iuZ8O/wDIz6T/ANfkP/oYr6CrixuJqUZJQOjD0Y1E3I8j/wCFWa5/z9af/wB/H/8AiK469tXsb+4s5SpkglaJip4JU4OPbivo2vn3xF/yM+rf9fk3/oZowWJqVpNTDEUY00nEqWV09jf295EFMkEqyqGHBKnIz7cV2P8AwtPXP+fXT/8Av2//AMXRRXZOjTqO81c541JR+Fh/wtPXP+fXT/8Av2//AMXXHXt099f3F5KFEk8rSsFHALHJx7c0UUQo06bvBWCVSUviZ//Z";
+const png = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAYCAYAAACbU/80AAAAAXNSR0IArs4c6QAAAARnQU1BAACxjwv8YQUAAAAJcEhZcwAADsMAAA7DAcdvqGQAAAA6SURBVEhLY9DUN/0/kHjUAaMOwOuAF3tLqIKxmQ3Dow4YdcCoA0YdMOqAUQcMbgfQA486YKQ7wPQ/AIW8KisbPBAyAAAAAElFTkSuQmCC";
+
+export const imageWidth = 32;
+export const imageHeight = 24;
+
+export function sampleImage(contentType: Media["content_type"]) {
+  return Uint8Array.from(atob(contentType === "image/jpeg" ? jpeg : png), (byte) => byte.charCodeAt(0));
+}

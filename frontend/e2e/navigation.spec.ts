@@ -38,7 +38,8 @@ test.describe("fixture preview", () => {
     const unexpectedRequests: string[] = [];
     const sockets: string[] = [];
     page.on("request", (request) => {
-      if (request.method() !== "GET" || !request.url().startsWith("http://127.0.0.1:3100/")) {
+      const local = new URL(request.url()).origin === "http://127.0.0.1:3100";
+      if (request.method() !== "GET" || !local) {
         unexpectedRequests.push(`${request.method()} ${request.url()}`);
       }
     });
