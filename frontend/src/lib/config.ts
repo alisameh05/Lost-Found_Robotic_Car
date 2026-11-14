@@ -2,6 +2,10 @@ export function isFixtureMode() {
   return process.env.LAF_MODE === "fixture";
 }
 
+export function fixtureHarnessEnabled() {
+  return isFixtureMode() && process.env.LAF_FIXTURE_HARNESS === "1";
+}
+
 export function readConfig() {
   const rawPort = process.env.LAF_BACKEND_PORT ?? "8000";
   const port = Number(rawPort);

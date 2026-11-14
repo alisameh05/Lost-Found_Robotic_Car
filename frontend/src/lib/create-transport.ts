@@ -8,5 +8,14 @@ export async function createTransport(): Promise<ApplicationTransport> {
   }
 
   const unavailable = async (): Promise<ReadResult<never>> => ({ kind: "unavailable" });
-  return { bootstrap: unavailable, get: unavailable };
+  return {
+    bootstrap: unavailable, get: unavailable, request: unavailable, snapshot: unavailable,
+    media: unavailable, emergency: unavailable, subscribeEvents: () => () => {},
+    subscribeFrames: () => () => {}, dispose() {},
+  };
+}
+
+export async function createFixtureHarness() {
+  const { createScenarioHarness } = await import("./fixtures/harness");
+  return createScenarioHarness();
 }

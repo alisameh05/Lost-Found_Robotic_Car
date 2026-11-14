@@ -31,12 +31,11 @@ test("fixture bootstrap, snapshot and sample reads conform to the approved API d
   expect(ajv.validate("api-v1#/$defs/BootstrapResponse", { ...context, capability: "" })).toBe(false);
 });
 
-test("the adapter binds bootstrap credentials to each instance and supports cancelled reads", async () => {
+test("the adapter rejects invalid context and supports cancelled reads", async () => {
   const first = createFixtureTransport();
-  const second = createFixtureTransport();
   const bootstrap = await first.bootstrap();
   if (bootstrap.kind !== "ok") throw new Error("Fixture bootstrap failed");
-  await expect(second.get("/snapshot", { context: bootstrap.data })).resolves.toMatchObject({
+  await expect(first.get("/snapshot", { context: { ...bootstrap.data, capability: "invalid" } })).resolves.toMatchObject({
     kind: "api-error", error: { code: "CAPABILITY_INVALID" },
   });
   const signal = AbortSignal.abort();

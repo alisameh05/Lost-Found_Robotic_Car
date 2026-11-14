@@ -1,5 +1,6 @@
 import { cache } from "react";
 import { createTransport } from "@/lib/create-transport";
+import { fixtureHarnessEnabled } from "@/lib/config";
 import type { ProtectedPath } from "@/lib/transport";
 
 export const readApplication = cache(async () => {
@@ -13,3 +14,7 @@ export const readApplication = cache(async () => {
     },
   };
 });
+
+export async function readFixtureInspector() {
+  if (fixtureHarnessEnabled()) return (await import("./fixture-inspector")).FixtureInspector;
+}
