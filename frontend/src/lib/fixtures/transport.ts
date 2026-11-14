@@ -1,6 +1,7 @@
 import type {
   EmergencyStopRequest, Error as ApiError, EventEnvelope, FrameMetadata, HttpResponses,
-  RegistrationFields, RetentionChange, RetentionPreviewRequest, SessionAction, StartRequest, TicketRequest,
+  MutationResponse, Object as LostObject, RegistrationFields, RetentionChange, RetentionPreviewRequest,
+  SessionAction, StartRequest, TicketRequest,
 } from "@/generated/api-v1";
 import { compatibleProfile, conforms } from "../fixture-contracts";
 import type {
@@ -94,7 +95,7 @@ export function createFixtureTransport({ scenario = "idle", now = () => sampleTi
     return pages.read(items, (item) => item.registered_at_ms, JSON.stringify(["objects", search, status]), pagination, now());
   }
 
-  async function register(input: FixtureRequest) {
+  async function register(input: FixtureRequest): Promise<ReadResult<MutationResponse>> {
     const { reference_image: image, ...body } = (input.body ?? {}) as RegistrationFields & { reference_image?: Blob };
     if (!conforms("RegistrationFields", body) || !(image instanceof Blob) || image.size < 1 ||
         !["image/jpeg", "image/png"].includes(image.type)) return invalid;
@@ -110,11 +111,11 @@ export function createFixtureTransport({ scenario = "idle", now = () => sampleTi
     if (body.roi.width > imageWidth - body.roi.x) return { kind: "api-error", status: 422, error: validationError } as const;
     if (body.roi.height > imageHeight - body.roi.y) return { kind: "api-error", status: 422, error: {
       ...validationError, field_errors: [{ path: "/roi/height", code: "OUT_OF_RANGE", message: "Height must fit the normalized source image." }],
-    } } as const;
+    } };
     if (scene.snapshot.retention.deletion.status === "Failed") return error(503, "STORAGE_UNAVAILABLE", "Sample deletion is incomplete.");
     const persistence = scene.health.initialization === "Starting" ? "Pending" : scene.health.initialization === "Failed" ? "Failed" : "Committed";
     const registered = registrationReceipt.object;
-    const object = {
+    const object: LostObject = {
       ...registered, id: "sample-new-object", name: body.name.trim().normalize("NFC"), roi: body.roi,
       reference_media: { ...registered.reference_media, id: "sample-new-reference", content_type: contentType, byte_length: sample.length },
     };
