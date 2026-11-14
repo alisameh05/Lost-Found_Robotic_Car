@@ -1,12 +1,9 @@
 import Link from "next/link";
 import { DataUnavailable, Preview, PreviewLinks } from "@/components/layout/preview";
-import { readApplication, readFixtureInspector, RuntimeStatus } from "@/features/runtime";
+import { DashboardRuntime } from "@/features/runtime";
 
-export async function DashboardScreen() {
-  const application = await readApplication();
-  const result = await application.get("/snapshot");
-  if (result.kind !== "ok") return <DataUnavailable />;
-  const FixtureInspector = await readFixtureInspector();
+export function DashboardScreen({ fixtureEnabled }: { fixtureEnabled: boolean }) {
+  if (!fixtureEnabled) return <DataUnavailable />;
 
   return (
     <Preview
@@ -14,7 +11,7 @@ export async function DashboardScreen() {
       description="Preview navigation for the local operator workspace."
       actions={<Link className="button button--secondary" href="/objects/new">Preview registration</Link>}
     >
-      {FixtureInspector ? <FixtureInspector /> : <RuntimeStatus status={result} />}
+      <DashboardRuntime />
       <PreviewLinks links={[
         { href: "/objects", label: "Browse sample history" },
         { href: "/devices", label: "Preview Devices" },
