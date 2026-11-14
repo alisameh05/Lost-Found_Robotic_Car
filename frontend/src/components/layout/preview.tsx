@@ -1,14 +1,14 @@
 import Link from "next/link";
 import type { ReactNode } from "react";
+import { PageHeader } from "./page-header";
+import { Panel } from "./panel";
 
-export function Preview({ title, description, children }: { title: string; description: string; children?: ReactNode }) {
+export function Preview({
+  title, description, actions, children,
+}: { title: string; description: string; actions?: ReactNode; children?: ReactNode }) {
   return (
     <>
-      <header className="page-header">
-        <p className="phase-label">Phase 01 preview</p>
-        <h1>{title}</h1>
-        <p>{description}</p>
-      </header>
+      <PageHeader title={title} description={description} context="Phase 01 preview" actions={actions} />
       {children}
     </>
   );
@@ -16,12 +16,12 @@ export function Preview({ title, description, children }: { title: string; descr
 
 export function PreviewLinks({ links }: { links: { href: string; label: string }[] }) {
   return (
-    <section className="panel">
+    <Panel>
       <h2>Related previews</h2>
       <ul className="preview-links">
         {links.map(({ href, label }) => <li key={href}><Link href={href}>{label}</Link></li>)}
       </ul>
-    </section>
+    </Panel>
   );
 }
 

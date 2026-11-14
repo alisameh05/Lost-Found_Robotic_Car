@@ -7,6 +7,7 @@ export function AppShell({ fixtureEnabled, children }: { fixtureEnabled: boolean
       <a className="skip-link" href="#main-content">Skip to content</a>
       <aside className="sidebar">
         <p className="brand">Lost &amp; Found</p>
+        <p className="workspace-label">Local operator workspace</p>
         <Sidebar />
         <p className="mode-label">
           {fixtureEnabled ? "Fixture mode · Sample data · No robot connected" : "Backend unavailable · No robot connected"}

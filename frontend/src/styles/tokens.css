@@ -1,0 +1,33 @@
+:root {
+  color-scheme: dark;
+  --canvas: #1b2027;
+  --surface: #292f35;
+  --elevated: #343c44;
+  --ink: #f2efe8;
+  --muted: #b0bec5;
+  --primary: #e8bd74;
+  --on-primary: #202020;
+  --primary-hover: #f0c985;
+  --primary-pressed: #d6a861;
+  --teal: #93b4ae;
+  --success: #a2d9b5;
+  --warning: #f7d69b;
+  --danger: #f19c99;
+  --border: #465159;
+  --control-border: #83949e;
+  --space-1: .25rem;
+  --space-2: .5rem;
+  --space-3: .75rem;
+  --space-4: 1rem;
+  --space-6: 1.5rem;
+  --space-8: 2rem;
+  --radius-small: .25rem;
+  --radius-control: .375rem;
+  --radius-panel: .5rem;
+  --control-height: 2.75rem;
+  --priority-height: 3.5rem;
+  font-family: "Instrument Sans Variable", sans-serif;
+  font-variant-numeric: tabular-nums;
+  background: var(--canvas);
+  color: var(--ink);
+}
