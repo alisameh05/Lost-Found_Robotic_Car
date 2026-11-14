@@ -92,11 +92,13 @@ test("keeps local assets, visible focus and modeless access through the laptop a
   await page.setViewportSize({ width: 1440, height: 960 });
   await page.emulateMedia({ reducedMotion: "reduce" });
   await page.goto("/");
+  await page.getByLabel("Fixture scenario").selectOption("emergency-pending");
   const nav = page.getByRole("navigation", { name: "Main navigation" });
   const form = page.getByRole("region", { name: "Sample submission" });
   const field = form.getByRole("textbox", { name: "Sample label" });
   const toggle = page.getByRole("button", { name: "Inspect sample media" });
-  const slot = page.getByRole("button", { name: "Check reserved action slot" });
+  const stop = page.getByRole("button", { name: "Emergency Stop", exact: true });
+  const active = page.getByRole("link", { name: "Return to Active Search" });
   const save = form.getByRole("button", { name: "Save sample" });
   const heading = page.getByRole("heading", { level: 1 });
   await expect(field).toBeVisible();
@@ -111,7 +113,7 @@ test("keeps local assets, visible focus and modeless access through the laptop a
   await expect(dashboard.locator("svg")).toBeVisible();
   expect((await field.boundingBox())?.height).toBe(44);
   expect((await save.boundingBox())?.height).toBe(44);
-  expect((await slot.boundingBox())?.height).toBe(56);
+  expect((await stop.boundingBox())?.height).toBe(56);
 
   function contrast(foreground: string, background: string) {
     function luminance(color: string) {
@@ -130,19 +132,27 @@ test("keeps local assets, visible focus and modeless access through the laptop a
     const style = getComputedStyle(node);
     return { ink: style.color, fill: style.backgroundColor, animation: style.animationName, transition: style.transitionDuration };
   });
+  const emergency = await stop.evaluate((node) => {
+    const style = getComputedStyle(node);
+    return { ink: style.color, fill: style.backgroundColor, animation: style.animationName, transition: style.transitionDuration };
+  });
   const muted = await form.getByText("Enter any label to try the sample submission.").evaluate((node) => getComputedStyle(node).color);
   const pairs = {
     "page text on canvas": contrast(ink, canvas),
     "description on panel": contrast(muted, surface),
     "primary label on fill": contrast(button.ink, button.fill),
     "field border on panel": contrast(controlBorder, surface),
+    "emergency label on fill": contrast(emergency.ink, emergency.fill),
   };
   expect(pairs["page text on canvas"]).toBeGreaterThanOrEqual(4.5);
   expect(pairs["description on panel"]).toBeGreaterThanOrEqual(4.5);
   expect(pairs["primary label on fill"]).toBeGreaterThanOrEqual(4.5);
   expect(pairs["field border on panel"]).toBeGreaterThanOrEqual(3);
+  expect(pairs["emergency label on fill"]).toBeGreaterThanOrEqual(4.5);
   expect(button.animation).toBe("none");
   expect(button.transition).toBe("0s");
+  expect(emergency.animation).toBe("none");
+  expect(emergency.transition).toBe("0s");
 
   await field.focus();
   await page.keyboard.press("Tab");
@@ -160,21 +170,23 @@ test("keeps local assets, visible focus and modeless access through the laptop a
     await page.screenshot({ path });
     await testInfo.attach(name, { path, contentType: "image/png" });
   }
-  await capture("1440x960-controls");
+  await capture("1440x960-emergency");
 
   await page.setViewportSize({ width: 1366, height: 768 });
-  await toggle.focus();
-  await page.keyboard.press("Enter");
+  await toggle.click();
+  await active.focus();
   await page.keyboard.press("Tab");
-  await expect(slot).toBeFocused();
-  await expect(slot).toBeInViewport();
+  await expect(stop).toBeFocused();
+  await expect(stop).toBeInViewport();
   await page.keyboard.press("Enter");
-  await expect(page.getByText("Sample action slot reached.")).toBeVisible();
+  await expect(page.getByRole("status").filter({ hasText: "Motion permission revoked" })).toContainText("Save pending");
   const media = page.getByRole("region", { name: "Sample media preview" });
   await expect(media.getByText("Sample image · Not live")).toBeVisible();
   const image = media.getByRole("img", { name: "Synthetic geometric swatch" });
   await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(32);
-  await capture("1366x768-media");
+  await media.getByLabel("Sample media", { exact: true }).scrollIntoViewIfNeeded();
+  await expect(stop).toBeInViewport();
+  await capture("1366x768-modeless-media");
   await media.getByLabel("Sample media", { exact: true }).selectOption("sample-confirmed-evidence");
   await expect(media.getByText("Sample image · Captured evidence")).toBeVisible();
   await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(32);
@@ -184,14 +196,17 @@ test("keeps local assets, visible focus and modeless access through the laptop a
   expect(await page.evaluate(() => document.documentElement.scrollWidth)).toBe(1366);
   await expect(dashboard).toBeVisible();
   await expect(nav.getByRole("link", { name: "Settings" })).toBeVisible();
-  await page.getByRole("button", { name: "Hide sample media" }).focus();
+  await active.focus();
   await page.keyboard.press("Tab");
-  await expect(slot).toBeFocused();
-  await expect(slot).toBeInViewport();
+  await expect(stop).toBeFocused();
+  await expect(stop).toBeInViewport();
+  await expect(page.getByText("Fixture mode · Sample data · No robot connected")).toBeVisible();
   await capture("1366x768-text-200-percent");
-  await page.keyboard.press("Tab");
-  await expect(media.getByLabel("Sample media", { exact: true })).toBeFocused();
   await page.keyboard.press("Shift+Tab");
-  await expect(slot).toBeFocused();
+  await expect(active).toBeFocused();
+  await expect(media.getByLabel("Sample media", { exact: true })).toBeVisible();
+  await media.getByLabel("Sample media", { exact: true }).scrollIntoViewIfNeeded();
+  await expect(stop).toBeInViewport();
+  await capture("1366x768-modeless-media-text-200-percent");
   expect(external).toEqual([]);
 });

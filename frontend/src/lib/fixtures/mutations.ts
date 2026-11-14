@@ -3,7 +3,7 @@ import type {
   RetentionPreview, SessionAction, Snapshot,
 } from "@/generated/api-v1";
 import type { ReadResult } from "../transport";
-import { bootstrapFacts, foundSession, recoveryFailure, sampleObject, sampleSession, sampleTime, searching } from "./samples";
+import { foundSession, sampleObject, sampleSession, sampleTime, searching } from "./samples";
 
 export const emptyResult: MutationResult = { object: null, session: null, match: null, settings: null, deletion: null };
 export const storageError = { code: "STORAGE_UNAVAILABLE", message: "Sample save failed.", retryable: true } satisfies ApiError;
@@ -23,13 +23,14 @@ export function mutation(
 }
 
 export function emergencyResponse(
-  body: EmergencyStopRequest, snapshot: Snapshot, outcome: EmergencyStopResponse["persistence"] | "network",
+  body: EmergencyStopRequest, snapshot: Snapshot, failure_id: EmergencyStopResponse["failure_id"],
+  outcome: EmergencyStopResponse["persistence"] | "network",
 ): ReadResult<EmergencyStopResponse> {
   if (outcome === "network") return { kind: "unavailable" };
   const session_id = snapshot.active_session?.id ?? null;
   const base = {
-    request_id: body.request_id, backend_boot_id: bootstrapFacts.backend_boot_id, permission_revoked: true,
-    session_id, failure_id: session_id ? recoveryFailure.failure_id : null,
+    request_id: body.request_id, backend_boot_id: snapshot.backend_boot_id, permission_revoked: true,
+    session_id, failure_id,
   } as const;
   return outcome === "Failed"
     ? { kind: "ok", status: 503, data: { ...base, persistence: outcome, error: storageError } }

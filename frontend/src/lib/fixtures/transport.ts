@@ -22,6 +22,8 @@ type FixtureOptions = {
   scenario?: ScenarioId;
   now?: () => number;
   eventScript?: "catalogue";
+  observeMutation?: (route: Endpoint, body: unknown) => void;
+  scriptedRegistration?: (signal: AbortSignal) => Promise<"Committed" | "Failed" | undefined>;
 };
 type FixtureRequest = ProtectedRequest & {
   id?: string; query?: ObjectQuery; body?: unknown; actionCreatedAtMs?: number;
@@ -34,7 +36,9 @@ const expired = error(410, "EXPIRED", "Sample record expired.");
 const invalid = error(422, "VALIDATION_FAILED", "A sample request field is invalid.");
 const conflict = error(409, "REVISION_CONFLICT", "Sample revision has changed.");
 
-export function createFixtureTransport({ scenario = "idle", now = () => sampleTime, eventScript }: FixtureOptions = {}): ApplicationTransport {
+export function createFixtureTransport({
+  scenario = "idle", now = () => sampleTime, eventScript, observeMutation, scriptedRegistration,
+}: FixtureOptions = {}): ApplicationTransport {
   const scene = readScenario(scenario);
   const { bootstrap } = scene;
   let { snapshot } = scene;
@@ -44,23 +48,24 @@ export function createFixtureTransport({ scenario = "idle", now = () => sampleTi
   const retentionReceipts = new Map<string, { fingerprint: string; response: ReturnType<typeof mutation> }>();
   let previewSequence = 0;
   let ticketSequence = 0;
+  let emergencyFailure = snapshot.failures.find((failure) => failure.cause === "EmergencyStop" && !failure.restored);
   const profile = compatibleProfile(snapshot.qualification_profile) ? snapshot.qualification_profile : null;
 
   function signalFor(signal?: AbortSignal) {
     return signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
   }
 
-  function authorize({ context }: ProtectedRequest) {
+  function authorize({ context }: ProtectedRequest, clientRequired = true) {
     return context.backend_boot_id === bootstrap.backend_boot_id && context.capability === bootstrap.capability &&
-      context.client_id === bootstrap.client_id;
+      (!clientRequired || context.client_id === bootstrap.client_id);
   }
 
-  async function respond<T>(request: ProtectedRequest, makeResult: () => ReadResult<T> | Promise<ReadResult<T>>) {
+  async function respond<T>(request: ProtectedRequest, makeResult: () => ReadResult<T> | Promise<ReadResult<T>>, clientRequired = true) {
     const signal = signalFor(request.signal);
     signal.throwIfAborted();
     await Promise.resolve();
     signal.throwIfAborted();
-    if (!authorize(request)) return error(403, "CAPABILITY_INVALID", "Invalid sample request context.");
+    if (!authorize(request, clientRequired)) return error(403, "CAPABILITY_INVALID", "Invalid sample request context.");
     const result = await makeResult();
     signal.throwIfAborted();
     return structuredClone(result);
@@ -113,7 +118,9 @@ export function createFixtureTransport({ scenario = "idle", now = () => sampleTi
       ...validationError, field_errors: [{ path: "/roi/height", code: "OUT_OF_RANGE", message: "Height must fit the normalized source image." }],
     } };
     if (scene.snapshot.retention.deletion.status === "Failed") return error(503, "STORAGE_UNAVAILABLE", "Sample deletion is incomplete.");
-    const persistence = scene.health.initialization === "Starting" ? "Pending" : scene.health.initialization === "Failed" ? "Failed" : "Committed";
+    const scripted = await scriptedRegistration?.(signalFor(input.signal));
+    const persistence = scripted ?? (scene.health.initialization === "Starting" ? "Pending"
+      : scene.health.initialization === "Failed" ? "Failed" : "Committed");
     const registered = registrationReceipt.object;
     const object: LostObject = {
       ...registered, id: "sample-new-object", name: body.name.trim().normalize("NFC"), roi: body.roi,
@@ -275,8 +282,13 @@ export function createFixtureTransport({ scenario = "idle", now = () => sampleTi
       const session = snapshot.active_session;
       const committed = valid && scene.emergency === "Committed";
       const control_generation = snapshot.runtime.control_generation + 1;
-      const failure = { ...recoveryFailure, session_id: session?.id ?? null };
-      const alreadyRecorded = snapshot.failures.some(({ failure_id }) => failure_id === failure.failure_id);
+      if (session && !emergencyFailure) {
+        const previous = snapshot.failures.find((failure) => failure.failure_id === recoveryFailure.failure_id);
+        emergencyFailure = { ...recoveryFailure, session_id: session.id,
+          failure_id: previous ? `${recoveryFailure.failure_id}-next` : recoveryFailure.failure_id };
+      }
+      const failure = session ? emergencyFailure : undefined;
+      const alreadyRecorded = snapshot.failures.some(({ failure_id }) => failure_id === failure?.failure_id);
       snapshot = {
         ...snapshot, lease: { state: "Unowned", owner_client_id: null, control_generation, can_acquire: false },
         runtime: {
@@ -284,13 +296,13 @@ export function createFixtureTransport({ scenario = "idle", now = () => sampleTi
           persistence_pending: !!session && scene.emergency === "Pending",
         },
         readiness: { ...snapshot.readiness, can_start: { Gestures: false, Controller: false }, can_resume: false },
-        failures: session && !alreadyRecorded ? [...snapshot.failures, failure] : snapshot.failures,
-        active_session: committed && session && !alreadyRecorded ? {
+        failures: failure && !alreadyRecorded ? [...snapshot.failures, failure] : snapshot.failures,
+        active_session: committed && session && failure && !session.pause_causes.some(({ failure_id }) => failure_id === failure.failure_id) ? {
           ...session, state: "Paused", ended_at_ms: null, end_reason: null, revision: session.revision + 1,
-          pause_causes: [{ cause: "RecoveryRequired", failure_id: failure.failure_id }],
+          pause_causes: [...session.pause_causes, { cause: "RecoveryRequired", failure_id: failure.failure_id }],
         } : session,
       };
-      return valid ? emergencyResponse(body as EmergencyStopRequest, snapshot, scene.emergency)
+      return valid ? emergencyResponse(body as EmergencyStopRequest, snapshot, failure?.failure_id ?? null, scene.emergency)
         : { kind: "api-error", status: 422, error: {
           code: "VALIDATION_FAILED", message: "Invalid sample emergency request.", retryable: false, permission_revoked: true,
         } };
@@ -314,13 +326,19 @@ export function createFixtureTransport({ scenario = "idle", now = () => sampleTi
       return ok({ ...structuredClone(bootstrap), server_time_ms: now() });
     },
     request<Route extends Endpoint>(route: Route, request: HttpRequest<Route>) {
-      return respond(request, () => handlers[route](request));
+      return respond(request, () => {
+        if (!route.startsWith("GET ")) observeMutation?.(route, "body" in request ? request.body : undefined);
+        return handlers[route](request);
+      }, route !== "POST /emergency-stop");
     },
     get<Path extends ProtectedPath>(path: Path, request: ProtectedRequest & { id?: string }) {
       return respond(request, () => handlers[`GET ${path}`](request));
     },
     snapshot: (request) => respond(request, () => handlers["GET /snapshot"](request)),
-    emergency: (body, request) => respond(request, () => handlers["POST /emergency-stop"]({ ...request, body })),
+    emergency: (body, request) => respond(request, () => {
+      observeMutation?.("POST /emergency-stop", body);
+      return handlers["POST /emergency-stop"]({ ...request, body });
+    }, false),
     subscribeEvents(request, onEvent) {
       const events = eventScript === "catalogue" ? eventVectors : [snapshotEvent(snapshot)];
       const signal = signalFor(request.signal);

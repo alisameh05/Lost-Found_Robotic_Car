@@ -245,19 +245,36 @@ test("reports every scripted emergency outcome, including a 503 that acknowledge
     const body = { request_id: requestId };
     contract("EmergencyStopRequest", body);
     const context = data(await transport.bootstrap());
-    const result = data(await transport.emergency(body, { context }), status);
+    const result = data(await transport.emergency(body, { context: { ...context, client_id: "unused-fixture-client" } }), status);
     contract("EmergencyStopResponse", result);
-    expect(result).toMatchObject({ permission_revoked: true, persistence, session_id: scenario === "idle" ? null : sampleSession.id });
+    expect(result).toMatchObject({ request_id: requestId, backend_boot_id: context.backend_boot_id,
+      permission_revoked: true, persistence, session_id: scenario === "idle" ? null : sampleSession.id,
+      failure_id: scenario === "idle" ? null : "fixture-emergency-failure" });
     expect(result.error).toEqual(persistence === "Failed" ? storageError : null);
     const updated = data(await transport.snapshot({ context }));
     expect(updated.lease.state).toBe("Unowned");
     expect(updated.runtime.effective_session_state).toBe(scenario === "idle" ? null : "Paused");
     expect(updated.runtime.persistence_pending).toBe(persistence === "Pending");
+    expect(updated.active_session?.state).toBe(scenario === "idle" ? undefined : persistence === "Committed" ? "Paused" : "Searching");
     expect(validSnapshot(updated, context)).toBe(true);
   }
   const network = createFixtureTransport({ scenario: "emergency-network" });
   await expect(network.emergency({ request_id: requestId }, { context: data(await network.bootstrap()) }))
     .resolves.toEqual({ kind: "unavailable" });
+});
+
+test("a restored failure keeps its identity when a new emergency occurrence is recorded", async () => {
+  const transport = createFixtureTransport({ scenario: "restored" });
+  const context = data(await transport.bootstrap());
+  const [restored] = data(await transport.snapshot({ context })).failures;
+  const stopped = data(await transport.emergency({ request_id: requestId }, { context }));
+  expect(stopped.failure_id).not.toBe(restored.failure_id);
+  const repeated = data(await transport.emergency({ request_id: actionId }, { context }));
+  expect(repeated.failure_id).toBe(stopped.failure_id);
+  const updated = data(await transport.snapshot({ context }));
+  expect(updated.failures).toEqual([restored, expect.objectContaining({ failure_id: stopped.failure_id, restored: false })]);
+  expect(validSnapshot(updated, context)).toBe(true);
+  transport.dispose();
 });
 
 test("validates all event types and distinguishes invalid sequencing from invalid schema", () => {

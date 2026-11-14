@@ -76,9 +76,36 @@ test("releases protected sample images on replacement, expiry, reset and navigat
 });
 
 test("disconnected mode hides the harness even when requested", async ({ page }) => {
+  const scripts: Promise<string>[] = [];
+  page.on("response", (response) => {
+    if (response.request().resourceType() === "script") scripts.push(response.text());
+  });
   await page.goto("http://127.0.0.1:3101/");
   await expect(page.getByRole("heading", { name: "Application data unavailable" })).toBeVisible();
   await expect(page.getByLabel("Fixture scenario")).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Sample media preview" })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Shared control specimens" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Emergency Stop" })).toHaveCount(0);
+  await page.getByRole("link", { name: "Objects / History" }).click();
+  await expect(page.getByRole("heading", { name: "Application data unavailable" })).toBeVisible();
+  const loadedFixtureCode = (await Promise.all(scripts)).some((script) =>
+    /Fixture mutation requests|Synthetic geometric swatch|sample-wallet-reference/.test(script));
+  expect(loadedFixtureCode).toBe(false);
+});
+
+test("record previews use the selected adapter for empty and expired data", async ({ page }) => {
+  await page.goto("http://127.0.0.1:3100/");
+  const scenario = page.getByLabel("Fixture scenario");
+  await scenario.selectOption("empty");
+  await expect(page.getByText("No active search", { exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Objects / History" }).click();
+  await expect(page.getByText("The fixture returned no objects.")).toBeVisible();
+  await expect(page.getByRole("link", { name: "Black wallet" })).toHaveCount(0);
+  await page.getByRole("link", { name: "Dashboard" }).click();
+  await scenario.selectOption("expiry-grace");
+  await page.getByRole("link", { name: "Return to Active Search" }).click();
+  await page.getByRole("link", { name: "View sample object" }).click();
+  await expect(page.getByText("Sample expired object · Lost")).toBeVisible();
+  await page.goto("http://127.0.0.1:3100/objects/sample-expired");
+  await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
 });

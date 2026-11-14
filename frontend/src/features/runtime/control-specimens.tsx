@@ -1,6 +1,6 @@
 "use client";
 
-import { CircleCheck, Octagon, Pause, Scan, Search, Square, TriangleAlert, VideoOff } from "lucide-react";
+import { CircleCheck, Pause, Scan, Search, Square, TriangleAlert, VideoOff } from "lucide-react";
 import { useEffect, useId, useRef, useState, type FormEvent, type ReactNode } from "react";
 import { PageActions } from "@/components/layout/page-header";
 import { ModelessPanel, Panel } from "@/components/layout/panel";
@@ -9,22 +9,21 @@ import { Choice, Field } from "@/components/ui/field";
 import { Notice, RetrievalFeedback, SaveFeedback, StatusBadge, type SaveState } from "@/components/ui/feedback";
 import type { createFixtureHarness } from "@/lib/create-transport";
 
-type OpenControls = Awaited<ReturnType<typeof createFixtureHarness>>["openControls"];
-type ControlScript = ReturnType<OpenControls>;
-type SampleOutcome = Parameters<ControlScript["submit"]>[0];
+type Fixture = ReturnType<Awaited<ReturnType<typeof createFixtureHarness>>["open"]>;
+type ControlScript = Pick<Fixture, "readSample" | "submitSample" | "deliverSample">;
+type SampleOutcome = Parameters<ControlScript["submitSample"]>[1];
 
-export function ControlSpecimens({ open, media }: { open: OpenControls; media: ReactNode }) {
+export function ControlSpecimens({ operations, media }: { operations: ControlScript; media: ReactNode }) {
   const mediaId = useId();
   const script = useRef<{ operations: ControlScript; lifetime: AbortController }>(null);
   const [mediaOpen, setMediaOpen] = useState(false);
-  const [slotReached, setSlotReached] = useState(false);
   const [readState, setReadState] = useState<"idle" | "loading" | "unavailable" | "empty">("idle");
 
   useEffect(() => {
     const lifetime = new AbortController();
-    script.current = { operations: open(), lifetime };
+    script.current = { operations, lifetime };
     return () => { lifetime.abort(); script.current = null; };
-  }, [open]);
+  }, [operations]);
 
   async function read() {
     const current = script.current;
@@ -32,7 +31,7 @@ export function ControlSpecimens({ open, media }: { open: OpenControls; media: R
     const { operations, lifetime: { signal } } = current;
     setReadState("loading");
     try {
-      const outcome = await operations.read(signal);
+      const outcome = await operations.readSample(signal);
       if (!signal.aborted) setReadState(outcome);
     } catch {
       if (!signal.aborted) setReadState("unavailable");
@@ -46,19 +45,12 @@ export function ControlSpecimens({ open, media }: { open: OpenControls; media: R
           <h2 id="control-specimens-title">Shared control specimens</h2>
           <p>Development samples for testing fields, feedback and media.</p>
         </div>
-        <PageActions priority={
-          <Button
-            onClick={() => setSlotReached(true)}
-          >
-            <Octagon aria-hidden="true" size={18} /> Check reserved action slot
-          </Button>
-        }>
+        <PageActions>
           <Button aria-expanded={mediaOpen} aria-controls={mediaId} onClick={() => setMediaOpen(!mediaOpen)}>
             {mediaOpen ? "Hide sample media" : "Inspect sample media"}
           </Button>
         </PageActions>
       </div>
-      <div role="status">{slotReached && <p className="control-hint">Sample action slot reached.</p>}</div>
       <div id={mediaId} hidden={!mediaOpen}>
         {mediaOpen && <ModelessPanel id={`${mediaId}-panel`} title="Sample media preview">{media}</ModelessPanel>}
       </div>
@@ -99,7 +91,7 @@ function SaveSpecimen({ script }: {
 }) {
   const [label, setLabel] = useState("");
   const [validation, setValidation] = useState(false);
-  const [outcome, setOutcome] = useState<SampleOutcome>("committed");
+  const [outcome, setOutcome] = useState<SampleOutcome>("Committed");
   const [feedback, setFeedback] = useState<SaveState>();
   const submitting = useRef(false);
   const field = useRef<HTMLInputElement>(null);
@@ -121,9 +113,9 @@ function SaveSpecimen({ script }: {
     setValidation(false);
     setFeedback({ kind: "pending" });
     try {
-      const result = await operations.submit(outcome, signal);
+      const result = await operations.submitSample(label.trim(), outcome, signal);
       if (signal.aborted) return;
-      setFeedback(result === "committed"
+      setFeedback(result === "Committed"
         ? { kind: "committed", detail: "The scripted response confirmed the sample save." }
         : { kind: "failed", detail: "The scripted response reported that the sample could not be saved." });
     } catch {
@@ -154,14 +146,14 @@ function SaveSpecimen({ script }: {
         <Choice type="checkbox" label="Include sample note" description="Example checkbox." />
         <fieldset className="specimen-options">
           <legend>Scripted save result</legend>
-          <Choice type="radio" name="sample-result" label="Commit" checked={outcome === "committed"} onChange={() => setOutcome("committed")} />
-          <Choice type="radio" name="sample-result" label="Fail" checked={outcome === "failed"} onChange={() => setOutcome("failed")} />
+          <Choice type="radio" name="sample-result" label="Commit" checked={outcome === "Committed"} onChange={() => setOutcome("Committed")} />
+          <Choice type="radio" name="sample-result" label="Fail" checked={outcome === "Failed"} onChange={() => setOutcome("Failed")} />
         </fieldset>
         <div className="control-row">
           <Button ref={saveButton} type="submit" variant="primary" pending={pending}>Save sample</Button>
           {pending && <Button onClick={() => {
             saveButton.current?.focus();
-            script.current?.operations.deliver();
+            script.current?.operations.deliverSample();
           }}>Deliver save result</Button>}
           <Button variant="quiet" onClick={() => {
             setLabel("");
