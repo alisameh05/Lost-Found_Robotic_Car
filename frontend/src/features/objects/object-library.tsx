@@ -34,7 +34,7 @@ export function ObjectLibraryScreen() {
   const showPaging = !tooLong && (!result || hasPrevious || Boolean(items?.length) || hasNext);
   if (disconnected) return <DataUnavailable />;
 
-  return <>
+  return <div className={styles.recordLayout}>
     <PageHeader title="Objects / History" description="Find a belonging and review its record." actions={<RegisterLink />} />
     <ActiveSearchBanner />
     <div className={styles.filters}>
@@ -68,7 +68,7 @@ export function ObjectLibraryScreen() {
         <Button aria-disabled={!hasNext} onClick={next}>Next</Button>
       </nav>
     </div>}
-  </>;
+  </div>;
 }
 
 function ActiveSearchBanner() {

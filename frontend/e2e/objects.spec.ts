@@ -152,8 +152,10 @@ test("renders the objects screens at design and laptop sizes with local assets a
   await expect(preview(page).getByRole("img", { name: "Reference for Black wallet" })).toBeVisible();
   await page.screenshot({ path: testInfo.outputPath("objects-1440.png") });
   await preview(page).getByRole("link", { name: "View Object Details" }).click();
-  const image = page.getByRole("img", { name: "Reference for Black wallet", exact: true });
-  const target = page.getByRole("img", { name: "Selected target from Reference for Black wallet", exact: true });
+  const reference = page.getByRole("region", { name: "Object reference and selected target" });
+  const image = reference.getByRole("img", { name: "Reference for Black wallet", exact: true });
+  const target = reference.getByRole("img", { name: "Selected target from Reference for Black wallet", exact: true });
+  await expect(image).toBeVisible();
   await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(640);
   await expect(target).toHaveAttribute("src", (await image.getAttribute("src"))!);
   await page.screenshot({ path: testInfo.outputPath("object-details-1440.png") });

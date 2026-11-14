@@ -16,7 +16,7 @@ export function ObjectDetailsScreen({ objectId }: { objectId: string }) {
   const { disconnected } = useRuntimeView();
   const object = result?.kind === "ok" ? result.data : undefined;
   if (disconnected) return <DataUnavailable />;
-  return <>
+  return <div className={styles.recordLayout}>
     <PageHeader title="Object Details" description={object?.name} actions={object && <ObjectStatus status={object.status} />} />
     {!result ? <LoadingState label="Loading object details" />
       : result.kind === "ok" ? <RecordDetails object={result.data} />
@@ -29,7 +29,7 @@ export function ObjectDetailsScreen({ objectId }: { objectId: string }) {
       <Link className="button button--secondary" href="/objects">Back to Objects</Link>
       <RegisterLink another />
     </footer>
-  </>;
+  </div>;
 }
 
 function RecordDetails({ object }: { object: ObjectRecord }) {
