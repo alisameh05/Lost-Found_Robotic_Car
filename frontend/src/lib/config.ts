@@ -1,3 +1,7 @@
+export function isFixtureMode() {
+  return process.env.LAF_MODE === "fixture";
+}
+
 export function readConfig() {
   const rawPort = process.env.LAF_BACKEND_PORT ?? "8000";
   const port = Number(rawPort);
@@ -5,7 +9,7 @@ export function readConfig() {
     throw new Error("LAF_BACKEND_PORT must be an integer from 1 to 65535.");
   }
   return {
-    fixtureEnabled: process.env.LAF_MODE === "fixture",
+    fixtureEnabled: isFixtureMode(),
     backendBaseUrl: `http://127.0.0.1:${port}/api/v1`,
   };
 }

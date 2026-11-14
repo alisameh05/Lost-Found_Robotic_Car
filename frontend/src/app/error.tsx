@@ -2,11 +2,11 @@
 
 import { Preview } from "@/components/layout/preview";
 
-export default function RouteError({ reset }: { reset: () => void }) {
+export default function RouteError({ retry }: { retry: () => void }) {
   return (
     <>
       <Preview title="Unable to open this preview" description="Try loading the current destination again." />
-      <button type="button" onClick={reset}>Try again</button>
+      <button type="button" onClick={retry}>Try again</button>
     </>
   );
 }

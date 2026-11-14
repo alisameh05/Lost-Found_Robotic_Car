@@ -34,13 +34,34 @@ const provenance = {
 };
 const seed = { $schema: schema.$schema, $comment: JSON.stringify(provenance), $defs: definitions };
 const bannerComment = `// Generated from ${provenance.path} v${version} (SHA-256 ${provenance.sha256}). Do not edit.`;
-// TypeScript uses the closed structural shape. Ajv checks cross-field constraints
-// (such as the timestamps required by each session state) from the full seed.
+// Expand object conditions into closed TypeScript variants. Scalar bounds,
+// collection constraints and referenced-property constraints stay in the Ajv seed.
+function variantsFor(rule, variant) {
+  const conditions = Object.entries(rule.if?.properties ?? {});
+  if (conditions.length !== 1) return [variant];
+  const [[field, test]] = conditions;
+  const property = variant.properties[field];
+  const values = property.enum ?? (Object.hasOwn(property, "const") ? [property.const] : []);
+  const accepted = test.enum ?? [test.const];
+  if (!values.length) throw new Error(`Cannot generate conditional variant for ${field}.`);
+  return values.map((value) => {
+    const branch = accepted.includes(value) ? rule.then : rule.else;
+    const properties = { ...variant.properties };
+    for (const [name, change] of Object.entries(branch?.properties ?? {})) {
+      if (change.$ref || change.type || Object.hasOwn(change, "const")) properties[name] = change;
+    }
+    properties[field] = { const: value };
+    return { ...variant, properties };
+  });
+}
+
 const typeDefinitions = Object.fromEntries(Object.entries(definitions).map(([name, definition]) => {
-  const shape = { ...definition };
-  delete shape.allOf;
-  delete shape.oneOf;
-  return [name, shape];
+  const { allOf = [], oneOf, ...shape } = definition;
+  const variants = allOf.reduce((current, rule) => current.flatMap((variant) => variantsFor(rule, variant)), [shape]);
+  const choices = oneOf ? variants.flatMap((variant) => oneOf.map(({ properties }) => ({
+    ...variant, properties: { ...variant.properties, ...properties },
+  }))) : variants;
+  return [name, choices.length === 1 ? choices[0] : { anyOf: choices }];
 }));
 const types = await compile({ ...seed, $defs: typeDefinitions, type: "object", additionalProperties: false, properties: Object.fromEntries(
   Object.entries(endpoints).map(([path, name]) => [path, { $ref: `#/$defs/${name}` }]),

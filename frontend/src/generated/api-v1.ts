@@ -22,14 +22,102 @@ export type UtcMs = number;
 export type Counter = number;
 /**
  * This interface was referenced by `GetResponses`'s JSON-Schema
+ * via the `definition` "Object".
+ */
+export type Object =
+  | {
+      id: Id;
+      name: Name;
+      status: "Lost";
+      registered_at_ms: UtcMs;
+      found_at_ms: null;
+      revision: Counter;
+      roi: Rect;
+      reference_media: Media;
+      expires_at_ms: UtcMs;
+      retention_grace: boolean;
+    }
+  | {
+      id: Id;
+      name: Name;
+      status: "Found";
+      registered_at_ms: UtcMs;
+      found_at_ms: UtcMs;
+      revision: Counter;
+      roi: Rect;
+      reference_media: Media;
+      expires_at_ms: UtcMs;
+      retention_grace: boolean;
+    };
+/**
+ * This interface was referenced by `GetResponses`'s JSON-Schema
  * via the `definition` "Name".
  */
 export type Name = string;
 /**
  * This interface was referenced by `GetResponses`'s JSON-Schema
+ * via the `definition` "Session".
+ */
+export type Session =
+  | {
+      id: Id;
+      object_id: Id;
+      control_mode: ControlMode;
+      state: "Searching";
+      started_at_ms: UtcMs;
+      ended_at_ms: null;
+      end_reason: null;
+      revision: Counter;
+      pause_causes: PauseCause[];
+    }
+  | {
+      id: Id;
+      object_id: Id;
+      control_mode: ControlMode;
+      state: "Paused";
+      started_at_ms: UtcMs;
+      ended_at_ms: null;
+      end_reason: null;
+      revision: Counter;
+      pause_causes: PauseCause[];
+    }
+  | {
+      id: Id;
+      object_id: Id;
+      control_mode: ControlMode;
+      state: "Ended";
+      started_at_ms: UtcMs;
+      ended_at_ms: UtcMs;
+      end_reason: EndReason;
+      revision: Counter;
+      pause_causes: PauseCause[];
+    };
+/**
+ * This interface was referenced by `GetResponses`'s JSON-Schema
  * via the `definition` "ControlMode".
  */
 export type ControlMode = "Gestures" | "Controller";
+/**
+ * This interface was referenced by `GetResponses`'s JSON-Schema
+ * via the `definition` "PauseCause".
+ */
+export type PauseCause =
+  | {
+      cause: "ManualPause";
+      failure_id: null;
+    }
+  | {
+      cause: "CandidateReview";
+      failure_id: null;
+    }
+  | {
+      cause: "ReviewRejected";
+      failure_id: null;
+    }
+  | {
+      cause: "RecoveryRequired";
+      failure_id: Id;
+    };
 /**
  * This interface was referenced by `GetResponses`'s JSON-Schema
  * via the `definition` "EndReason".
@@ -114,6 +202,146 @@ export type FailureCause =
   | "ProtocolMismatch";
 /**
  * This interface was referenced by `GetResponses`'s JSON-Schema
+ * via the `definition` "Match".
+ */
+export type Match =
+  | {
+      id: Id;
+      session_id: Id;
+      object_id: Id;
+      captured_at_ms: UtcMs;
+      frame_id: Id;
+      stream_epoch: Id;
+      box: Rect;
+      disposition: "Pending";
+      reviewed_at_ms: null;
+      evidence_media: Media;
+    }
+  | {
+      id: Id;
+      session_id: Id;
+      object_id: Id;
+      captured_at_ms: UtcMs;
+      frame_id: Id;
+      stream_epoch: Id;
+      box: Rect;
+      disposition: "Confirmed";
+      reviewed_at_ms: UtcMs;
+      evidence_media: Media;
+    }
+  | {
+      id: Id;
+      session_id: Id;
+      object_id: Id;
+      captured_at_ms: UtcMs;
+      frame_id: Id;
+      stream_epoch: Id;
+      box: Rect;
+      disposition: "Rejected";
+      reviewed_at_ms: UtcMs;
+      evidence_media: Media;
+    }
+  | {
+      id: Id;
+      session_id: Id;
+      object_id: Id;
+      captured_at_ms: UtcMs;
+      frame_id: Id;
+      stream_epoch: Id;
+      box: Rect;
+      disposition: "NotReviewed";
+      reviewed_at_ms: null;
+      evidence_media: Media;
+    };
+/**
+ * This interface was referenced by `GetResponses`'s JSON-Schema
+ * via the `definition` "PublicLease".
+ */
+export type PublicLease =
+  | {
+      state: "Unowned";
+      owner_client_id: null;
+      control_generation: Counter;
+      can_acquire: boolean;
+    }
+  | {
+      state: "Owned";
+      owner_client_id: Id;
+      control_generation: Counter;
+      can_acquire: false;
+    };
+/**
+ * This interface was referenced by `GetResponses`'s JSON-Schema
+ * via the `definition` "DeletionProgress".
+ */
+export type DeletionProgress =
+  | {
+      status: "Pending";
+      remaining_objects: number;
+      remaining_files: number;
+      error_code: null;
+    }
+  | {
+      status: "Complete";
+      remaining_objects: 0;
+      remaining_files: 0;
+      error_code: null;
+    }
+  | {
+      status: "Failed";
+      remaining_objects: number;
+      remaining_files: number;
+      error_code: ErrorCode;
+    };
+/**
+ * This interface was referenced by `GetResponses`'s JSON-Schema
+ * via the `definition` "Operation".
+ */
+export type Operation =
+  | {
+      action_id: RequestId;
+      request_id: null;
+      persistence: "Pending";
+      result: null;
+      error: null;
+    }
+  | {
+      action_id: null;
+      request_id: RequestId;
+      persistence: "Pending";
+      result: null;
+      error: null;
+    }
+  | {
+      action_id: RequestId;
+      request_id: null;
+      persistence: "Committed";
+      result: MutationResult;
+      error: null;
+    }
+  | {
+      action_id: null;
+      request_id: RequestId;
+      persistence: "Committed";
+      result: MutationResult;
+      error: null;
+    }
+  | {
+      action_id: RequestId;
+      request_id: null;
+      persistence: "Failed";
+      result: null;
+      error: Error;
+    }
+  | {
+      action_id: null;
+      request_id: RequestId;
+      persistence: "Failed";
+      result: null;
+      error: Error;
+    };
+/**
+ * This interface was referenced by `GetResponses`'s JSON-Schema
  * via the `definition` "RequestId".
  */
 export type RequestId = string;
@@ -183,22 +411,6 @@ export interface Snapshot {
 }
 /**
  * This interface was referenced by `GetResponses`'s JSON-Schema
- * via the `definition` "Object".
- */
-export interface Object {
-  id: Id;
-  name: Name;
-  status: "Lost" | "Found";
-  registered_at_ms: UtcMs;
-  found_at_ms: UtcMs | null;
-  revision: Counter;
-  roi: Rect;
-  reference_media: Media;
-  expires_at_ms: UtcMs;
-  retention_grace: boolean;
-}
-/**
- * This interface was referenced by `GetResponses`'s JSON-Schema
  * via the `definition` "Rect".
  */
 export interface Rect {
@@ -220,29 +432,6 @@ export interface Media {
   byte_length: number;
   created_at_ms: UtcMs;
   availability: "Available" | "Missing" | "Corrupt";
-}
-/**
- * This interface was referenced by `GetResponses`'s JSON-Schema
- * via the `definition` "Session".
- */
-export interface Session {
-  id: Id;
-  object_id: Id;
-  control_mode: ControlMode;
-  state: "Searching" | "Paused" | "Ended";
-  started_at_ms: UtcMs;
-  ended_at_ms: UtcMs | null;
-  end_reason: EndReason | null;
-  revision: Counter;
-  pause_causes: PauseCause[];
-}
-/**
- * This interface was referenced by `GetResponses`'s JSON-Schema
- * via the `definition` "PauseCause".
- */
-export interface PauseCause {
-  cause: "ManualPause" | "CandidateReview" | "ReviewRejected" | "RecoveryRequired";
-  failure_id: Id | null;
 }
 /**
  * This interface was referenced by `GetResponses`'s JSON-Schema
@@ -293,32 +482,6 @@ export interface Failure {
 }
 /**
  * This interface was referenced by `GetResponses`'s JSON-Schema
- * via the `definition` "Match".
- */
-export interface Match {
-  id: Id;
-  session_id: Id;
-  object_id: Id;
-  captured_at_ms: UtcMs;
-  frame_id: Id;
-  stream_epoch: Id;
-  box: Rect;
-  disposition: "Pending" | "Confirmed" | "Rejected" | "NotReviewed";
-  reviewed_at_ms: UtcMs | null;
-  evidence_media: Media;
-}
-/**
- * This interface was referenced by `GetResponses`'s JSON-Schema
- * via the `definition` "PublicLease".
- */
-export interface PublicLease {
-  state: "Unowned" | "Owned";
-  owner_client_id: Id | null;
-  control_generation: Counter;
-  can_acquire: boolean;
-}
-/**
- * This interface was referenced by `GetResponses`'s JSON-Schema
  * via the `definition` "Proximity".
  */
 export interface Proximity {
@@ -347,27 +510,6 @@ export interface Settings {
   retention_days: number;
   revision: Counter;
   updated_at_ms: UtcMs;
-}
-/**
- * This interface was referenced by `GetResponses`'s JSON-Schema
- * via the `definition` "DeletionProgress".
- */
-export interface DeletionProgress {
-  status: "Pending" | "Complete" | "Failed";
-  remaining_objects: number;
-  remaining_files: number;
-  error_code: ErrorCode | null;
-}
-/**
- * This interface was referenced by `GetResponses`'s JSON-Schema
- * via the `definition` "Operation".
- */
-export interface Operation {
-  action_id: RequestId | null;
-  request_id: RequestId | null;
-  persistence: "Pending" | "Committed" | "Failed";
-  result: MutationResult | null;
-  error: Error | null;
 }
 /**
  * This interface was referenced by `GetResponses`'s JSON-Schema

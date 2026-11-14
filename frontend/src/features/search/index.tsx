@@ -27,8 +27,8 @@ export async function SessionScreen({ sessionId, view }: { sessionId: string; vi
   const session = await application.get("/sessions/{id}", sessionId);
   if (session.kind === "api-error" && session.status === 404) notFound();
   if (session.kind !== "ok") return <DataUnavailable />;
-  const snapshot = await application.get("/snapshot");
-  if (snapshot.kind !== "ok") return <DataUnavailable />;
+  const snapshot = view === "live" ? await application.get("/snapshot") : null;
+  if (snapshot && snapshot.kind !== "ok") return <DataUnavailable />;
 
   const base = `/sessions/${session.data.id}`;
   return (
@@ -36,7 +36,7 @@ export async function SessionScreen({ sessionId, view }: { sessionId: string; vi
       <section className="panel">
         <h2>Sample session</h2>
         <p>{session.data.state}</p>
-        {view === "live" && snapshot.data.active_session === null && <p>No active search</p>}
+        {snapshot?.data.active_session === null && <p>No active search</p>}
       </section>
       <PreviewLinks links={[
         { href: `/objects/${session.data.object_id}`, label: "View sample object" },

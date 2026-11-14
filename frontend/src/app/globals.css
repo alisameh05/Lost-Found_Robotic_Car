@@ -8,7 +8,7 @@
   --ink: #f2efe8;
   --muted: #b0bec5;
   --primary: #e8bd74;
-  --teal: #b1ccc7;
+  --teal: #93b4ae;
   --border: #465159;
   font-family: "Instrument Sans Variable", sans-serif;
   background: var(--canvas);
@@ -46,8 +46,7 @@ a:hover { color: var(--ink); }
 
 .sidebar-links svg { flex-shrink: 0; }
 .sidebar-links a:hover { background: var(--elevated); }
-.sidebar-links a[aria-current] { background: var(--primary); color: #202020; }
-.sidebar-links a[aria-current="location"] { text-decoration: underline; text-underline-offset: .25em; }
+.sidebar-links a[aria-current] { background: var(--primary); color: #202020; text-decoration: underline; text-underline-offset: .25em; }
 
 .mode-label {
   margin-top: 2rem;

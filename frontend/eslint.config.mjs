@@ -15,7 +15,7 @@ const architecture = {
       const from = sourcePath(context.filename);
       const specifier = node.value;
       let to;
-      if (specifier.startsWith("@/")) to = specifier.slice(2);
+      if (specifier.startsWith("@/")) to = posix.normalize(specifier.slice(2));
       else if (specifier.startsWith(".")) to = posix.normalize(posix.join(dirname(from).replaceAll("\\", "/"), specifier));
       else return;
 
@@ -35,7 +35,8 @@ const architecture = {
 
       if (!featureAllowed || (targetLayer === "app" && layer !== "app") ||
           (layer === "lib" && targetLayer === "components") ||
-          (from.startsWith("app/") && to.startsWith("lib/fixtures/"))) {
+          (to.startsWith("lib/fixtures/") && !from.startsWith("lib/fixtures/") && from !== "lib/create-transport.ts") ||
+          (/^lib\/create-transport(?:\.ts)?$/.test(to) && !from.startsWith("features/runtime/"))) {
         context.report({ node, messageId: "boundary", data: { target: specifier } });
       }
     }
@@ -45,6 +46,11 @@ const architecture = {
       ExportAllDeclaration: ({ source }) => check(source),
       ExportNamedDeclaration: ({ source }) => check(source),
       ImportExpression: ({ source }) => check(source),
+      TSImportType: ({ source, argument }) => check(source?.literal ?? source ?? argument?.literal ?? argument),
+      TSExternalModuleReference: ({ expression }) => check(expression),
+      CallExpression: ({ callee, arguments: args }) => {
+        if (callee.type === "Identifier" && callee.name === "require") check(args[0]);
+      },
     };
   },
 };
@@ -53,7 +59,7 @@ export default defineConfig(
   next,
   nextTypeScript,
   {
-    files: ["src/**/*.{ts,tsx}"],
+    files: ["src/**/*.{js,jsx,ts,tsx,mjs,cjs,mts,cts}"],
     plugins: { local: { rules: { "architecture-imports": architecture } } },
     rules: { "local/architecture-imports": "error" },
   },

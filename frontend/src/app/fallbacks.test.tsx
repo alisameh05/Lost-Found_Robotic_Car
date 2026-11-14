@@ -10,16 +10,16 @@ vi.mock("next/navigation", () => ({ usePathname: () => "/" }));
 afterEach(cleanup);
 
 test("the fixture mode label remains visible while a destination loads or fails", async () => {
-  const reset = vi.fn();
+  const retry = vi.fn();
   const user = userEvent.setup();
   const view = render(<AppShell fixtureEnabled><Loading /></AppShell>);
   const label = "Fixture mode · Sample data · No robot connected";
   expect(screen.getByText(label)).toBeTruthy();
   expect(screen.getByRole("status").textContent).toContain("Loading preview");
 
-  view.rerender(<AppShell fixtureEnabled><RouteError reset={reset} /></AppShell>);
+  view.rerender(<AppShell fixtureEnabled><RouteError retry={retry} /></AppShell>);
   expect(screen.getByText(label)).toBeTruthy();
   expect(screen.getByRole("heading", { name: "Unable to open this preview" })).toBeTruthy();
   await user.click(screen.getByRole("button", { name: "Try again" }));
-  expect(reset).toHaveBeenCalledOnce();
+  expect(retry).toHaveBeenCalledOnce();
 });
