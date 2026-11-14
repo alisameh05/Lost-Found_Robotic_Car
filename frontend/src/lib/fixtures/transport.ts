@@ -395,6 +395,7 @@ export function createFixtureTransport({
           error: { code: "MEDIA_UNAVAILABLE", message: `Sample media is ${media.availability.toLowerCase()}.`, retryable: media.availability === "Missing" },
         };
         if (scene.recordsRecovery && id === "sample-keys-a-reference") return { kind: "unavailable" };
+        if (scene.recordsRecovery && id === "sample-usb-reference") return missing;
         const bytes = sampleMediaBytes(id, media.content_type);
         if (scene.recordsRecovery && id === "sample-keys-Z-reference") bytes.fill(0);
         return ok({ bytes, headers: {

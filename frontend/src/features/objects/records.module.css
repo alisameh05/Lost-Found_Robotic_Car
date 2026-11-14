@@ -103,6 +103,7 @@
 .selected > :first-child { margin-top: 0; }
 .muted, .paging p, .recordSummary dt { color: var(--muted); font-size: .875rem; }
 .preview { margin-block: var(--space-4); }
+.preview :global(.media-frame) { padding: var(--space-2); }
 .preview :global(.media-frame), .reference :global(.media-frame) { min-height: 9rem; }
 .preview img, .reference :global(.media-frame) > img { width: 100%; height: auto; max-height: 12rem; object-fit: contain; }
 .selectedHeading { gap: var(--space-2); }

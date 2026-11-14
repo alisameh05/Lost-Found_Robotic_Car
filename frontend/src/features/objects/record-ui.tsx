@@ -52,7 +52,7 @@ export function StartSearch({ object }: { object: ObjectRecord }) {
   const reason = object.status === "Found" ? "This object has already been found."
     : state === "Searching" || state === "Paused" ? `End the ${state.toLowerCase()} session before starting another search.`
     : health?.storage_integrity === "Unavailable" || storage?.status === "Unavailable" ? "Storage is unavailable."
-    : health?.storage_integrity === "Reconciling" ? "Storage is being checked."
+    : health?.storage_integrity === "Reconciling" || storage?.status === "Initializing" ? "Storage is being checked."
     : object.retention_grace ? "This expired record is available for its existing search only."
     : object.reference_media.availability !== "Available" ? "The reference image is unavailable."
     : undefined;

@@ -72,7 +72,12 @@ const scenarios = {
     }, null, null, false),
   }, { snapshotError: { code: "STORAGE_UNAVAILABLE", message: "Sample storage is unavailable.", retryable: true } }, "Failed"),
   empty: withSnapshot(snapshot, { objects: [], sessions: [], matches: [] }),
-  "records-recovery": withSnapshot(snapshot, { recordsRecovery: true }),
+  "records-recovery": withSnapshot(snapshot, {
+    recordsRecovery: true,
+    objects: libraryRecords.map((record) => ["sample-keys-a", "sample-keys-Z", "sample-usb"].includes(record.id)
+      ? { ...record, reference_media: { ...record.reference_media, availability: "Available" } }
+      : record),
+  }),
   "controller-ready": withSnapshot({ ...owned, readiness: readiness(controllerReady, fixtureProfile, null, true) }),
   "gestures-ready": withSnapshot({ ...owned, readiness: readiness(gesturesReady, fixtureProfile, null, true) }),
   candidate: withSnapshot({ ...active(candidateSession), pending_candidate: pending }, {

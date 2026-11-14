@@ -66,7 +66,7 @@ export const expiredObject: LostObject = {
   reference_media: { ...media("sample-expired-reference", "Reference", "Available", sampleTime - 8 * day), role: "Reference" },
 };
 
-function sampleRecord(id: string, name: string, hoursAgo: number, availability: Media["availability"] = "Available", roi = sampleSwatchRect): LostObject {
+function sampleRecord(id: string, name: string, hoursAgo: number, availability: Media["availability"] = "Missing", roi = sampleSwatchRect): LostObject {
   const registeredAt = sampleTime - hoursAgo * 3_600_000;
   return {
     ...sampleObject, id: `sample-${id}`, name, roi, registered_at_ms: registeredAt, expires_at_ms: registeredAt + 7 * day,

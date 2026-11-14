@@ -79,7 +79,8 @@ export function useRuntimeRead<Path extends ProtectedPath>(path: Path, id?: stri
 
 export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal: AbortSignal) => Promise<ReadResult<T>>,
   enabled = true, waitForRuntime = false) {
-  const runtime = useRuntime()?.connection?.runtime;
+  const state = useRuntime();
+  const runtime = state?.connection?.runtime;
   const { snapshot, connected, failedRead, loading } = useRuntimeView();
   const ready = connected && (!waitForRuntime || snapshot !== undefined || !loading);
   const [attempt, setAttempt] = useState(0);
@@ -103,7 +104,8 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
     result: current ? read.result : connected ? undefined : failedRead,
     retry: () => {
       if (connected) setAttempt((previous) => previous + 1);
-      else void runtime?.refresh();
+      else if (runtime) void runtime.refresh();
+      else if (state) state.select(state.selection.id);
     },
   };
 }

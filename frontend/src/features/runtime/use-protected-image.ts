@@ -18,6 +18,7 @@ export function useProtectedImage({ id, availability }: Media) {
     if (result?.kind === "api-error" && result.status === 410) {
       return { kind: "expired", detail: "Access to this reference has ended." };
     }
+    if (result?.kind === "api-error" && result.status === 404) return { kind: "not-found" };
     return { kind: "unavailable", detail: "The reference image could not be retrieved." };
   }, [availability, id, runtime]);
 }

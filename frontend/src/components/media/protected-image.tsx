@@ -5,7 +5,7 @@ import { MediaViewport } from "@/components/layout/panel";
 import { DataFeedback, LoadingState } from "@/components/ui/feedback";
 import type { Rect } from "@/generated/api-v1";
 
-type MediaFailure = { kind: "expired" | "missing" | "unavailable" | "corrupt" | "decode-error"; detail?: string };
+type MediaFailure = { kind: "expired" | "missing" | "not-found" | "unavailable" | "corrupt" | "decode-error"; detail?: string };
 export type LoadImage = (signal: AbortSignal) => Promise<{ kind: "ok"; image: Blob } | MediaFailure>;
 type ImageState = ({ kind: "ok"; url: string } | MediaFailure) & { load: LoadImage };
 

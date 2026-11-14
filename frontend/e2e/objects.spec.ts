@@ -103,6 +103,8 @@ test("shows Found metadata, protected reference failures, and distinct expired a
   await expect(preview(page).getByRole("img", { name: "Reference for Black wallet" })).toHaveAttribute("src", /^blob:/);
   await page.getByRole("button", { name: "Preview Reading glasses" }).click();
   await expect(preview(page).getByText("Media missing", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Preview USB drive" }).click();
+  await expect(preview(page).getByText("Media not found", { exact: true })).toBeVisible();
   await search(page).fill("Café");
   await expect(preview(page).getByText("Media unavailable", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Preview Straße%_ Café key ring", exact: true }).click();
@@ -138,6 +140,8 @@ test("keeps search navigation read-only and blocks setup during Searching, Pause
   await scenario.selectOption("deletion-failed");
   await objectsLink.click();
   await expect(preview(page).getByRole("button", { name: "Start Search" })).toHaveAccessibleDescription("Storage is unavailable.");
+  await openScenario(page, "initializing");
+  await expect(preview(page).getByRole("button", { name: "Start Search" })).toHaveAccessibleDescription("Storage is being checked.");
 });
 
 test("renders the objects screens at design and laptop sizes with local assets and enlarged text", async ({ page }, testInfo) => {
