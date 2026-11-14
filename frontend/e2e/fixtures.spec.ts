@@ -45,8 +45,8 @@ test("releases protected sample images on replacement, expiry, reset and navigat
   await page.getByRole("button", { name: "Inspect sample media" }).click();
   const media = page.getByLabel("Sample media", { exact: true });
   await expect(page.getByText("Sample image · Not live")).toBeVisible();
-  const image = page.getByRole("img", { name: "Synthetic geometric swatch" });
-  await expect.poll(() => image.evaluate((node: HTMLImageElement) => [node.naturalWidth, node.naturalHeight])).toEqual([32, 24]);
+  const image = page.getByRole("img", { name: "Synthetic fixture image" });
+  await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(640);
   const original = await image.getAttribute("src");
   await media.selectOption("sample-confirmed-evidence");
   await expect(page.getByText("Sample image · Captured evidence")).toBeVisible();
@@ -89,23 +89,25 @@ test("disconnected mode hides the harness even when requested", async ({ page })
   await page.getByRole("link", { name: "Objects / History" }).click();
   await expect(page.getByRole("heading", { name: "Application data unavailable" })).toBeVisible();
   const loadedFixtureCode = (await Promise.all(scripts)).some((script) =>
-    /Fixture mutation requests|Synthetic geometric swatch|sample-wallet-reference/.test(script));
+    /Fixture mutation requests|Synthetic fixture image|sample-wallet-reference/.test(script));
   expect(loadedFixtureCode).toBe(false);
 });
 
-test("record previews use the selected adapter for empty and expired data", async ({ page }) => {
+test("record screens use the selected adapter for empty data and active-session grace", async ({ page }) => {
   await page.goto("http://127.0.0.1:3100/");
   const scenario = page.getByLabel("Fixture scenario");
   await scenario.selectOption("empty");
   await expect(page.getByText("No active search", { exact: true })).toBeVisible();
   await page.getByRole("link", { name: "Objects / History" }).click();
-  await expect(page.getByText("The fixture returned no objects.")).toBeVisible();
-  await expect(page.getByRole("link", { name: "Black wallet" })).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "No objects registered" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "View details for Black wallet" })).toHaveCount(0);
   await page.getByRole("link", { name: "Dashboard" }).click();
   await scenario.selectOption("expiry-grace");
   await page.getByRole("link", { name: "Return to Active Search" }).click();
   await page.getByRole("link", { name: "View sample object" }).click();
-  await expect(page.getByText("Sample expired object · Lost")).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Sample expired object" })).toBeVisible();
+  await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();
+  await expect(page.getByRole("img", { name: "Reference for Sample expired object", exact: true })).toBeVisible();
   await page.goto("http://127.0.0.1:3100/objects/sample-expired");
   await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
 });

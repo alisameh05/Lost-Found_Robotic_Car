@@ -182,8 +182,8 @@ test("keeps local assets, visible focus and modeless access through the laptop a
   await expect(page.getByRole("status").filter({ hasText: "Motion permission revoked" })).toContainText("Save pending");
   const media = page.getByRole("region", { name: "Sample media preview" });
   await expect(media.getByText("Sample image · Not live")).toBeVisible();
-  const image = media.getByRole("img", { name: "Synthetic geometric swatch" });
-  await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(32);
+  const image = media.getByRole("img", { name: "Synthetic fixture image" });
+  await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(640);
   await media.getByLabel("Sample media", { exact: true }).scrollIntoViewIfNeeded();
   await expect(stop).toBeInViewport();
   await capture("1366x768-modeless-media");

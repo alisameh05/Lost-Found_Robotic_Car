@@ -1,16 +1,17 @@
 "use client";
 
-import { useEffect, useState } from "react";
+import { useEffect, useState, type CSSProperties } from "react";
 import { MediaViewport } from "@/components/layout/panel";
 import { DataFeedback, LoadingState } from "@/components/ui/feedback";
+import type { Rect } from "@/generated/api-v1";
 
-type MediaFailure = { kind: "expired" | "missing" | "unavailable" | "corrupt"; detail: string };
-type LoadImage = (signal: AbortSignal) => Promise<{ kind: "ok"; image: Blob } | MediaFailure>;
+type MediaFailure = { kind: "expired" | "missing" | "unavailable" | "corrupt" | "decode-error"; detail?: string };
+export type LoadImage = (signal: AbortSignal) => Promise<{ kind: "ok"; image: Blob } | MediaFailure>;
 type ImageState = ({ kind: "ok"; url: string } | MediaFailure) & { load: LoadImage };
 
 export function ProtectedImage({
-  load, label, alt, width, height,
-}: { load: LoadImage; label: string; alt: string; width: number; height: number }) {
+  load, label, alt, width, height, target,
+}: { load: LoadImage; label: string; alt: string; width: number; height: number; target?: Rect }) {
   const [state, setState] = useState<ImageState>();
 
   useEffect(() => {
@@ -33,19 +34,32 @@ export function ProtectedImage({
     };
   }, [load]);
 
-  return (
-    <MediaViewport label={label}>
-      {state?.load !== load ? <LoadingState label="Loading image" announce={false} />
-        : state.kind !== "ok" ? <DataFeedback state={state.kind} detail={state.detail} />
-        // Protected object URLs are local and temporary.
-        // eslint-disable-next-line @next/next/no-img-element
-        : <img
-            alt={alt} src={state.url} width={width} height={height}
-            onError={() => {
-              URL.revokeObjectURL(state.url);
-              setState({ load, kind: "corrupt", detail: "The image could not be decoded." });
-            }}
-          />}
-    </MediaViewport>
-  );
+  function renderImage(crop?: Rect) {
+    if (state?.load !== load) return <LoadingState label="Loading image" announce={false} />;
+    if (state.kind !== "ok") return <DataFeedback state={state.kind} detail={state.detail} />;
+
+    // Protected object URLs are local and temporary. The crop uses the same decoded source.
+    const image = ( // eslint-disable-next-line @next/next/no-img-element
+      <img
+        alt={crop ? `Selected target from ${alt}` : alt} src={state.url} width={width} height={height}
+        style={crop && {
+          width: `${100 * width / crop.width}%`, left: `${-100 * crop.x / crop.width}%`, top: `${-100 * crop.y / crop.height}%`,
+        }}
+        onError={() => {
+          URL.revokeObjectURL(state.url);
+          setState((current) => current === state ? { load, kind: "decode-error" } : current);
+        }}
+      />
+    );
+    return crop ? (
+      <div className="protected-crop" style={{ "--crop-ratio": crop.width / crop.height, aspectRatio: "var(--crop-ratio)" } as CSSProperties}>
+        {image}
+      </div>
+    ) : image;
+  }
+
+  return <>
+    <MediaViewport label={label}>{renderImage()}</MediaViewport>
+    {target && <MediaViewport label="Selected target">{renderImage(target)}</MediaViewport>}
+  </>;
 }

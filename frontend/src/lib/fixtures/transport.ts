@@ -4,11 +4,13 @@ import type {
   SessionAction, StartRequest, TicketRequest,
 } from "@/generated/api-v1";
 import { compatibleProfile, conforms } from "../fixture-contracts";
+import { maxObjectNameLength, normalizeObjectName } from "../object-name";
 import type {
   ApplicationTransport, Endpoint, HttpRequest, ObjectQuery, ProtectedMedia, ProtectedPath,
   ProtectedRequest, ReadResult,
 } from "../transport";
-import { imageHeight, imageWidth, sampleImage } from "./images";
+import { imageHeight, imageWidth, sampleImage, sampleMediaBytes } from "./images";
+import { caseFold } from "./casefold";
 import {
   emergencyResponse, emptyResult, mutation, registrationReceipt, reviewReceipt,
   sampleRetentionPreview, startReceipt, validationError,
@@ -50,6 +52,9 @@ export function createFixtureTransport({
   let ticketSequence = 0;
   let emergencyFailure = snapshot.failures.find((failure) => failure.cause === "EmergencyStop" && !failure.restored);
   const profile = compatibleProfile(snapshot.qualification_profile) ? snapshot.qualification_profile : null;
+  let failList = scene.recordsRecovery;
+  let failDetail = scene.recordsRecovery;
+  let expireContinuation = scene.recordsRecovery;
 
   function signalFor(signal?: AbortSignal) {
     return signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
@@ -92,12 +97,14 @@ export function createFixtureTransport({
 
   function objectsPage(query: ObjectQuery = {}) {
     const { name, status, ...pagination } = query;
-    if ((name !== undefined && (typeof name !== "string" || [...name].length > 120)) ||
+    if ((name !== undefined && typeof name !== "string") ||
         (status !== undefined && status !== "Found" && status !== "Lost")) return invalid;
-    const search = name?.trim().normalize("NFC").toLowerCase() ?? "";
+    const normalizedName = normalizeObjectName(name ?? "");
+    if ([...normalizedName].length > maxObjectNameLength) return invalid;
+    const search = caseFold(normalizedName);
     const items = eligibleObjects().filter((object) =>
-      (status === undefined || status === object.status) && object.name.toLowerCase().includes(search));
-    return pages.read(items, (item) => item.registered_at_ms, JSON.stringify(["objects", search, status]), pagination, now());
+      (status === undefined || status === object.status) && caseFold(object.name).includes(search));
+    return pages.read(items, (item) => item.registered_at_ms, JSON.stringify(["objects", normalizedName, status]), pagination, now());
   }
 
   async function register(input: FixtureRequest): Promise<ReadResult<MutationResponse>> {
@@ -124,7 +131,8 @@ export function createFixtureTransport({
     const registered = registrationReceipt.object;
     const object: LostObject = {
       ...registered, id: "sample-new-object", name: body.name.trim().normalize("NFC"), roi: body.roi,
-      reference_media: { ...registered.reference_media, id: "sample-new-reference", content_type: contentType, byte_length: sample.length },
+      reference_media: { ...registered.reference_media, id: "sample-new-reference", content_type: contentType,
+        width: imageWidth, height: imageHeight, byte_length: sample.length },
     };
     return mutation(body.action_id, persistence, { ...registrationReceipt, object }, 201, "/api/v1/objects/sample-new-object");
   }
@@ -160,8 +168,24 @@ export function createFixtureTransport({
   const handlers: { [Route in Endpoint]: (input: FixtureRequest) => ReadResult<HttpResponses[Route]> | Promise<ReadResult<HttpResponses[Route]>> } = {
     "GET /health": () => ok(healthFor(snapshot, scene.health.initialization), scene.health.initialization === "Ready" ? 200 : 503),
     "GET /snapshot": () => scene.snapshotError ? { kind: "api-error", status: 503, error: scene.snapshotError } : ok(snapshot),
-    "GET /objects": ({ query }) => objectsPage(query),
-    "GET /objects/{id}": ({ id }) => objectRead(id),
+    "GET /objects": ({ query }) => {
+      if (failList) {
+        failList = false;
+        return { kind: "unavailable" };
+      }
+      if (expireContinuation && query?.cursor) {
+        expireContinuation = false;
+        pages.clear();
+      }
+      return objectsPage(query);
+    },
+    "GET /objects/{id}": ({ id }) => {
+      if (failDetail) {
+        failDetail = false;
+        return { kind: "unavailable" };
+      }
+      return objectRead(id);
+    },
     "GET /objects/{id}/sessions": ({ id, query }) => {
       const parent = objectRead(id);
       const sessions = scene.sessions.map((session) => snapshot.active_session?.id === session.id ? snapshot.active_session : session);
@@ -370,7 +394,10 @@ export function createFixtureTransport({
           kind: "api-error", status: 503,
           error: { code: "MEDIA_UNAVAILABLE", message: `Sample media is ${media.availability.toLowerCase()}.`, retryable: media.availability === "Missing" },
         };
-        return ok({ bytes: sampleImage(media.content_type), headers: {
+        if (scene.recordsRecovery && id === "sample-keys-a-reference") return { kind: "unavailable" };
+        const bytes = sampleMediaBytes(id, media.content_type);
+        if (scene.recordsRecovery && id === "sample-keys-Z-reference") bytes.fill(0);
+        return ok({ bytes, headers: {
           "Content-Type": media.content_type, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Accept-Ranges": "none",
         } });
       });

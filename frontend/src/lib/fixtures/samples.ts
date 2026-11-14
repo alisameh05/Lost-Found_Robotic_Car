@@ -1,9 +1,9 @@
 import {
   componentNames, type BootstrapResponse, type Component, type ComponentName, type ErrorCode,
   type Failure, type FrontendProfile, type Health, type Match, type Media, type Object as LostObject,
-  type Proximity, type Session, type Settings, type Snapshot,
+  type Proximity, type Rect, type Session, type Settings, type Snapshot,
 } from "@/generated/api-v1";
-import { imageHeight, imageWidth, sampleImage } from "./images";
+import { imageHeight, imageWidth, sampleImage, sampleReference } from "./images";
 
 export const sampleTime = Date.UTC(2026, 10, 13, 12);
 export const day = 86_400_000;
@@ -38,28 +38,57 @@ export const bootstrapFacts: BootstrapResponse = {
 
 function media(id: string, role: Media["role"], availability: Media["availability"], created_at_ms: number): Media {
   const content_type = role === "Reference" ? "image/jpeg" : "image/png";
-  return { id, role, availability, created_at_ms, content_type, width: imageWidth, height: imageHeight,
-    byte_length: sampleImage(content_type).byteLength };
+  const reference = sampleReference(id);
+  return { id, role, availability, created_at_ms, content_type,
+    width: reference?.width ?? imageWidth, height: reference?.height ?? imageHeight,
+    byte_length: reference?.byte_length ?? sampleImage(content_type).byteLength };
 }
 
+export const sampleSwatchRect: Rect = { x: 7, y: 5, width: 18, height: 14 };
 const registered = sampleTime - 3_600_000;
 export const sampleObject: LostObject = {
   id: "sample-wallet", name: "Black wallet", status: "Lost", registered_at_ms: registered, found_at_ms: null,
-  roi: { x: 7, y: 5, width: 18, height: 14 },
+  roi: { x: 148, y: 87, width: 342, height: 186 },
   reference_media: { ...media("sample-wallet-reference", "Reference", "Available", registered), role: "Reference" },
   revision: 1, expires_at_ms: registered + 7 * day, retention_grace: false,
 };
 
 export const foundObject: LostObject = {
   ...sampleObject, id: "sample-headphones", name: "Headphones", status: "Found",
+  roi: sampleSwatchRect,
   registered_at_ms: registered - day, expires_at_ms: registered + 6 * day, found_at_ms: sampleTime - 180_000, revision: 2,
   reference_media: { ...media("sample-headphones-reference", "Reference", "Corrupt", registered - day), role: "Reference" },
 };
 export const expiredObject: LostObject = {
   ...sampleObject, id: "sample-expired", name: "Sample expired object",
+  roi: sampleSwatchRect,
   registered_at_ms: sampleTime - 8 * day, expires_at_ms: sampleTime - day,
   reference_media: { ...media("sample-expired-reference", "Reference", "Available", sampleTime - 8 * day), role: "Reference" },
 };
+
+function sampleRecord(id: string, name: string, hoursAgo: number, availability: Media["availability"] = "Available", roi = sampleSwatchRect): LostObject {
+  const registeredAt = sampleTime - hoursAgo * 3_600_000;
+  return {
+    ...sampleObject, id: `sample-${id}`, name, roi, registered_at_ms: registeredAt, expires_at_ms: registeredAt + 7 * day,
+    reference_media: { ...media(`sample-${id}-reference`, "Reference", availability, registeredAt), role: "Reference" },
+  };
+}
+
+export const libraryRecords = [
+  sampleObject,
+  sampleRecord("office-keys", "Office keys", 3),
+  foundObject,
+  sampleRecord("bottle", "Blue water bottle", 28, "Available", { x: 271, y: 54, width: 108, height: 266 }),
+  sampleRecord("glasses", "Reading glasses", 32, "Missing"),
+  sampleRecord("usb", "USB drive", 36),
+  sampleRecord("keys-a", "Straße%_ Café keys", 37),
+  sampleRecord("keys-Z", "Straße%_ Café key ring", 37),
+  ...Array.from({ length: 20 }, (_, index) => {
+    const number = String(index + 1).padStart(2, "0");
+    return sampleRecord(`storage-tag-${number}`, `Storage tag ${number}`, 48 + index);
+  }),
+];
+
 export const missingMedia = media("sample-missing-evidence", "Evidence", "Missing", sampleTime - 75_000);
 
 export const sampleSession: Extract<Session, { state: "Ended" }> = {
@@ -81,7 +110,7 @@ const rejectedAt = sampleTime - 100_000;
 export const rejected: Match = {
   id: "sample-rejected", session_id: sampleSession.id, object_id: sampleObject.id,
   captured_at_ms: rejectedAt, frame_id: "sample-rejected-frame", stream_epoch: "fixture-robot-stream",
-  box: sampleObject.roi, disposition: "Rejected", reviewed_at_ms: rejectedAt + 1000,
+  box: sampleSwatchRect, disposition: "Rejected", reviewed_at_ms: rejectedAt + 1000,
   evidence_media: { ...media("sample-rejected-evidence", "Evidence", "Available", rejectedAt), role: "Evidence", content_type: "image/png" },
 };
 export const notReviewed: Match = {

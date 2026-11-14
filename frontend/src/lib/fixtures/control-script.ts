@@ -1,6 +1,6 @@
 import type { ApplicationTransport, ProtectedRequest } from "../transport";
 import { sampleImage } from "./images";
-import { sampleObject } from "./samples";
+import { sampleSwatchRect } from "./samples";
 
 type Outcome = "Committed" | "Failed";
 type SampleRead = "unavailable" | "empty";
@@ -35,7 +35,7 @@ export function openControlScript() {
       try {
         const result = await transport.request("POST /objects", {
           ...request, actionCreatedAtMs: createdAt,
-          body: { action_id: crypto.randomUUID(), name: label, roi: sampleObject.roi,
+          body: { action_id: crypto.randomUUID(), name: label, roi: sampleSwatchRect,
             reference_image: new Blob([sampleImage("image/jpeg")], { type: "image/jpeg" }) },
         });
         return result.kind === "ok" ? result.data.persistence : "Failed";
