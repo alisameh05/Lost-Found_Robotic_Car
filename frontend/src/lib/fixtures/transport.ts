@@ -1,6 +1,6 @@
 import type {
   EmergencyStopRequest, Error as ApiError, EventEnvelope, FrameMetadata, HttpResponses,
-  MutationResponse, Object as LostObject, RegistrationFields, RetentionChange, RetentionPreviewRequest,
+  RetentionChange, RetentionPreviewRequest,
   SessionAction, StartRequest, TicketRequest,
 } from "@/generated/api-v1";
 import { compatibleProfile, conforms } from "../fixture-contracts";
@@ -9,11 +9,13 @@ import type {
   ApplicationTransport, Endpoint, HttpRequest, ObjectQuery, ProtectedMedia, ProtectedPath,
   ProtectedRequest, ReadResult,
 } from "../transport";
-import { imageHeight, imageWidth, sampleImage, sampleMediaBytes } from "./images";
+import { sampleMediaBytes } from "./images";
+import type { normalizeReference } from "../reference-image";
+import { openRegistrations } from "./registration";
 import { caseFold } from "./casefold";
 import {
-  emergencyResponse, emptyResult, mutation, registrationReceipt, reviewReceipt,
-  sampleRetentionPreview, startReceipt, validationError,
+  emergencyResponse, emptyResult, mutation, reviewReceipt,
+  sampleRetentionPreview, startReceipt,
 } from "./mutations";
 import { fixturePages } from "./pages";
 import { day, expiredObject, healthFor, leaseId, recoveryFailure, requestId, sampleTime } from "./samples";
@@ -25,7 +27,8 @@ type FixtureOptions = {
   now?: () => number;
   eventScript?: "catalogue";
   observeMutation?: (route: Endpoint, body: unknown) => void;
-  scriptedRegistration?: (signal: AbortSignal) => Promise<"Committed" | "Failed" | undefined>;
+  normalizeRegistration?: typeof normalizeReference;
+  scriptedRegistration?: (actionId: string, signal: AbortSignal) => Promise<"Committed" | "Failed" | undefined>;
 };
 type FixtureRequest = ProtectedRequest & {
   id?: string; query?: ObjectQuery; body?: unknown; actionCreatedAtMs?: number;
@@ -39,13 +42,20 @@ const invalid = error(422, "VALIDATION_FAILED", "A sample request field is inval
 const conflict = error(409, "REVISION_CONFLICT", "Sample revision has changed.");
 
 export function createFixtureTransport({
-  scenario = "idle", now = () => sampleTime, eventScript, observeMutation, scriptedRegistration,
+  scenario = "idle", now: fixtureNow, eventScript, observeMutation, scriptedRegistration, normalizeRegistration,
 }: FixtureOptions = {}): ApplicationTransport {
+  const startedAt = performance.now();
+  const now = fixtureNow ?? (() => sampleTime + Math.floor(performance.now() - startedAt));
   const scene = readScenario(scenario);
   const { bootstrap } = scene;
   let { snapshot } = scene;
   const lifetime = new AbortController();
   const pages = fixturePages();
+  const registrations = openRegistrations({
+    now, signal: lifetime.signal, getSnapshot: () => snapshot, healthy: scene.health.storage_integrity === "Healthy",
+    normalize: normalizeRegistration, recovery: scenario === "registration-recovery", scripted: scriptedRegistration,
+  });
+  const snapshotRead = () => ({ ...snapshot, operations: [...snapshot.operations, ...registrations.operations()] });
   const previews = new Map<string, { value: ReturnType<typeof sampleRetentionPreview>; owners: string }>();
   const retentionReceipts = new Map<string, { fingerprint: string; response: ReturnType<typeof mutation> }>();
   let previewSequence = 0;
@@ -78,13 +88,14 @@ export function createFixtureTransport({
 
   function eligibleObjects() {
     const time = now();
-    return scene.objects.filter((object) => object.expires_at_ms > time || object.retention_grace);
+    return [...scene.objects.filter((object) => object.expires_at_ms > time || object.retention_grace),
+      ...registrations.records().map(({ object }) => object)];
   }
 
   function objectRead(id?: string) {
     const object = eligibleObjects().find((item) => item.id === id);
     if (object) return ok(object);
-    return scene.objects.some((item) => item.id === id) || id === expiredObject.id ? expired : missing;
+    return scene.objects.some((item) => item.id === id) || id === expiredObject.id || registrations.isExpired(id) ? expired : missing;
   }
 
   function sessionRead(id?: string) {
@@ -105,36 +116,6 @@ export function createFixtureTransport({
     const items = eligibleObjects().filter((object) =>
       (status === undefined || status === object.status) && caseFold(object.name).includes(search));
     return pages.read(items, (item) => item.registered_at_ms, JSON.stringify(["objects", normalizedName, status]), pagination, now());
-  }
-
-  async function register(input: FixtureRequest): Promise<ReadResult<MutationResponse>> {
-    const { reference_image: image, ...body } = (input.body ?? {}) as RegistrationFields & { reference_image?: Blob };
-    if (!conforms("RegistrationFields", body) || !(image instanceof Blob) || image.size < 1 ||
-        !["image/jpeg", "image/png"].includes(image.type)) return invalid;
-    if (image.size > 10_485_760) return error(413, "PAYLOAD_TOO_LARGE", "Sample reference is too large.");
-    const contentType = image.type === "image/png" ? "image/png" : "image/jpeg";
-    const sample = sampleImage(contentType);
-    const bytes = new Uint8Array(await image.arrayBuffer());
-    if (bytes.length !== sample.length || !sample.every((byte, index) => bytes[index] === byte)) return invalid;
-    const submitted = input.actionCreatedAtMs;
-    if (submitted === undefined || !Number.isSafeInteger(submitted) || submitted < 0) return invalid;
-    const age = now() - submitted;
-    if (age < 0 || age > 600_000) return error(410, "ACTION_EXPIRED", "Sample registration has expired.");
-    if (body.roi.width > imageWidth - body.roi.x) return { kind: "api-error", status: 422, error: validationError } as const;
-    if (body.roi.height > imageHeight - body.roi.y) return { kind: "api-error", status: 422, error: {
-      ...validationError, field_errors: [{ path: "/roi/height", code: "OUT_OF_RANGE", message: "Height must fit the normalized source image." }],
-    } };
-    if (scene.snapshot.retention.deletion.status === "Failed") return error(503, "STORAGE_UNAVAILABLE", "Sample deletion is incomplete.");
-    const scripted = await scriptedRegistration?.(signalFor(input.signal));
-    const persistence = scripted ?? (scene.health.initialization === "Starting" ? "Pending"
-      : scene.health.initialization === "Failed" ? "Failed" : "Committed");
-    const registered = registrationReceipt.object;
-    const object: LostObject = {
-      ...registered, id: "sample-new-object", name: body.name.trim().normalize("NFC"), roi: body.roi,
-      reference_media: { ...registered.reference_media, id: "sample-new-reference", content_type: contentType,
-        width: imageWidth, height: imageHeight, byte_length: sample.length },
-    };
-    return mutation(body.action_id, persistence, { ...registrationReceipt, object }, 201, "/api/v1/objects/sample-new-object");
   }
 
   function start(body: StartRequest) {
@@ -167,7 +148,7 @@ export function createFixtureTransport({
 
   const handlers: { [Route in Endpoint]: (input: FixtureRequest) => ReadResult<HttpResponses[Route]> | Promise<ReadResult<HttpResponses[Route]>> } = {
     "GET /health": () => ok(healthFor(snapshot, scene.health.initialization), scene.health.initialization === "Ready" ? 200 : 503),
-    "GET /snapshot": () => scene.snapshotError ? { kind: "api-error", status: 503, error: scene.snapshotError } : ok(snapshot),
+    "GET /snapshot": () => scene.snapshotError ? { kind: "api-error", status: 503, error: scene.snapshotError } : ok(snapshotRead()),
     "GET /objects": ({ query }) => {
       if (failList) {
         failList = false;
@@ -199,7 +180,7 @@ export function createFixtureTransport({
         (match) => match.captured_at_ms, `matches:${id}`, query ?? {}, now()) : parent;
     },
     "GET /settings": () => ok(snapshot.retention.settings),
-    "POST /objects": register,
+    "POST /objects": (request) => registrations.submit(request as HttpRequest<"POST /objects">),
     "POST /sessions": ({ body }) => start(body as StartRequest),
     "POST /sessions/{id}/actions": ({ body: value, id }) => {
       const body = value as SessionAction;
@@ -364,7 +345,7 @@ export function createFixtureTransport({
       return handlers["POST /emergency-stop"]({ ...request, body });
     }, false),
     subscribeEvents(request, onEvent) {
-      const events = eventScript === "catalogue" ? eventVectors : [snapshotEvent(snapshot)];
+      const events = eventScript === "catalogue" ? eventVectors : [snapshotEvent(snapshotRead())];
       const signal = signalFor(request.signal);
       let subscribed = true;
       const unsubscribe = subscribe(request, () => {
@@ -383,11 +364,12 @@ export function createFixtureTransport({
     },
     media(id, request) {
       return respond<ProtectedMedia>(request, () => {
-        const reference = scene.objects.find(({ reference_media }) => reference_media.id === id);
+        const registered = registrations.records().find(({ object }) => object.reference_media.id === id);
+        const reference = registered?.object ?? scene.objects.find(({ reference_media }) => reference_media.id === id);
         const match = scene.matches.find(({ evidence_media }) => evidence_media.id === id);
         if (id === expiredObject.reference_media.id && !reference) return expired;
         const media = reference?.reference_media ?? match?.evidence_media;
-        if (!media) return missing;
+        if (!media) return registrations.isExpired(id) ? expired : missing;
         const owner = objectRead(reference?.id ?? match?.object_id);
         if (owner.kind !== "ok") return owner;
         if (media.availability !== "Available") return {
@@ -396,13 +378,13 @@ export function createFixtureTransport({
         };
         if (scene.recordsRecovery && id === "sample-keys-a-reference") return { kind: "unavailable" };
         if (scene.recordsRecovery && id === "sample-usb-reference") return missing;
-        const bytes = sampleMediaBytes(id, media.content_type);
+        const bytes = registered?.bytes ?? sampleMediaBytes(id, media.content_type);
         if (scene.recordsRecovery && id === "sample-keys-Z-reference") bytes.fill(0);
         return ok({ bytes, headers: {
           "Content-Type": media.content_type, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Accept-Ranges": "none",
         } });
       });
     },
-    dispose() { lifetime.abort(); pages.clear(); previews.clear(); retentionReceipts.clear(); },
+    dispose() { lifetime.abort(); pages.clear(); previews.clear(); retentionReceipts.clear(); registrations.clear(); },
   };
 }

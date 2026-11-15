@@ -16,11 +16,13 @@ export function createScenarioHarness() {
     ] as const,
     open(id: string) {
       const scenario = scenarioIds.find((name) => name === id) ?? "idle";
-      let now = sampleTime;
+      const startedAt = performance.now();
+      let offset = 0;
+      const now = () => sampleTime + offset + Math.floor(performance.now() - startedAt);
       const controls = openControlScript();
       let requests: readonly ObservedMutation[] = [];
       const observers = new Set<() => void>();
-      const transport = createFixtureTransport({ scenario, now: () => now, scriptedRegistration: controls.waitForDelivery, observeMutation(route, body) {
+      const transport = createFixtureTransport({ scenario, now, scriptedRegistration: controls.waitForDelivery, observeMutation(route, body) {
         requests = [...requests, { route, ...(route === "POST /emergency-stop" ? { body: structuredClone(body) } : {}) }];
         for (const notify of observers) notify();
       } });
@@ -29,11 +31,11 @@ export function createScenarioHarness() {
         async submitSample(label: string, outcome: "Committed" | "Failed", signal: AbortSignal) {
           const bootstrap = await transport.bootstrap(signal);
           if (bootstrap.kind !== "ok") return "Failed";
-          return controls.submit(transport, { context: bootstrap.data, signal }, label, outcome, now);
+          return controls.submit(transport, { context: bootstrap.data, signal }, label, outcome, now());
         },
         readSample: controls.read,
         deliverSample: controls.deliver,
-        expire() { now = sampleTime + 9 * day; },
+        expire() { offset = 9 * day; },
         readRequests: () => requests,
         subscribeRequests(notify: () => void) {
           observers.add(notify);
