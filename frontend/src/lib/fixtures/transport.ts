@@ -49,6 +49,7 @@ export function createFixtureTransport({
   const scene = readScenario(scenario);
   const { bootstrap } = scene;
   let { snapshot } = scene;
+  let snapshotError = scene.snapshotError;
   const lifetime = new AbortController();
   const pages = fixturePages();
   const registrations = openRegistrations({
@@ -165,7 +166,11 @@ export function createFixtureTransport({
 
   const handlers: { [Route in Endpoint]: (input: FixtureRequest) => ReadResult<HttpResponses[Route]> | Promise<ReadResult<HttpResponses[Route]>> } = {
     "GET /health": () => ok(healthFor(snapshot, scene.health.initialization), scene.health.initialization === "Ready" ? 200 : 503),
-    "GET /snapshot": () => scene.snapshotError ? { kind: "api-error", status: 503, error: scene.snapshotError } : ok(snapshotRead()),
+    "GET /snapshot": () => {
+      const error = snapshotError;
+      if (scene.snapshotErrorOnce) snapshotError = undefined;
+      return error ? { kind: "api-error", status: 503, error } : ok(snapshotRead());
+    },
     "GET /objects": ({ query }) => {
       if (failList) {
         failList = false;

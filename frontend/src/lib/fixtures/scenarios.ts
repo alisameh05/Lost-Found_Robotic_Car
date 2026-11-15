@@ -14,6 +14,7 @@ type Scenario = {
   sessions: readonly Session[];
   matches: readonly Match[];
   snapshotError?: ApiError;
+  snapshotErrorOnce?: boolean;
   recordsRecovery?: boolean;
   historyRecovery?: boolean;
   emergency: "Committed" | "Pending" | "Failed" | "network";
@@ -114,6 +115,14 @@ const scenarios = {
   }),
   "controller-ready": withSnapshot({ ...owned, readiness: readiness(controllerReady, fixtureProfile, null, true) }),
   "gestures-ready": withSnapshot({ ...owned, readiness: readiness(gesturesReady, fixtureProfile, null, true) }),
+  "camera-unavailable": withSnapshot({
+    ...owned, readiness: readiness({
+      ...gesturesReady, RobotVideo: "Unavailable", DisplayedRobotVideo: "Unavailable",
+    }, fixtureProfile, null, true),
+  }, {
+    snapshotError: { code: "INTERNAL_ERROR", message: "Sample snapshot could not be read.", retryable: true },
+    snapshotErrorOnce: true,
+  }),
   candidate: withSnapshot({ ...active(candidateSession), pending_candidate: pending }, {
     sessions: [candidateSession, foundSession], matches: [pending, rejected, confirmed],
   }),

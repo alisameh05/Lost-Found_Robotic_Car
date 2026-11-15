@@ -4,3 +4,4 @@ export { RuntimeProvider, useApplicationRead, useRuntime, useRuntimeRead, useRun
 export type { RegistrationAction, RuntimeProjection } from "./projection";
 export { useCursorPage, useProtectedRead } from "./use-protected-read";
 export { useProtectedImage } from "./use-protected-image";
+export { useEligibleSearchSetup } from "./use-eligible-search-setup";
