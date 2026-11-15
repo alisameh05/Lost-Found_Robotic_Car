@@ -9,12 +9,16 @@ import styles from "./records.module.css";
 
 export const dispositionLabel = (disposition: Match["disposition"]) => disposition === "NotReviewed" ? "Not reviewed" : disposition;
 
-export function CapturedEvidence({ match }: { match: Match }) {
+export function CapturedEvidence({ match, zoom, onDisplay }: {
+  match: Match;
+  zoom?: boolean;
+  onDisplay?: (available: boolean | undefined) => void;
+}) {
   const media = match.evidence_media;
   const load = useProtectedImage(media);
   return <article className={styles.capture}>
     <ProtectedImage load={load} label="Captured evidence" alt="Captured evidence"
-      width={media.width} height={media.height} box={match.box} />
+      width={media.width} height={media.height} box={match.box} zoom={zoom} onDisplay={onDisplay} />
     <StatusBadge tone={match.disposition === "Confirmed" ? "success" : match.disposition === "Pending" ? "warning" : "muted"}>
       {dispositionLabel(match.disposition)}
     </StatusBadge>

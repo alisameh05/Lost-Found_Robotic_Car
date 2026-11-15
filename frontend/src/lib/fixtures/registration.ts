@@ -170,6 +170,14 @@ export function openRegistrations({ now, signal, getSnapshot, healthy, isExclude
   return {
     submit,
     records: () => [...records.values()],
+    updateObject(updated: Record["object"]) {
+      for (const [action, record] of records) {
+        if (record.object.id === updated.id) {
+          records.set(action, { ...record, object: updated });
+          return;
+        }
+      }
+    },
     purge(owners: ReadonlyMap<string, number>) {
       for (const [action, { object }] of records) {
         if (!owners.has(object.id)) continue;

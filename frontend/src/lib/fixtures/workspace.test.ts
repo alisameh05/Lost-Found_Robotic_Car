@@ -1,5 +1,5 @@
-import { expect, test, vi } from "vitest";
-import type { Channel, EventEnvelope, WorkspaceHeartbeat } from "@/generated/api-v1";
+import { expect, onTestFinished, test, vi } from "vitest";
+import type { Channel, EventEnvelope, SessionAction, WorkspaceHeartbeat } from "@/generated/api-v1";
 import { conforms } from "../fixture-contracts";
 import { parseFrameEnvelope } from "../frame-display";
 import { socketOffer, type ClientContext, type ReadResult } from "../transport";
@@ -206,4 +206,102 @@ test("scopes Start and subsequent actions to one live lease and expires an aband
   await vi.advanceTimersByTimeAsync(profile.heartbeat_deadline_ms + 1);
   expect(await snapshot()).toMatchObject({ active_session: { id: session.id, state: "Paused" },
     lease: { state: "Unowned" }, runtime: { effective_session_state: "Paused", motion_permission: "Disarmed" } });
+});
+
+test.each(["confirm", "stop"] as const)("commits only %s when the other terminal action is already pending", async (winner) => {
+  vi.useFakeTimers();
+  vi.setSystemTime(sampleTime);
+  const transport = createFixtureTransport({
+    monotonic: () => Date.now() - sampleTime, now: () => Date.now(),
+  });
+  onTestFinished(() => { transport.dispose(); vi.useRealTimers(); });
+  const context = data(await transport.bootstrap());
+  const events: EventEnvelope[] = [];
+  const eventSocket = data(transport.connectEvents({ context }, await ticket(transport, context, "events"), {
+    ...silent, message: (event) => events.push(event),
+  }));
+  let frame: WorkspaceHeartbeat["displayed_robot_frame"] = null;
+  data(transport.connectFrames({ context }, "robot", await ticket(transport, context, "robot-video"), {
+    ...silent, message(value) {
+      const { frame_id, stream_epoch } = parseFrameEnvelope(value, context.qualification_profile!, "robot")!.metadata;
+      frame = { frame_id, stream_epoch };
+    },
+  }));
+  const lease = data(await transport.request("POST /control-lease", { context,
+    body: { client_id: context.client_id, request_id: crypto.randomUUID(), session_id: null, takeover: false } }));
+  const owner = { client_id: context.client_id, client_lease_id: lease.client_lease_id! };
+  const heartbeat: WorkspaceHeartbeat = { ...owner, type: "workspace_heartbeat", protocol_version: 1,
+    backend_boot_id: context.backend_boot_id, session_id: null, control_generation: lease.control_generation,
+    heartbeat_seq: 1, workspace_visible: true, workspace_focused: true, workspace_operational: true,
+    displayed_robot_frame: frame };
+  expect(eventSocket.heartbeat(heartbeat)).toBe(true);
+  const started = data(await transport.request("POST /sessions", { context, body: {
+    ...owner, action_id: crypto.randomUUID(), object_id: "sample-wallet", expected_revision: 1, control_mode: "Gestures",
+  } })).result!.session!;
+  const snapshot = async () => data(await transport.snapshot({ context }));
+  const readObject = async () => data(await transport.request("GET /objects/{id}", { context, id: started.object_id }));
+  const readMatches = async () => data(await transport.request("GET /sessions/{id}/matches", { context, id: started.id })).items;
+  const searching = await snapshot();
+  await vi.advanceTimersByTimeAsync(80);
+  expect(eventSocket.heartbeat({ ...heartbeat, heartbeat_seq: 2, session_id: started.id,
+    control_generation: searching.runtime.control_generation, displayed_robot_frame: frame })).toBe(true);
+  transport.controls.input("Gestures", "neutral");
+  transport.controls.input("Gestures", "forward");
+  expect((await snapshot()).runtime.motion_permission).toBe("Armed");
+
+  for (const observation of ["unprepared", "mismatched", "stale"] as const) {
+    await transport.controls.observeCandidate(observation);
+    expect(await readMatches()).toEqual([]);
+  }
+  await transport.controls.observeCandidate("visible");
+  const paused = await snapshot();
+  const pending = paused.pending_candidate!;
+  expect({ frame_id: pending.frame_id, stream_epoch: pending.stream_epoch }).toEqual(frame);
+  expect(pending).toMatchObject({ session_id: started.id, disposition: "Pending", reviewed_at_ms: null });
+  expect(paused.runtime).toMatchObject({ effective_session_state: "Paused", motion_permission: "Disarmed" });
+  expect(paused.runtime.control_generation).toBeGreaterThan(searching.runtime.control_generation);
+  expect(events.find(({ type }) => type === "candidate_pending")).toMatchObject({
+    session_id: started.id, session_revision: paused.active_session!.revision,
+    payload: { match: pending, control_generation: paused.runtime.control_generation },
+  });
+  const evidence = data(await transport.media(pending.evidence_media.id, { context }));
+  expect(evidence.headers["Content-Type"]).toBe("image/png");
+  expect(evidence.bytes.length).toBe(pending.evidence_media.byte_length);
+
+  const base = { ...owner, session_id: started.id, expected_revision: paused.active_session!.revision };
+  const confirm = { ...base, action_id: crypto.randomUUID(), action: "confirm", candidate_id: pending.id } as const;
+  const stop = { ...base, action_id: crypto.randomUUID(), action: "stop" } as const;
+  const request = (body: SessionAction, client = context) =>
+    transport.request("POST /sessions/{id}/actions", { context: client, id: started.id, body });
+  const spectator = transport.controls.addClient();
+  await expect(request({ ...confirm, client_id: spectator.client_id }, spectator)).resolves.toMatchObject({ error: { code: "LEASE_REQUIRED" } });
+  await expect(request({ ...confirm, expected_revision: started.revision })).resolves.toMatchObject({ error: { code: "REVISION_CONFLICT" } });
+  await expect(request({ ...confirm, candidate_id: "sample-confirmed" })).resolves.toMatchObject({ error: { code: "OWNERSHIP_MISMATCH" } });
+  const winningAction = winner === "confirm" ? confirm : stop;
+  const losingAction = winner === "confirm" ? stop : confirm;
+  transport.controls.scriptSearch("fail");
+  expect(data(await request(losingAction)).persistence).toBe("Failed");
+  transport.controls.scriptSearch("pending");
+  const pendingReceipt = data(await request(losingAction));
+  expect(pendingReceipt.persistence).toBe("Pending");
+  expect(data(await request(losingAction))).toEqual(pendingReceipt);
+  expect((await readObject()).status).toBe("Lost");
+  expect(await readMatches()).toEqual([pending]);
+
+  const receipt = data(await request(winningAction));
+  expect(receipt.persistence).toBe("Committed");
+  await expect(request(losingAction)).resolves.toMatchObject({ data: { persistence: "Failed" } });
+  expect(data(await request(winningAction))).toEqual(receipt);
+  const session = data(await transport.request("GET /sessions/{id}", { context, id: started.id }));
+  const [match] = await readMatches();
+  expect(await readMatches()).toHaveLength(1);
+  expect(session).toMatchObject({ state: "Ended", end_reason: winner === "confirm" ? "Confirmed" : "Stopped" });
+  expect((await snapshot()).active_session).toBeNull();
+  expect(data(await transport.media(pending.evidence_media.id, { context }))).toEqual(evidence);
+  expect(match).toMatchObject(winner === "confirm"
+    ? { disposition: "Confirmed", reviewed_at_ms: session.ended_at_ms }
+    : { disposition: "NotReviewed", reviewed_at_ms: null });
+  expect(await readObject()).toMatchObject(winner === "confirm"
+    ? { status: "Found", found_at_ms: session.ended_at_ms }
+    : { status: "Lost", found_at_ms: null });
 });

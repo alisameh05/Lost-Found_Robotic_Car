@@ -52,13 +52,7 @@ export function ConfirmedEvidence({ objectId }: { objectId: string }) {
     );
     if (session.kind !== "ok") return session;
     if (!session.data) return found(null);
-    const sessionId = session.data.id;
-    return findInPages<Match>(
-      (cursor) => runtime.read("GET /sessions/{id}/matches", { id: sessionId, query: { limit: historyPageSize, cursor } }, signal),
-      (item) => item.session_id === sessionId && item.object_id === objectId &&
-        item.disposition === "Confirmed",
-      signal,
-    );
+    return readConfirmedMatch(runtime, signal, session.data.id, objectId);
   }, [objectId]);
   const { result, retry } = useApplicationRead(load, true, true);
   return <section className={styles.confirmedEvidence} aria-label="Confirmed evidence">
@@ -70,4 +64,18 @@ export function ConfirmedEvidence({ objectId }: { objectId: string }) {
         The saved confirmation time remains in the object record.
       </Notice>}
   </section>;
+}
+
+function readConfirmedMatch(runtime: RuntimeProjection, signal: AbortSignal, sessionId: string, objectId: string) {
+  return findInPages<Match>(
+    (cursor) => runtime.read("GET /sessions/{id}/matches", { id: sessionId, query: { limit: historyPageSize, cursor } }, signal),
+    (item) => item.session_id === sessionId && item.object_id === objectId && item.disposition === "Confirmed",
+    signal,
+  );
+}
+
+export function useConfirmedMatch(sessionId: string, objectId?: string) {
+  const load = useCallback((runtime: RuntimeProjection, signal: AbortSignal) =>
+    objectId ? readConfirmedMatch(runtime, signal, sessionId, objectId) : Promise.resolve(found(null)), [objectId, sessionId]);
+  return useApplicationRead(load, Boolean(objectId), true);
 }

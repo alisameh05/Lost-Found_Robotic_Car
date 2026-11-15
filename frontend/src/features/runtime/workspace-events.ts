@@ -1,6 +1,7 @@
-import type { EventEnvelope, Operation, Snapshot } from "@/generated/api-v1";
+import type { EventEnvelope, Match, Operation, Snapshot } from "@/generated/api-v1";
 import { componentNames } from "@/generated/api-v1";
 import { conforms } from "@/lib/fixture-contracts";
+import { pendingReview } from "@/lib/match-evidence";
 
 function completeReadiness(readiness: Snapshot["readiness"]) {
   const names = new Set(readiness.components.map(({ component }) => component));
@@ -21,7 +22,8 @@ export function validSnapshot(state: Snapshot, boot: string) {
     state.qualification_profile_id === (state.qualification_profile?.profile_id ?? null) &&
     state.active_session?.state !== "Ended" &&
     state.runtime.control_generation === state.lease.control_generation &&
-    (state.active_object?.id ?? null) === (state.active_session?.object_id ?? null);
+    (state.active_object?.id ?? null) === (state.active_session?.object_id ?? null) &&
+    (!state.pending_candidate || pendingReview(state));
 }
 
 function withOperation(state: Snapshot, operation: Operation | null) {
@@ -33,6 +35,16 @@ function withOperation(state: Snapshot, operation: Operation | null) {
   const completed = operations.filter(({ persistence }) => persistence !== "Pending");
   if (pending.length > 64) return undefined;
   return { ...state, operations: [...pending, ...completed.slice(-64)] };
+}
+
+function sameCapture(left: Match, right: Match) {
+  const before = left.evidence_media;
+  const after = right.evidence_media;
+  return left.id === right.id && left.session_id === right.session_id && left.object_id === right.object_id &&
+    left.frame_id === right.frame_id && left.stream_epoch === right.stream_epoch && left.captured_at_ms === right.captured_at_ms &&
+    left.box.x === right.box.x && left.box.y === right.box.y && left.box.width === right.box.width && left.box.height === right.box.height &&
+    before.id === after.id && before.width === after.width && before.height === after.height &&
+    before.byte_length === after.byte_length && before.created_at_ms === after.created_at_ms;
 }
 
 // Undefined invalidates the stream. Returning the same state discards a duplicate.
@@ -54,6 +66,10 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
   if (session?.id === event.session_id && event.session_revision !== null && event.session_revision < session.revision) return;
   if (event.type === "snapshot") {
     const { payload } = event;
+    const previous = current?.pending_candidate;
+    const candidate = payload.pending_candidate;
+    if (previous && candidate && (previous.id === candidate.id || session?.revision === payload.active_session?.revision) &&
+        !sameCapture(previous, candidate)) return;
     if (current && (payload.runtime.control_generation < current.runtime.control_generation ||
       payload.retention.settings.revision < current.retention.settings.revision ||
       (current.active_object && current.active_object.id === payload.active_object?.id &&
@@ -74,11 +90,14 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
       // A new active record needs the matching object from a fresh snapshot.
       if (session.state !== "Ended" && session.object_id !== next.active_object?.id) return;
       return withOperation({ ...next, runtime, active_session: session.state === "Ended" ? null : session,
-        active_object: session.state === "Ended" ? null : next.active_object }, event.payload.operation);
+        active_object: session.state === "Ended" ? null : next.active_object,
+        pending_candidate: session.state === "Paused" && session.pause_causes.some(({ cause }) => cause === "CandidateReview")
+          ? next.pending_candidate : null }, event.payload.operation);
     }
     case "candidate_pending":
-      if (!session || event.payload.match.session_id !== session.id ||
-          event.payload.match.object_id !== session.object_id || event.payload.control_generation !== next.runtime.control_generation) return;
+      if (!session || event.session_id !== session.id || event.session_revision !== session.revision ||
+          event.payload.control_generation !== next.runtime.control_generation || !pendingReview(next, event.payload.match) ||
+          (next.pending_candidate && !sameCapture(next.pending_candidate, event.payload.match))) return;
       return { ...next, pending_candidate: event.payload.match };
     case "recovery_changed":
       if (event.payload.failures.some((failure) => failure.session_id !== session?.id)) return;

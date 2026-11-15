@@ -14,7 +14,6 @@
   width: 100%;
 }
 
-.evidenceViewport[data-enlarged="true"] .evidenceFrame { width: 200%; }
 .evidenceFrame img { width: 100%; }
 
 .box {

@@ -1,15 +1,17 @@
-import type { ControlMode, Error as ApiError, MutationResponse, Object as ObjectRecord, Session, SessionAction, Snapshot, StartRequest } from "@/generated/api-v1";
+import type { ControlMode, Error as ApiError, MutationResponse, MutationResult, Object as ObjectRecord, Session, SessionAction, Snapshot, StartRequest } from "@/generated/api-v1";
 import { conforms } from "@/lib/fixture-contracts";
 import type { ApplicationTransport, ClientContext, ReadResult } from "@/lib/transport";
 
 export type SearchIntent = { kind: "start"; object: ObjectRecord; mode: ControlMode }
-  | { kind: "pause" | "resume" | "stop"; sessionId: string };
+  | { kind: "pause" | "resume" | "stop"; sessionId: string }
+  | { kind: "confirm" | "reject"; sessionId: string; candidateId: string };
 
-export type SearchFeedback = { stage: "sending" | "pending" | "unknown" }
-  | { stage: "rejected" | "failed"; message: string }
-  | { stage: "committed"; session: Session | null };
+export type SearchFeedback = ({ stage: "sending" | "pending" | "unknown" }
+  | { stage: "rejected"; message: string }
+  | { stage: "failed"; message: string; retryable: boolean }
+  | { stage: "committed"; session: Session | null }) & { candidateId?: string };
 
-type ActionBody = StartRequest | Extract<SessionAction, { action: "pause" | "resume" | "stop" }>;
+type ActionBody = StartRequest | Exclude<SessionAction, { action: "acknowledge" }>;
 type Action = { context: ClientContext; body: ActionBody; objectId: string; feedback: SearchFeedback; timer?: ReturnType<typeof setTimeout> };
 
 export const searchActionKey = (kind: SearchIntent["kind"], id: string) => `${kind}:${id}`;
@@ -28,30 +30,42 @@ export function openSearchActions({
   const actions = new Map<string, Action>();
 
   function publish() {
-    notify(Object.fromEntries([...actions].map(([key, action]) => [key, action.feedback])));
+    notify(Object.fromEntries([...actions].map(([key, { body, feedback }]) =>
+      [key, "candidate_id" in body ? { ...feedback, candidateId: body.candidate_id } : feedback])));
   }
 
   function current(action: Action) {
     return !signal.aborted && [...actions.values()].includes(action) && unresolved(action.feedback);
   }
 
-  function resultMatches(body: ActionBody, session: Session | null) {
+  function resultMatches({ body, objectId }: Action, { session, match, object, settings, deletion }: MutationResult) {
     if ("control_mode" in body) {
       return !!session && session.object_id === body.object_id && session.control_mode === body.control_mode && session.state === "Searching";
     }
-    if (body.action === "stop" && session === null) return true; // Expiry grace ended with the committed Stop.
-    return session?.id === body.session_id && session.revision >= body.expected_revision &&
-      session.state === (body.action === "pause" ? "Paused" : body.action === "resume" ? "Searching" : "Ended") &&
-      (body.action !== "stop" || session.end_reason === "Stopped");
+    if ((body.action === "stop" || body.action === "confirm") && !session) {
+      return !match && !object && !settings && !deletion; // A terminal commit ended expiry grace.
+    }
+    if (session?.id !== body.session_id || session.object_id !== objectId || session.revision < body.expected_revision) return false;
+    if (body.action === "confirm" || body.action === "reject") {
+      if (!match || match.id !== body.candidate_id || match.session_id !== session.id ||
+          match.object_id !== objectId || match.reviewed_at_ms === null || session.revision <= body.expected_revision) return false;
+      return body.action === "confirm"
+        ? match.disposition === "Confirmed" && session.end_reason === "Confirmed" && session.ended_at_ms === match.reviewed_at_ms &&
+          object?.id === objectId && object.status === "Found" && object.found_at_ms === match.reviewed_at_ms
+        : match.disposition === "Rejected" && session.state === "Paused" &&
+          session.pause_causes.some(({ cause }) => cause === "ReviewRejected");
+    }
+    if (body.action === "stop") return session.end_reason === "Stopped";
+    return session.state === (body.action === "pause" ? "Paused" : "Searching");
   }
 
   function accept(action: Action, data: MutationResponse) {
     if (!current(action) || data.action_id !== action.body.action_id) return false;
     if (data.persistence === "Committed") {
-      if (!resultMatches(action.body, data.result.session)) return false;
+      if (!resultMatches(action, data.result)) return false;
       action.feedback = { stage: "committed", session: data.result.session };
     } else if (data.persistence === "Failed") {
-      action.feedback = { stage: "failed", message: data.error.message };
+      action.feedback = { stage: "failed", message: data.error.message, retryable: data.error.retryable };
     } else {
       action.feedback = { stage: "pending" };
     }
@@ -119,7 +133,8 @@ export function openSearchActions({
     retry(key: string, context: ClientContext) {
       const action = actions.get(key);
       if (action && sameContext(action.context, context) &&
-          (action.feedback.stage === "unknown" || action.feedback.stage === "pending")) return send(action);
+          (action.feedback.stage === "unknown" || action.feedback.stage === "pending" ||
+            (action.feedback.stage === "failed" && action.feedback.retryable))) return send(action);
     },
     clear() {
       for (const action of actions.values()) clearTimeout(action.timer);
@@ -129,7 +144,7 @@ export function openSearchActions({
     purge(owners: readonly string[]) {
       for (const [key, action] of actions) {
         if (!owners.includes(action.objectId) || (unresolved(action.feedback) &&
-            "action" in action.body && action.body.action === "stop")) continue;
+            "action" in action.body && (action.body.action === "stop" || action.body.action === "confirm"))) continue;
         clearTimeout(action.timer);
         actions.delete(key);
       }

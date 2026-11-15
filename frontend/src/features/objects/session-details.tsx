@@ -71,6 +71,7 @@ export function SessionDetailsScreen({ sessionId }: { sessionId: string }) {
         </div>
         <footer className={styles.detailActions}>
           {active && <Link className="button button--secondary" href={`${sessionHref(sessionId)}/live`}>Return to Active Search</Link>}
+          {session.state === "Ended" && <Link className="button button--secondary" href={`${sessionHref(sessionId)}/result`}>View Search Result</Link>}
           <Link className="button button--primary" href={objectHref(object.id)}>View Object</Link>
         </footer>
       </>}

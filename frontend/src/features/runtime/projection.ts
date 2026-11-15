@@ -1,5 +1,6 @@
 import type { EmergencyStopRequest, EmergencyStopResponse, FrontendProfile, Health, RetentionChange, RetentionPreviewRequest, Snapshot } from "@/generated/api-v1";
 import { compatibleProfile } from "@/lib/fixture-contracts";
+import { pendingReview } from "@/lib/match-evidence";
 import type { ApplicationTransport, HttpRequest, ProtectedPath, ProtectedRequest, ReadEndpoint, ReadParams, ReadResult } from "@/lib/transport";
 import { openWorkspace, type WorkspaceView } from "./workspace";
 import { openSearchActions, searchActionKey, type SearchFeedback, type SearchIntent, unresolved } from "./search-actions";
@@ -220,8 +221,16 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       }
       if (active?.id !== id || (intent.kind === "resume" && (!state.readiness.can_resume ||
           !view.workspace.previewLive || !view.workspace.usable))) return;
-      return searchActions.submit(key, { ...scope, action_id: crypto.randomUUID(), session_id: id,
-        expected_revision: active.revision, action: intent.kind }, context, active.object_id);
+      const body = { ...scope, action_id: crypto.randomUUID(), session_id: id, expected_revision: active.revision };
+      if (intent.kind === "confirm" || intent.kind === "reject") {
+        const candidate = state.pending_candidate;
+        if (!pendingReview(state, candidate) || candidate.id !== intent.candidateId ||
+            unresolved(view.searchActions?.[searchActionKey("confirm", id)]) ||
+            unresolved(view.searchActions?.[searchActionKey("reject", id)]) ||
+            (intent.kind === "confirm" && candidate.evidence_media.availability !== "Available")) return;
+        return searchActions.submit(key, { ...body, action: intent.kind, candidate_id: candidate.id }, context, active.object_id);
+      }
+      return searchActions.submit(key, { ...body, action: intent.kind }, context, active.object_id);
     },
     retrySearch(kind: SearchIntent["kind"], id: string) {
       if (context) return searchActions.retry(searchActionKey(kind, id), context);

@@ -35,6 +35,14 @@ export function InputControls({ mode, disabled }: { mode: ControlMode; disabled:
       <Button onClick={fixture.search.disconnectEvents}>Disconnect search events</Button>
       <Button onClick={fixture.search.dropNextRelease}>Drop next lease release</Button>
     </div>
+    <div className="control-row" aria-label="Fixture candidate observations">
+      <Button disabled={disabled} onClick={() => fixture.search.observeCandidate("visible")}>Show sample candidate</Button>
+      <Button onClick={() => fixture.search.observeCandidate("uncertain")}>Mark sample continuity uncertain</Button>
+      <Button onClick={() => fixture.search.observeCandidate("exit")}>Observe sample candidate exit</Button>
+      <Button disabled={disabled} onClick={() => fixture.search.observeCandidate("unprepared")}>Try unprepared sample candidate</Button>
+      <Button disabled={disabled} onClick={() => fixture.search.observeCandidate("missing-media")}>Show sample with missing evidence</Button>
+      <Button disabled={disabled} onClick={() => fixture.search.observeCandidate("corrupt-media")}>Show sample with corrupt evidence</Button>
+    </div>
     <SearchSaveControls />
   </details>;
 }
