@@ -355,8 +355,9 @@ test("parses only bounded UTF-8 frame envelopes with matching source and JPEG di
 });
 
 test("isolates fixtures, cancels outstanding reads, and removes subscriptions on abort and dispose", async () => {
-  const first = createFixtureTransport({ scenario: "controller-ready", eventScript: "catalogue" });
-  const second = createFixtureTransport({ scenario: "controller-ready", eventScript: "catalogue" });
+  const now = () => sampleTime;
+  const first = createFixtureTransport({ scenario: "controller-ready", eventScript: "catalogue", now });
+  const second = createFixtureTransport({ scenario: "controller-ready", eventScript: "catalogue", now });
   const context = data(await first.bootstrap());
   expect(data(await second.bootstrap())).toEqual(context);
   const detached = data(await first.snapshot({ context }));

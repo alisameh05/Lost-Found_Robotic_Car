@@ -4,8 +4,10 @@ import { notFound } from "next/navigation";
 import { DataUnavailable, Preview, PreviewLinks } from "@/components/layout/preview";
 import { DataFeedback, LoadingState } from "@/components/ui/feedback";
 import { useRuntimeRead, useRuntimeView } from "@/features/runtime";
+import type { ControlMode } from "@/generated/api-v1";
+import { supportHref } from "@/lib/search-setup-context";
 
-export function SearchSetupScreen({ objectId }: { objectId: string }) {
+export function SearchSetupScreen({ objectId, mode }: { objectId: string; mode?: ControlMode }) {
   const object = useRuntimeRead("/objects/{id}", objectId);
   if (object?.kind === "api-error" && object.status === 404) notFound();
   if (object && object.kind !== "ok") return <DataUnavailable />;
@@ -14,7 +16,12 @@ export function SearchSetupScreen({ objectId }: { objectId: string }) {
     <Preview title="Search Setup" description="Target setup, mode selection and starting a search are planned for a later phase.">
       {object ? <>
         <section className="panel"><h2>Sample target</h2><p>{object.data.name}</p></section>
-        <PreviewLinks links={[{ href: `/objects/${object.data.id}`, label: "Back to Object Details" }]} />
+        <PreviewLinks links={[
+          { href: `/objects/${object.data.id}`, label: "Back to Object Details" },
+          ...(object.data.status === "Lost" ? [
+            { href: supportHref("/devices", { objectId: object.data.id, mode }), label: "View Devices" },
+          ] : []),
+        ]} />
       </> : <LoadingState label="Loading sample target" />}
     </Preview>
   );

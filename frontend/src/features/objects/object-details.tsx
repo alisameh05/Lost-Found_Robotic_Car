@@ -4,10 +4,10 @@ import Link from "next/link";
 import { PageHeader } from "@/components/layout/page-header";
 import { DataUnavailable } from "@/components/layout/preview";
 import { LoadingState, Notice } from "@/components/ui/feedback";
-import { useRuntimeView } from "@/features/runtime";
+import { recordAbsence, useObjectRecord, useRuntimeView } from "@/features/runtime";
 import type { Object as ObjectRecord } from "@/generated/api-v1";
 import { ConfirmedEvidence } from "./confirmed-evidence";
-import { ObjectStatus, RecordAbsent, recordAbsence, RecordReadFailure, RecordTime, ReferenceImage, RegisterLink, StartSearch, useObjectRecord } from "./record-ui";
+import { ObjectStatus, RecordAbsent, RecordReadFailure, RecordTime, ReferenceImage, RegisterLink, StartSearch } from "./record-ui";
 import { historyPageSize, ObjectSessionHistory, useObjectSessions } from "./session-history";
 import styles from "./records.module.css";
 

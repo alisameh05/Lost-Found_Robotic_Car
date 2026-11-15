@@ -5,10 +5,10 @@ import { useMemo } from "react";
 import { PageHeader } from "@/components/layout/page-header";
 import { DataUnavailable } from "@/components/layout/preview";
 import { LoadingState, Notice, StatusBadge } from "@/components/ui/feedback";
-import { useCursorPage, useProtectedRead, useRuntimeView } from "@/features/runtime";
+import { recordAbsence, useCursorPage, useObjectRecord, useProtectedRead, useRuntimeView } from "@/features/runtime";
 import type { Match, Session } from "@/generated/api-v1";
 import { CapturedEvidence, dispositionLabel } from "./captured-evidence";
-import { objectHref, RecordAbsent, recordAbsence, RecordReadFailure, RecordTime, ReferenceImage, useObjectRecord } from "./record-ui";
+import { objectHref, RecordAbsent, RecordReadFailure, RecordTime, ReferenceImage } from "./record-ui";
 import { HistoryPager, historyPageSize, modeLabel, sessionHref } from "./session-history";
 import styles from "./records.module.css";
 

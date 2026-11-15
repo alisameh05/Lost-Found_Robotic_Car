@@ -29,7 +29,7 @@ test.describe("fixture preview", () => {
         await expect(page.getByText(fixtureLabel, { exact: true })).toBeVisible();
         if (title === "Session Details") {
           await expect(page.getByRole("region", { name: "Session record" })).toBeVisible();
-        } else if (!["Objects / History", "Object Details", "Register Object"].includes(title)) {
+        } else if (!["Objects / History", "Object Details", "Register Object", "Devices", "Control Guide"].includes(title)) {
           await expect(page.getByText("Phase 01 preview", { exact: true })).toBeVisible();
         }
         await expect(page.getByRole("navigation", { name: "Main navigation" }).getByRole("link", { name: section, exact: true }))

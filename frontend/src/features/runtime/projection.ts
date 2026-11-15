@@ -46,13 +46,13 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     readRequest?.abort();
     readRequest = new AbortController();
     const signal = AbortSignal.any([lifetime.signal, readRequest.signal]);
-    update({ loading: true, failedRead: undefined });
+    update({ loading: true });
     try {
       if (!context || readBootstrap) {
         const bootstrap = await transport.bootstrap(signal);
         if (signal.aborted) return;
         if (bootstrap.kind !== "ok") {
-          update({ loading: false, failedRead: bootstrap });
+          update({ loading: false, failedRead: bootstrap, health: undefined });
           return;
         }
         context = bootstrap.data;
@@ -60,7 +60,11 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         update({ connected: true });
       }
       const request = { context, signal };
-      const [status, health] = await Promise.all([transport.snapshot(request), transport.request("GET /health", request)]);
+      const unavailable = () => ({ kind: "unavailable" } as const);
+      const [status, health] = await Promise.all([
+        transport.snapshot(request).catch(unavailable),
+        transport.request("GET /health", request).catch(unavailable),
+      ]);
       if (signal.aborted) return;
       update({
         snapshot: status.kind === "ok" ? status.data : view.snapshot,
@@ -69,7 +73,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         loading: false,
       });
     } catch {
-      if (!signal.aborted) update({ loading: false, failedRead: { kind: "unavailable" } });
+      if (!signal.aborted) update({ loading: false, failedRead: { kind: "unavailable" }, health: undefined });
     }
   }
 

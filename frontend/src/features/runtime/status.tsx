@@ -23,10 +23,10 @@ function RuntimeStatus() {
     <section className="panel" aria-labelledby="search-status">
       <h2 id="search-status">Search status</h2>
       {loading && <LoadingState label="Loading fixture snapshot" />}
-      {failedRead && <Notice title="Runtime data unavailable" tone="danger" role="alert">
+      {!loading && failedRead && <Notice title="Runtime data unavailable" tone="danger" role="alert">
         {failedRead.kind === "api-error" && `${failedRead.error.code} · ${failedRead.error.message}`}
       </Notice>}
-      {failedRead && runtime && <Button onClick={() => { void runtime.refresh(); }}>Retry snapshot</Button>}
+      {failedRead && runtime && <Button pending={loading} onClick={() => { void runtime.refresh(); }}>Retry snapshot</Button>}
       {health?.initialization === "Starting" ? <p role="status">Initializing fixture application</p>
         : data && <p role="status">{data.runtime.effective_session_state ?? "No active search"}</p>}
       {health?.initialization === "Failed" && <p>Application initialization failed</p>}
