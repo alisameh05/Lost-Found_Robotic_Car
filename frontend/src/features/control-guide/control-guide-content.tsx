@@ -1,24 +1,40 @@
 import { useId } from "react";
+import type { ControlMode } from "@/generated/api-v1";
 import layout from "@/components/layout/support-page.module.css";
 import styles from "./control-guide.module.css";
+
+const instructions = {
+  Gestures: {
+    title: "Gesture directions and stop",
+    direction: "In the mirrored webcam view, hold one extended index finger pointing up for forward, down for backward, left for left, or right for right.",
+    stop: "Release the pointing gesture to stop. A closed fist, no hand, multiple hands, or ambiguous or invalid pointing stops ordinary movement.",
+  },
+  Controller: {
+    title: "PS4 controller",
+    direction: "On the DualShock 4, hold D-pad up for forward, down for backward, left for left, or right for right. Release the D-pad to stop. Conflicting directions also stop ordinary movement.",
+    stop: "Press Circle for Emergency Stop. The UI Emergency Stop works in either mode. Gesture input is inactive in Controller mode.",
+  },
+} satisfies Record<ControlMode, { title: string; direction: string; stop: string }>;
+
+export function ModeInstructions({ mode, heading: Heading = "h2", title }: {
+  mode: ControlMode; heading?: "h2" | "h3"; title?: string;
+}) {
+  const id = useId();
+  const content = instructions[mode];
+  return <section className={styles.rule} aria-labelledby={id}>
+    <Heading id={id}>{title ?? content.title}</Heading>
+    <p>{content.direction}</p>
+    <p>{content.stop}</p>
+  </section>;
+}
 
 export function ControlGuideContent({ heading: Heading = "h2" }: { heading?: "h2" | "h3" }) {
   const id = useId();
   return (
     <div className={`${layout.columns} ${styles.content}`}>
       <div>
-        <section className={styles.rule} aria-labelledby={`${id}-gestures`}>
-          <Heading id={`${id}-gestures`}>Gesture directions and stop</Heading>
-          <p>In the mirrored webcam view, hold one extended index finger pointing up for forward, down for backward,
-            left for left, or right for right.</p>
-          <p>Release the pointing gesture to stop. A closed fist, no hand, multiple hands, or ambiguous or invalid pointing stops ordinary movement.</p>
-        </section>
-        <section className={styles.rule} aria-labelledby={`${id}-ps4`}>
-          <Heading id={`${id}-ps4`}>PS4 controller</Heading>
-          <p>On the DualShock 4, hold D-pad up for forward, down for backward, left for left, or right for right.
-            Release the D-pad to stop. Conflicting directions also stop ordinary movement.</p>
-          <p>Press Circle for Emergency Stop. The UI Emergency Stop works in either mode. Gesture input is inactive in Controller mode.</p>
-        </section>
+        <ModeInstructions mode="Gestures" heading={Heading} />
+        <ModeInstructions mode="Controller" heading={Heading} />
         <section className={styles.rule} aria-labelledby={`${id}-session`}>
           <Heading id={`${id}-session`}>Pause, Stop Search and Emergency Stop</Heading>
           <dl className={styles.actions}>

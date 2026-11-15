@@ -2,6 +2,7 @@
 
 import { Octagon } from "lucide-react";
 import Link from "next/link";
+import { usePathname } from "next/navigation";
 import type { ReactNode } from "react";
 import { AppShell } from "@/components/layout/app-shell";
 import { Notice } from "@/components/ui/feedback";
@@ -10,10 +11,12 @@ import { useRuntime, useRuntimeView } from "./runtime-provider";
 
 export function RuntimeFrame({ children }: { children: ReactNode }) {
   const runtime = useRuntime()?.connection?.runtime;
-  const { snapshot, health, failedRead, emergency } = useRuntimeView();
+  const pathname = usePathname();
+  const { snapshot, health, failedRead, emergency, connected } = useRuntimeView();
   const session = snapshot?.active_session;
   const active = session?.state === "Searching" || session?.state === "Paused";
-  const offerEmergency = active || !!health?.active_session_state;
+  const offerEmergency = active || !!health?.active_session_state ||
+    (!!connected && /^\/objects\/[^/]+\/search\/?$/.test(pathname ?? ""));
 
   return (
     <AppShell fixtureEnabled activeSearch={snapshot && active && !failedRead && (

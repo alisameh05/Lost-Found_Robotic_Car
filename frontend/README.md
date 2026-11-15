@@ -1,6 +1,6 @@
 # Lost & Found frontend
 
-The Phase 01 fixture application runs locally on Windows. The eleven previews use synthetic records. The fixture shell requires Node and a browser.
+The fixture application runs locally on Windows with synthetic records and device observations. The fixture shell requires Node and a browser.
 
 ## Setup and startup
 
@@ -47,7 +47,7 @@ npm.cmd run verify
 
 The seed records the API document version, its line-ending-normalized SHA-256 and the endpoint catalogue. Ajv verifies the complete Draft 2020-12 definitions against fixture payloads. The contract checks also validate relationships between resources, readiness and profile bounds, and binary frame envelopes. Deliberately invalid vectors are exercised separately. In Phase 04, replace the documentation-derived generation input with backend-owned OpenAPI plus event and frame exports. Compare wire fields, required/nullability rules, enums, limits and fixture validation against this baseline before removing the seed.
 
-Frame admission checks the bounds, metadata and bytes of the known synthetic JPEG. Live frame decoding and display acknowledgment belong to the later workspace implementation. Registration validates JPEG and PNG files locally and saves their normalized references in fixture memory. Select **registration recovery** to exercise a failed save followed by a Pending request and a lost response. **Retry Same Request** recovers the matching receipt. Playwright uses generated images for registration checks.
+Search Setup decodes bounded fixture robot frames and reports successful display through the controlling workspace heartbeat. Open Setup from an eligible Lost record, inspect the preview, then select **Acquire control** to check readiness. The opt-in Search Setup fixture controls can freeze or disconnect the preview and restore fresh frames. Registration validates JPEG and PNG files locally and saves their normalized references in fixture memory. Select **registration recovery** to exercise a failed save followed by a Pending request and a lost response. **Retry Same Request** recovers the matching receipt. Playwright uses generated images for registration checks.
 
 Instrument Sans Variable weights 400–700 ship as local WOFF2 files from the pinned Fontsource package under the [SIL Open Font License](Instrument-Sans-LICENSE.txt). Navigation and controls use bundled Lucide icons distributed under the [Lucide license notices](Lucide-LICENSE.txt). The fixture adapter bundles original synthetic 32 × 24 JPEG and PNG swatches generated with System.Drawing. The swatches are repository-authored assets with no third-party source.
 
@@ -57,4 +57,4 @@ The shared-controls Playwright check captures Emergency Stop at 1440 × 960, bes
 
 Reuse the root shell, page layout, fields, buttons, feedback, and protected-image lifecycle. Product views read generated types through the injected runtime and `ApplicationTransport`. The adapter owns the scenario, responses and fixture clock. Replacing a scenario disposes its transport, and navigation releases route-local reads, subscriptions, and media URLs. The shell keeps the current snapshot and emergency response in memory while navigating. Phase 02 owns the record, registration, device and settings workflow presentations.
 
-Phase 03 owns real socket and lease lifecycle, event synchronization, heartbeats, focus and navigation safety, live video, review and deliberate recovery. Phase 04 owns backend persistence and schema exports. Later phases qualify the devices and measure physical stopping. The Phase 01 seven-hour allocation is a planning assumption.
+Phase 03 exercises ticketed channels, lease lifecycle, event synchronization, heartbeats, focus and navigation, video, review and deliberate recovery through the fixture adapter. Phase 04 owns backend persistence and schema exports. Later phases qualify the devices and measure physical stopping. The Phase 01 seven-hour allocation is a planning assumption.

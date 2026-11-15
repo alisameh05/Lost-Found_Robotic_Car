@@ -131,7 +131,7 @@ test("shows the actual active mode and keeps Emergency Stop keyboard-operable fr
   await expect(page.getByText("Locked to active search · Paused")).toBeVisible();
   await expect(page.getByRole("region", { name: "Required for Controller (PS4)" })).toBeVisible();
   await expect(page.getByLabel("Readiness mode")).toHaveCount(0);
-  await expect(page.getByRole("link", { name: "Return to Search Setup" })).toHaveCount(0);
+  await expect(page.getByRole("link", { name: "Return to Search Setup" })).toHaveAttribute("href", "/objects/sample-wallet/search?mode=Gestures");
 
   await page.getByRole("link", { name: "Open Control Guide" }).click();
   const gestures = page.getByRole("region", { name: "Gesture directions and stop" });

@@ -3,29 +3,8 @@
 import { notFound } from "next/navigation";
 import { DataUnavailable, Preview, PreviewLinks } from "@/components/layout/preview";
 import { DataFeedback, LoadingState } from "@/components/ui/feedback";
-import { useObjectRecord, useRuntimeRead, useRuntimeView } from "@/features/runtime";
-import type { ControlMode } from "@/generated/api-v1";
-import { supportHref } from "@/lib/search-setup-context";
-
-export function SearchSetupScreen({ objectId, mode }: { objectId: string; mode?: ControlMode }) {
-  const { object, result, absence } = useObjectRecord(objectId);
-  if (absence === 404) notFound();
-  if (!object && result && absence !== 410) return <DataUnavailable />;
-
-  return (
-    <Preview title="Search Setup" description="Target setup, mode selection and starting a search are planned for a later phase.">
-      {object ? <>
-        <section className="panel"><h2>Sample target</h2><p>{object.name}</p></section>
-        <PreviewLinks links={[
-          { href: `/objects/${object.id}`, label: "Back to Object Details" },
-          ...(object.status === "Lost" ? [
-            { href: supportHref("/devices", { objectId: object.id, mode }), label: "View Devices" },
-          ] : []),
-        ]} />
-      </> : absence === 410 ? <DataFeedback state="expired" /> : <LoadingState label="Loading sample target" />}
-    </Preview>
-  );
-}
+import { useRuntimeRead, useRuntimeView } from "@/features/runtime";
+export { SearchSetupScreen } from "./search-setup";
 
 const sessionPreviews = {
   live: { title: "Search Workspace", description: "Camera feeds and manual controls are planned for a later phase." },

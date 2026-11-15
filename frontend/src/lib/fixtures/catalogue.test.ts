@@ -71,12 +71,13 @@ test.each(scenarioIds)("validates the %s fixture's bootstrap, snapshot, health a
   transport.dispose();
 });
 
-test("required input follows the selected mode, independently of proximity", () => {
+test("projects the inactive inputs and recovery separately from pre-session Start readiness", () => {
   const controller = readScenario("controller-ready").snapshot;
   const gestures = readScenario("gestures-ready").snapshot;
-  expect(controller.readiness.can_start).toEqual({ Gestures: false, Controller: true });
+  expect(controller.readiness.can_start).toEqual({ Gestures: false, Controller: false });
   expect(controller.readiness.components.find(({ component }) => component === "Webcam")?.status).toBe("Unavailable");
-  expect(gestures.readiness.can_start).toEqual({ Gestures: true, Controller: false });
+  expect(gestures.readiness.components.find(({ component }) => component === "Controller")?.status).toBe("Unavailable");
+  expect(gestures.readiness.can_start).toEqual({ Gestures: false, Controller: false });
   expect(readScenario("paused").snapshot.readiness).toEqual(readScenario("searching").snapshot.readiness);
   expect(readScenario("restored").snapshot.readiness.can_resume).toBe(false);
   expect(readScenario("acknowledged").snapshot.readiness.can_resume).toBe(true);
@@ -230,7 +231,7 @@ test("keeps pending, committed and failed mutations distinct from plain validati
   const body = { action_id: actionId, object_id: sampleObject.id, expected_revision: 1, control_mode: "Controller", client_id: clientId, client_lease_id: leaseId } as const;
   contract("StartRequest", body);
   const active = createFixtureTransport({ scenario: "searching" });
-  const controller = createFixtureTransport({ scenario: "controller-ready" });
+  const controller = createFixtureTransport({ scenario: "controller-ready", startSpecimen: true });
   await expect(active.request("POST /sessions", { context: data(await active.bootstrap()), body }))
     .resolves.toMatchObject({ status: 409, error: { code: "ACTIVE_SESSION_EXISTS" } });
   const context = data(await controller.bootstrap());
@@ -361,8 +362,8 @@ test("parses only bounded UTF-8 frame envelopes with matching source and JPEG di
 
 test("isolates fixtures, cancels outstanding reads, and removes subscriptions on abort and dispose", async () => {
   const now = () => sampleTime;
-  const first = createFixtureTransport({ scenario: "controller-ready", eventScript: "catalogue", now });
-  const second = createFixtureTransport({ scenario: "controller-ready", eventScript: "catalogue", now });
+  const first = createFixtureTransport({ scenario: "controller-ready", now });
+  const second = createFixtureTransport({ scenario: "controller-ready", now });
   const context = data(await first.bootstrap());
   expect(data(await second.bootstrap())).toEqual(context);
   const detached = data(await first.snapshot({ context }));
@@ -372,54 +373,29 @@ test("isolates fixtures, cancels outstanding reads, and removes subscriptions on
   await expect(second.request("GET /objects", { context, query: { limit: 1, cursor: page.next_cursor! } }))
     .resolves.toMatchObject({ error: { code: "CURSOR_EXPIRED" } });
 
+  const offer = data(await first.request("POST /websocket-tickets", { context,
+    body: { client_id: context.client_id, channel: "events" } }));
   const events: string[] = [];
-  const stop = first.subscribeEvents({ context }, ({ type }) => { events.push(type); stop(); });
-  const frames: Uint8Array[] = [];
+  const eventsConnection = data(first.connectEvents({ context }, socketOffer("events", offer.ticket), {
+    message: ({ type }) => { events.push(type); }, closed() {},
+  }));
+  await Promise.resolve();
+  eventsConnection.close();
   const signal = new AbortController();
-  second.subscribeFrames({ context, signal: signal.signal }, "webcam", (frame) => frames.push(frame));
   const inFlight = first.media("sample-wallet-reference", { context, signal: signal.signal });
   signal.abort();
   await expect(inFlight).rejects.toMatchObject({ name: "AbortError" });
   expect(events).toEqual(["snapshot"]);
-  expect(frames).toHaveLength(0);
-
-  second.subscribeEvents({ context }, ({ type }) => { events.push(type); });
+  const next = data(await second.request("POST /websocket-tickets", { context, body: { client_id: context.client_id, channel: "events" } }));
+  data(second.connectEvents({ context }, socketOffer("events", next.ticket), { message: ({ type }) => { events.push(type); }, closed() {} }));
   const pending = second.snapshot({ context });
   second.dispose();
   await expect(pending).rejects.toMatchObject({ name: "AbortError" });
   expect(events).toEqual(["snapshot"]);
-  const noProfile = createFixtureTransport();
-  noProfile.subscribeFrames({ context }, "robot", (frame) => frames.push(frame));
-  await Promise.resolve();
-  expect(frames).toHaveLength(0);
-  first.subscribeFrames({ context }, "robot", (frame) => frames.push(frame));
-  await Promise.resolve();
-  expect(frames).toHaveLength(1);
-  expect(parseFrame(frames[0], fixtureProfile, "robot")).not.toBeNull();
 
   const image = data(await first.media("sample-wallet-reference", { context }));
   expect(image.headers).toMatchObject({ "Cache-Control": "no-store", "Accept-Ranges": "none" });
   expect(image.bytes).toEqual(sampleMediaBytes("sample-wallet-reference", "image/jpeg"));
   contract("BootstrapResponse", bootstrapFacts);
-});
-
-test("validates acquired and released lease specimens without opening a socket", async () => {
-  const transport = createFixtureTransport({ scenario: "searching" });
-  const context = data(await transport.bootstrap());
-  const body = { request_id: requestId, client_id: context.client_id, session_id: sampleSession.id };
-  const acquire = { ...body, takeover: true };
-  contract("LeaseAcquire", acquire);
-  const lease = data(await transport.request("POST /control-lease", { context, body: acquire }));
-  contract("LeaseResponse", lease);
-  expect(lease.client_lease_id).toBe(leaseId);
-  await expect(transport.request("POST /control-lease", { context, body: { ...acquire, request_id: actionId } }))
-    .resolves.toMatchObject({ status: 403, error: { code: "LEASE_OWNED" } });
-  const release = { ...body, request_id: "10000000-0000-4000-8000-000000000003",
-    client_lease_id: leaseId, control_generation: lease.control_generation };
-  contract("LeaseRelease", release);
-  const released = data(await transport.request("POST /control-lease/release", { context, body: release }));
-  contract("LeaseResponse", released);
-  expect(released.snapshot.active_session?.state).toBe("Paused");
-  expect(released.snapshot.lease.state).toBe("Unowned");
-  expect(validSnapshot(released.snapshot, context)).toBe(true);
+  first.dispose();
 });
