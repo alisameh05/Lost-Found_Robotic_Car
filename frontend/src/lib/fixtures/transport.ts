@@ -1,13 +1,13 @@
 import type {
-  EmergencyStopRequest, EventEnvelope, FrameMetadata, HttpResponses, Object as LostObject, Session,
+  EmergencyStopRequest, EventEnvelope, FrameMetadata, HttpResponses, LeaseAcquire, LeaseRelease, Object as LostObject, Session,
   RetentionChange, RetentionPreviewRequest,
-  SessionAction, StartRequest, TicketRequest,
+  SessionAction, Snapshot, StartRequest, TicketRequest,
 } from "@/generated/api-v1";
 import { compatibleProfile, conforms } from "../fixture-contracts";
 import { maxObjectNameLength, normalizeObjectName } from "../object-name";
 import type {
   ApplicationTransport, Endpoint, HttpRequest, ObjectQuery, ProtectedMedia, ProtectedPath,
-  ProtectedRequest, ReadResult,
+  ProtectedRequest, ReadResult, SocketObserver, SocketOffer,
 } from "../transport";
 import { sampleMediaBytes } from "./images";
 import type { normalizeReference } from "../reference-image";
@@ -15,16 +15,18 @@ import { openRegistrations } from "./registration";
 import { caseFold } from "./casefold";
 import { emergencyResponse, emptyResult, mutation, reviewReceipt, startReceipt } from "./mutations";
 import { fixturePages } from "./pages";
-import { expiredObject, healthFor, leaseId, paused, recoveryFailure, requestId, sampleObject, sampleSession, sampleTime, searching } from "./samples";
+import { expiredObject, healthFor, leaseId, paused, recoveryFailure, sampleObject, sampleSession, sampleTime, searching } from "./samples";
 import { readScenario, type ScenarioId } from "./scenarios";
-import { eventVectors, frameVector, snapshotEvent } from "./vectors";
 import { expiryFor, openRetention, unavailableStorage } from "./retention";
 import { fixtureOk as ok, fixtureError as error } from "./responses";
+import { openSocketTickets } from "./socket-tickets";
+import { openFixtureWorkspace, type FrameMode } from "./workspace";
 
 type FixtureOptions = {
   scenario?: ScenarioId;
   now?: () => number;
-  eventScript?: "catalogue";
+  monotonic?: () => number;
+  startSpecimen?: boolean;
   observeMutation?: (route: Endpoint, body: unknown) => void;
   normalizeRegistration?: typeof normalizeReference;
   scriptedRegistration?: (actionId: string, signal: AbortSignal) => Promise<"Committed" | "Failed" | undefined>;
@@ -39,7 +41,8 @@ const invalid = error(422, "VALIDATION_FAILED", "A sample request field is inval
 const conflict = error(409, "REVISION_CONFLICT", "Sample revision has changed.");
 
 export function createFixtureTransport({
-  scenario = "idle", now: fixtureNow, eventScript, observeMutation, scriptedRegistration, normalizeRegistration, manualCleanup = false,
+  scenario = "idle", now: fixtureNow, monotonic = () => performance.now(), startSpecimen = false,
+  observeMutation, scriptedRegistration, normalizeRegistration, manualCleanup = false,
 }: FixtureOptions = {}) {
   const startedAt = performance.now();
   const readClock = fixtureNow ?? (() => sampleTime + Math.floor(performance.now() - startedAt));
@@ -54,6 +57,7 @@ export function createFixtureTransport({
   const scene = readScenario(scenario);
   const { bootstrap } = scene;
   let { snapshot } = scene;
+  const clients = new Set([bootstrap.client_id]);
   let { objects, sessions, matches } = scene;
   let snapshotError = scene.snapshotError;
   const lifetime = new AbortController();
@@ -81,30 +85,65 @@ export function createFixtureTransport({
     invalidate, manualCleanup,
   });
   const storageBlocked = () => !healthy() || retention.read().deletion.status === "Failed";
-  const readinessRead = () => {
+  const readinessRead = (client = bootstrap.client_id) => {
     const { readiness } = snapshot;
-    if (!healthy() || !storageBlocked()) return readiness;
-    const blocked = structuredClone(readiness);
-    const storage = blocked.components.find(({ component }) => component === "Storage");
-    if (storage) { storage.status = "Unavailable"; storage.cause_codes = ["STORAGE_UNAVAILABLE"]; }
-    return { ...blocked, can_start: { Gestures: false, Controller: false }, can_resume: false };
+    const { workspace: usable, displayed } = workspace.observations();
+    const hasLiveOwner = snapshot.lease.owner_client_id === client && usable;
+    const components = structuredClone(readiness.components);
+    for (const observation of components) {
+      if (observation.component === "Storage" && storageBlocked() && healthy()) {
+        observation.status = "Unavailable";
+        observation.cause_codes = ["STORAGE_UNAVAILABLE"];
+      }
+      if (observation.component === "Workspace" && (usable || workspace.hasEvents())) {
+        observation.status = usable ? "Ready" : "Unavailable";
+        observation.cause_codes = usable ? [] : ["NOT_READY"];
+      }
+      if (observation.component === "DisplayedRobotVideo" && (displayed || workspace.hasEvents())) {
+        observation.status = displayed ? "Ready" : "Unavailable";
+        observation.cause_codes = displayed ? [] : ["NOT_READY"];
+      }
+    }
+    const sharedReady = !!profile && hasLiveOwner && displayed && !snapshot.active_session && !storageBlocked() &&
+      components.every(({ component, status }) => component === "Webcam" || component === "Controller" || status === "Ready");
+    return { components, can_start: {
+      Gestures: sharedReady && components.some(({ component, status }) => component === "Webcam" && status === "Ready"),
+      Controller: sharedReady && components.some(({ component, status }) => component === "Controller" && status === "Ready"),
+    }, can_resume: readiness.can_resume };
   };
-  const snapshotRead = () => {
+  const snapshotRead = (client = bootstrap.client_id): Snapshot => {
     const active_object = snapshot.active_object && projectObject(snapshot.active_object, now());
     const operations = [...snapshot.operations, ...registrations.operations().filter(({ result }) =>
       !result?.object || !retention.excluded(result.object.id)), ...retention.operations()];
     const pending = operations.filter(({ persistence }) => persistence === "Pending");
     const completed = operations.filter(({ persistence }) => persistence !== "Pending").slice(-64);
     return {
-      ...snapshot, active_object, readiness: readinessRead(),
+      ...snapshot, event_seq: workspace.watermark(), active_object, readiness: readinessRead(client),
+      lease: snapshot.lease.state === "Owned" ? snapshot.lease : { ...snapshot.lease, can_acquire: workspace.canAcquire(client) },
       retention: { ...retention.read(), active_object_expires_at_ms: active_object?.expires_at_ms ?? null,
         active_object_grace: active_object?.retention_grace ?? false },
       operations: [...pending, ...completed],
     };
   };
-  let ticketSequence = 0;
   let emergencyFailure = snapshot.failures.find((failure) => failure.cause === "EmergencyStop" && !failure.restored);
   const profile = compatibleProfile(snapshot.qualification_profile) ? snapshot.qualification_profile : null;
+  const tickets = openSocketTickets(monotonic, now);
+  const workspace = openFixtureWorkspace({
+    boot: bootstrap.backend_boot_id, profile, now, monotonic, read: snapshotRead, frameMode: scene.frameMode,
+    available: (source) => snapshot.readiness.components.some(({ component, status }) =>
+      component === (source === "robot" ? "RobotVideo" : "Webcam") && status === "Ready"),
+    setLease(lease, pause) {
+      const session = snapshot.active_session;
+      const pausedSession = pause && session?.state === "Searching" ? {
+        ...session, state: "Paused" as const, revision: session.revision + 1,
+        pause_causes: [{ cause: "ManualPause" as const, failure_id: null }],
+      } : session;
+      snapshot = { ...snapshot, lease, active_session: pausedSession, runtime: {
+        ...snapshot.runtime, effective_session_state: pausedSession?.state ?? null,
+        control_generation: lease.control_generation, motion_permission: "Disarmed",
+      } };
+    },
+  });
   let failList = scene.recordsRecovery;
   let failDetail = scene.recordsRecovery;
   let expireContinuation = scene.recordsRecovery;
@@ -121,7 +160,7 @@ export function createFixtureTransport({
 
   function authorize({ context }: ProtectedRequest, clientRequired = true) {
     return context.backend_boot_id === bootstrap.backend_boot_id && context.capability === bootstrap.capability &&
-      (!clientRequired || context.client_id === bootstrap.client_id);
+      (!clientRequired || clients.has(context.client_id));
   }
 
   async function respond<T>(request: ProtectedRequest, makeResult: () => ReadResult<T> | Promise<ReadResult<T>>, clientRequired = true) {
@@ -145,6 +184,7 @@ export function createFixtureTransport({
   }
 
   function invalidate(owners?: string[]) {
+    workspace.publish();
     for (const listener of retentionListeners) listener(owners);
   }
 
@@ -207,8 +247,14 @@ export function createFixtureTransport({
     if (storageBlocked()) return unavailableStorage;
     if (object.data.revision !== body.expected_revision) return conflict;
     if (object.data.status !== "Lost") return error(409, "INVALID_TRANSITION", "Sample object is already Found.");
-    if (body.client_id !== bootstrap.client_id || body.client_lease_id !== leaseId) return error(403, "LEASE_REQUIRED", "Invalid sample lease.");
-    if (!snapshot.readiness.can_start[body.control_mode]) return error(503, "NOT_READY", "Sample setup is unavailable.");
+    if (!startSpecimen || body.client_id !== bootstrap.client_id || body.client_lease_id !== leaseId) {
+      return error(403, "LEASE_REQUIRED", "Invalid sample lease.");
+    }
+    const input = body.control_mode === "Gestures" ? "Webcam" : "Controller";
+    if (!profile || snapshot.readiness.components.some(({ component, status }) => status !== "Ready" &&
+      (component === input || (component !== "Webcam" && component !== "Controller")))) {
+      return error(503, "NOT_READY", "Sample setup is unavailable.");
+    }
     return mutation(body.action_id, "Committed", { ...startReceipt, session: {
       ...startReceipt.session, object_id: object.data.id, control_mode: body.control_mode,
     } }, 201, "/api/v1/sessions/sample-new-search");
@@ -233,10 +279,10 @@ export function createFixtureTransport({
       const initialization = retention.read().deletion.status === "Failed" ? "Failed" : scene.health.initialization;
       return ok(healthFor({ ...snapshot, readiness: readinessRead() }, initialization), initialization === "Ready" ? 200 : 503);
     },
-    "GET /snapshot": () => {
+    "GET /snapshot": ({ context }) => {
       const error = snapshotError;
       if (scene.snapshotErrorOnce) snapshotError = undefined;
-      return error ? { kind: "api-error", status: 503, error } : ok(snapshotRead());
+      return error ? { kind: "api-error", status: 503, error } : ok(snapshotRead(context.client_id));
     },
     "GET /objects": ({ query }) => {
       if (failList && query?.limit === undefined) {
@@ -323,45 +369,15 @@ export function createFixtureTransport({
       const result = retention.apply(body);
       return result.kind === "ok" && retention.takeLostResponse(body.action_id) ? { kind: "unavailable" } : result;
     },
-    "POST /websocket-tickets": ({ body: value }) => {
+    "POST /websocket-tickets": ({ body: value, context }) => {
       const body = value as TicketRequest;
       if (!conforms("TicketRequest", body)) return invalid;
-      if (body.client_id !== bootstrap.client_id) return error(403, "CLIENT_INVALID", "Unknown sample client.");
+      if (body.client_id !== context.client_id) return error(403, "CLIENT_INVALID", "Unknown sample client.");
       if (!profile) return error(503, "NOT_READY", "Sample profile is unavailable.");
-      const sampleTicket = (++ticketSequence).toString(16).padStart(42, "E") + "A";
-      return ok({ ticket: sampleTicket, expires_at_ms: now() + 10_000 });
+      return tickets.issue(context, body.channel);
     },
-    "POST /control-lease": ({ body: value }) => {
-      if (!conforms("LeaseAcquire", value)) return invalid;
-      const body = value as HttpRequest<"POST /control-lease">["body"];
-      if (body.client_id !== bootstrap.client_id) return error(403, "CLIENT_INVALID", "Unknown sample client.");
-      if (!profile || scene.snapshot.lease.state !== "Owned") return error(503, "NOT_READY", "No sample lease is available.");
-      if (body.request_id !== requestId) return snapshot.lease.state === "Owned"
-        ? error(403, "LEASE_OWNED", "The sample lease is already owned.")
-        : error(503, "NOT_READY", "No sample lease is available.");
-      if (body.session_id !== (snapshot.active_session?.id ?? null)) return error(409, "OWNERSHIP_MISMATCH", "Wrong sample session.");
-      if (body.takeover !== (body.session_id !== null)) return error(409, "REQUEST_ID_CONFLICT", "Sample acquisition differs from the original request.");
-      return ok({ request_id: body.request_id, client_lease_id: leaseId, control_generation: scene.snapshot.lease.control_generation,
-        lease: scene.snapshot.lease, snapshot: snapshotRead() });
-    },
-    "POST /control-lease/release": ({ body: value }) => {
-      if (!conforms("LeaseRelease", value)) return invalid;
-      const body = value as HttpRequest<"POST /control-lease/release">["body"];
-      if (!profile || snapshot.lease.state !== "Owned" || body.client_id !== bootstrap.client_id ||
-          body.client_lease_id !== leaseId || body.control_generation !== snapshot.lease.control_generation ||
-          body.session_id !== (snapshot.active_session?.id ?? null)) return error(403, "LEASE_REQUIRED", "Invalid sample lease.");
-      const control_generation = snapshot.lease.control_generation + 1;
-      const lease = { state: "Unowned", owner_client_id: null, control_generation, can_acquire: false } as const;
-      const released = { ...snapshotRead(), lease, runtime: { ...snapshot.runtime, control_generation, motion_permission: "Disarmed" } } satisfies typeof snapshot;
-      if (released.active_session?.state === "Searching") {
-        const session = released.active_session;
-        released.active_session = { ...session, state: "Paused", revision: session.revision + 1,
-          pause_causes: [{ cause: "ManualPause", failure_id: null }] };
-        released.runtime.effective_session_state = "Paused";
-      }
-      released.readiness = { ...released.readiness, can_start: { Controller: false, Gestures: false }, can_resume: false };
-      return ok({ request_id: body.request_id, client_lease_id: null, control_generation, lease, snapshot: released });
-    },
+    "POST /control-lease": ({ body, context }) => workspace.acquire(context.client_id, body as LeaseAcquire),
+    "POST /control-lease/release": ({ body, context }) => workspace.release(context.client_id, body as LeaseRelease),
     "POST /emergency-stop": ({ body }) => {
       if (scene.emergency === "network") return { kind: "unavailable" };
       const valid = conforms("EmergencyStopRequest", body);
@@ -375,6 +391,7 @@ export function createFixtureTransport({
       }
       const failure = session ? emergencyFailure : undefined;
       const alreadyRecorded = snapshot.failures.some(({ failure_id }) => failure_id === failure?.failure_id);
+      workspace.clearOwnership();
       snapshot = {
         ...snapshot, lease: { state: "Unowned", owner_client_id: null, control_generation, can_acquire: false },
         runtime: {
@@ -388,6 +405,7 @@ export function createFixtureTransport({
           pause_causes: [...session.pause_causes, { cause: "RecoveryRequired", failure_id: failure.failure_id }],
         } : session,
       };
+      workspace.publish();
       return valid ? emergencyResponse(body as EmergencyStopRequest, snapshot, failure?.failure_id ?? null, scene.emergency)
         : { kind: "api-error", status: 422, error: {
           code: "VALIDATION_FAILED", message: "Invalid sample emergency request.", retryable: false, permission_revoked: true,
@@ -395,20 +413,13 @@ export function createFixtureTransport({
     },
   };
 
-  function subscribe(request: ProtectedRequest, deliver: () => void) {
-    const signal = signalFor(request.signal);
-    if (signal.aborted || !authorize(request) || !profile) return () => {};
-    let active = true;
-    queueMicrotask(() => { if (active && !signal.aborted) deliver(); });
-    return () => { active = false; };
-  }
-
   function endFixtureSearch(end_reason: Extract<Session, { state: "Ended" }>["end_reason"] = "Stopped") {
     const active = snapshot.active_session;
     if (!active) return;
     const ended: Session = { ...active, state: "Ended", end_reason, ended_at_ms: now(), revision: active.revision + 1, pause_causes: [] };
     sessions = sessions.map((session) => session.id === ended.id ? ended : session);
     const control_generation = snapshot.runtime.control_generation + 1;
+    workspace.clearOwnership();
     snapshot = { ...snapshot, active_object: null, active_session: null, pending_candidate: null, failures: [],
       lease: { state: "Unowned", owner_client_id: null, can_acquire: false, control_generation },
       runtime: { effective_session_state: null, motion_permission: "Disarmed", persistence_pending: false, control_generation },
@@ -425,6 +436,14 @@ export function createFixtureTransport({
       isSavePending: retention.isSavePending,
       cleanup(failed: boolean) { retention.finishCleanup(failed); scheduleRetention(); },
       endSearch: endFixtureSearch,
+      addClient() {
+        const client_id = crypto.randomUUID();
+        if (clients.size >= 64) throw new Error("Sample client capacity reached");
+        clients.add(client_id);
+        return { ...bootstrap, client_id };
+      },
+      changeFrames(mode: FrameMode) { workspace.changeFrames(mode); },
+      disconnectEvents() { workspace.disconnectEvents(bootstrap.client_id); },
       activateSearch(state: "Searching" | "Paused") {
         const result = objectRead(sampleObject.id);
         if (snapshot.active_session || storageBlocked() || result.kind !== "ok") return;
@@ -451,7 +470,9 @@ export function createFixtureTransport({
     },
     request<Route extends Endpoint>(route: Route, request: HttpRequest<Route>): Promise<ReadResult<HttpResponses[Route]>> {
       return respond(request, () => {
-        if (!route.startsWith("GET ")) observeMutation?.(route, "body" in request ? request.body : undefined);
+        if (!route.startsWith("GET ") && route !== "POST /websocket-tickets") {
+          observeMutation?.(route, "body" in request ? request.body : undefined);
+        }
         return handlers[route](request);
       }, route !== "POST /emergency-stop");
     },
@@ -463,25 +484,24 @@ export function createFixtureTransport({
       observeMutation?.("POST /emergency-stop", body);
       return handlers["POST /emergency-stop"]({ ...request, body });
     }, false),
-    subscribeEvents(request: ProtectedRequest, onEvent: (event: EventEnvelope) => void) {
+    connectEvents(request: ProtectedRequest, offer: SocketOffer, observer: SocketObserver<EventEnvelope>) {
       const signal = signalFor(request.signal);
-      let subscribed = true;
-      const unsubscribe = subscribe(request, () => {
-        retention.sweep();
-        scheduleRetention();
-        const events = eventScript === "catalogue" ? eventVectors : [snapshotEvent(snapshotRead())];
-        for (const event of events) {
-          if (!subscribed || signal.aborted) break;
-          onEvent(structuredClone<EventEnvelope>(event));
-        }
-      });
-      return () => { subscribed = false; unsubscribe(); };
+      if (signal.aborted) return { kind: "unavailable" } as const;
+      if (!authorize(request)) return error(403, "TICKET_INVALID", "The channel ticket is invalid.");
+      if (!profile) return error(503, "NOT_READY", "Sample profile is unavailable.");
+      const redemption = tickets.redeem(request.context, "events", offer);
+      if (redemption.kind !== "ok") return redemption;
+      retention.sweep();
+      scheduleRetention();
+      return ok(workspace.connectEvents(request.context.client_id, observer, signal));
     },
-    subscribeFrames(request: ProtectedRequest, source: FrameMetadata["source"], onFrame: (frame: Uint8Array) => void) {
-      return subscribe(request, () => {
-        const frame = frameVector(source, profile);
-        if (frame) onFrame(frame);
-      });
+    connectFrames(request: ProtectedRequest, source: FrameMetadata["source"], offer: SocketOffer, observer: SocketObserver<Uint8Array>) {
+      const signal = signalFor(request.signal);
+      if (signal.aborted) return { kind: "unavailable" } as const;
+      if (!authorize(request)) return error(403, "TICKET_INVALID", "The channel ticket is invalid.");
+      if (!profile) return error(503, "NOT_READY", "Sample profile is unavailable.");
+      const redemption = tickets.redeem(request.context, source === "robot" ? "robot-video" : "webcam-video", offer);
+      return redemption.kind !== "ok" ? redemption : ok(workspace.connectVideo(request.context.client_id, source, observer, signal));
     },
     media(id: string, request: ProtectedRequest) {
       return respond<ProtectedMedia>(request, () => {
@@ -508,6 +528,14 @@ export function createFixtureTransport({
         } });
       });
     },
-    dispose() { lifetime.abort(); clearTimeout(retentionTimer); retentionListeners.clear(); pages.clear(); registrations.clear(); },
+    dispose() {
+      workspace.dispose();
+      tickets.clear();
+      lifetime.abort();
+      clearTimeout(retentionTimer);
+      retentionListeners.clear();
+      pages.clear();
+      registrations.clear();
+    },
   } satisfies ApplicationTransport & { controls: object };
 }

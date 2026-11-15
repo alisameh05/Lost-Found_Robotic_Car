@@ -12,8 +12,9 @@ export type LoadImage = (signal: AbortSignal) => Promise<{ kind: "ok"; image: Bl
 type ImageState = ({ kind: "ok"; url: string } | MediaFailure) & { load: LoadImage };
 
 export function ProtectedImage({
-  load, label, alt, width, height, target, box, targetOnly,
-}: { load: LoadImage; label: string; alt: string; width: number; height: number; target?: Rect; box?: Rect; targetOnly?: boolean }) {
+  load, label, alt, width, height, target, box, targetOnly, onDisplay,
+}: { load: LoadImage; label: string; alt: string; width: number; height: number; target?: Rect; box?: Rect; targetOnly?: boolean;
+  onDisplay?: (available: boolean | undefined) => void }) {
   const [state, setState] = useState<ImageState>();
   const [inspection, setInspection] = useState<ImageState>();
   const frameId = useId();
@@ -39,22 +40,27 @@ export function ProtectedImage({
   useEffect(() => {
     const lifetime = new AbortController();
     let url: string | undefined;
+    onDisplay?.(undefined);
     void load(lifetime.signal).then((result) => {
       if (lifetime.signal.aborted) return;
       if (result.kind === "ok") {
         url = URL.createObjectURL(result.image);
         setState({ load, kind: "ok", url });
       } else {
+        onDisplay?.(false);
         setState({ load, ...result });
       }
     }).catch(() => {
-      if (!lifetime.signal.aborted) setState({ load, kind: "unavailable", detail: "The image request failed." });
+      if (!lifetime.signal.aborted) {
+        onDisplay?.(false);
+        setState({ load, kind: "unavailable", detail: "The image request failed." });
+      }
     });
     return () => {
       lifetime.abort();
       if (url) URL.revokeObjectURL(url);
     };
-  }, [load]);
+  }, [load, onDisplay]);
 
   function renderImage(crop?: Rect) {
     if (state?.load !== load) return <LoadingState label="Loading image" announce={false} />;
@@ -62,6 +68,7 @@ export function ProtectedImage({
 
     function failedDecode() {
       if (state?.kind !== "ok") return;
+      onDisplay?.(false);
       URL.revokeObjectURL(state.url);
       setState((current) => current === state ? { load, kind: "decode-error" } : current);
     }
@@ -73,8 +80,9 @@ export function ProtectedImage({
           width: `${100 * width / crop.width}%`, left: `${-100 * crop.x / crop.width}%`, top: `${-100 * crop.y / crop.height}%`,
         }}
         onError={failedDecode}
-        onLoad={box ? ({ currentTarget }) => {
+        onLoad={box || onDisplay ? ({ currentTarget }) => {
           if (currentTarget.naturalWidth !== width || currentTarget.naturalHeight !== height) failedDecode();
+          else if (!crop || targetOnly) onDisplay?.(true);
         } : undefined}
       />
     );

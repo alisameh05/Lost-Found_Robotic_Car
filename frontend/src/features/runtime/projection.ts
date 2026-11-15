@@ -1,5 +1,7 @@
-import type { EmergencyStopRequest, EmergencyStopResponse, Health, RetentionChange, RetentionPreviewRequest, Snapshot } from "@/generated/api-v1";
+import type { EmergencyStopRequest, EmergencyStopResponse, FrontendProfile, Health, RetentionChange, RetentionPreviewRequest, Snapshot } from "@/generated/api-v1";
+import { compatibleProfile } from "@/lib/fixture-contracts";
 import type { ApplicationTransport, HttpRequest, ProtectedPath, ProtectedRequest, ReadEndpoint, ReadParams, ReadResult } from "@/lib/transport";
+import { openWorkspace, type WorkspaceView } from "./workspace";
 
 type EmergencyFeedback =
   | { kind: "sending" }
@@ -15,6 +17,8 @@ type RuntimeView = {
   health?: Health;
   emergency?: EmergencyFeedback;
   removedOwners?: ReadonlySet<string>;
+  profile?: FrontendProfile;
+  workspace?: WorkspaceView;
 };
 
 export type RegistrationAction = Pick<HttpRequest<"POST /objects">, "body" | "actionCreatedAtMs">;
@@ -27,6 +31,11 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
   let clock: { server: number; received: number } | undefined;
   let readRequest: AbortController | undefined;
   let uncertainRequest: EmergencyStopRequest | undefined;
+  let workspace: ReturnType<typeof openWorkspace> | undefined;
+
+  function serverTime() {
+    if (clock && !lifetime.signal.aborted) return clock.server + Math.ceil(performance.now() - clock.received);
+  }
 
   function acknowledgedSnapshot(response: EmergencyStopResponse) {
     const snapshot = view.snapshot;
@@ -50,15 +59,31 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     update({ loading: true });
     try {
       if (!context || readBootstrap) {
+        const bootstrapStarted = performance.now();
         const bootstrap = await transport.bootstrap(signal);
         if (signal.aborted) return;
         if (bootstrap.kind !== "ok") {
-          update({ loading: false, failedRead: bootstrap, health: undefined });
+          workspace?.dispose();
+          workspace = undefined;
+          context = undefined;
+          clock = undefined;
+          update({ loading: false, failedRead: bootstrap, health: undefined, snapshot: undefined, connected: false,
+            profile: undefined, workspace: undefined });
           return;
         }
+        const candidate = bootstrap.data.qualification_profile;
+        const profile = compatibleProfile(candidate) ? candidate : undefined;
+        const sameAuthority = context?.backend_boot_id === bootstrap.data.backend_boot_id &&
+          context.client_id === bootstrap.data.client_id && context.capability === bootstrap.data.capability;
+        const sameProfile = sameAuthority && JSON.stringify(profile) === JSON.stringify(view.profile);
+        if (!sameProfile) {
+          workspace?.dispose();
+          workspace = undefined;
+        }
         context = bootstrap.data;
-        clock = { server: bootstrap.data.server_time_ms, received: performance.now() };
-        update({ connected: true });
+        clock = { server: bootstrap.data.server_time_ms, received: bootstrapStarted };
+        update({ connected: true, profile: sameProfile ? view.profile : profile,
+          ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, removedOwners: undefined }) });
       }
       const request = { context, signal };
       const unavailable = () => ({ kind: "unavailable" } as const);
@@ -67,9 +92,10 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         transport.request("GET /health", request).catch(unavailable),
       ]);
       if (signal.aborted) return;
+      const eventsLive = view.workspace?.eventsLive;
       update({
-        snapshot: status.kind === "ok" ? status.data : view.snapshot,
-        failedRead: status.kind === "ok" ? undefined : status,
+        snapshot: eventsLive ? view.snapshot : status.kind === "ok" ? status.data : view.snapshot,
+        failedRead: status.kind === "ok" || eventsLive ? undefined : status,
         health: health.kind === "ok" ? health.data : undefined,
         loading: false,
       });
@@ -89,6 +115,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       if (result.kind === "ok" && result.data.request_id === body.request_id &&
           result.data.backend_boot_id === request.context.backend_boot_id) {
         uncertainRequest = undefined;
+        workspace?.release("Control was released by Emergency Stop.");
         update({ emergency: { kind: "result", status: result.status, response: result.data }, snapshot: acknowledgedSnapshot(result.data) });
         void refresh();
       } else if (result.kind === "api-error") {
@@ -122,9 +149,31 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     },
     refresh,
     emergency,
-    serverTime() {
-      if (clock && !lifetime.signal.aborted) return clock.server + Math.floor(performance.now() - clock.received);
+    serverTime,
+    mountWorkspace(robot: HTMLCanvasElement, webcam?: HTMLCanvasElement) {
+      if (!context || !view.profile || lifetime.signal.aborted) return () => {};
+      workspace?.dispose();
+      const active = openWorkspace({
+        transport, context, profile: view.profile, robot, webcam, serverTime,
+        update: (observation) => update({ workspace: observation }),
+        snapshot: (next, removedOwner) => update({ snapshot: next, failedRead: undefined,
+          ...(removedOwner && { removedOwners: new Set([...view.removedOwners ?? [], removedOwner]) }) }),
+        recover: () => {
+          update({ snapshot: undefined, failedRead: { kind: "unavailable" } });
+          void refresh({ readBootstrap: true });
+        },
+      });
+      workspace = active;
+      return () => {
+        active.dispose();
+        if (workspace !== active) return;
+        workspace = undefined;
+        update({ workspace: undefined });
+        queueMicrotask(() => { void refresh(); });
+      };
     },
+    acquireWorkspace: () => workspace?.acquire(),
+    releaseWorkspace: () => workspace?.release(),
     async register(action: RegistrationAction, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;
       return transport.request("POST /objects", { ...action, context, signal: AbortSignal.any([signal, lifetime.signal]) });
@@ -152,6 +201,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       return transport.media(id, { context, signal: AbortSignal.any([signal, lifetime.signal]) });
     },
     dispose() {
+      workspace?.dispose();
       lifetime.abort();
       unsubscribeRetention?.();
       subscribers.clear();

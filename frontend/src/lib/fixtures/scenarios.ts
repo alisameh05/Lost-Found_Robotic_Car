@@ -1,4 +1,5 @@
 import type { BootstrapResponse, Error as ApiError, Health, Match, Object as LostObject, Session, Snapshot } from "@/generated/api-v1";
+import type { FrameMode } from "./workspace";
 import {
   bootstrapFacts, clear, confirmed, earlierWalletMatches, earlierWalletSessions, expiredObject, expiredSession,
   fixtureProfile, foundObject, foundSession, foundWallet, healthFor, interruptedSession, libraryRecords, notReviewed, paused,
@@ -18,6 +19,7 @@ type Scenario = {
   recordsRecovery?: boolean;
   historyRecovery?: boolean;
   dashboardRecovery?: boolean;
+  frameMode?: FrameMode;
   emergency: "Committed" | "Pending" | "Failed" | "network";
 };
 
@@ -38,6 +40,14 @@ const compatible = { ...snapshot, qualification_profile: fixtureProfile, qualifi
 const owned = { ...compatible, lease: { state: "Owned", owner_client_id: bootstrapFacts.client_id, control_generation: 1, can_acquire: false } } satisfies Snapshot;
 const controllerReady = { Webcam: "Unavailable" } as const;
 const gesturesReady = { Controller: "Unavailable" } as const;
+const setupProfile = {
+  ...fixtureProfile, profile_id: "fixture-search-setup", max_frame_bytes: 65_536, max_frame_width: 640, max_frame_height: 480,
+  max_frame_pixels: 307_200, heartbeat_deadline_ms: 1_000, display_deadline_ms: 1_000, capture_age_limit_ms: 850,
+};
+const setup = {
+  ...snapshot, qualification_profile: setupProfile, qualification_profile_id: setupProfile.profile_id,
+  readiness: readiness({ DisplayedRobotVideo: "Unavailable", Workspace: "Unavailable" }, setupProfile, null, false),
+} satisfies Snapshot;
 
 function active(session: typeof searching | typeof paused, overrides: Partial<Snapshot> = {}): Snapshot {
   return {
@@ -81,7 +91,16 @@ const dashboardTies = [
 ];
 
 const scenarios = {
-  idle: initial,
+  idle: withSnapshot(setup),
+  "no-profile": initial,
+  "setup-ps4": withSnapshot({ ...setup, readiness: readiness({ ...controllerReady,
+    DisplayedRobotVideo: "Unavailable", Workspace: "Unavailable" }, setupProfile, null, false) }),
+  "setup-blocked": withSnapshot({ ...setup, readiness: readiness({ AI: "Unavailable",
+    DisplayedRobotVideo: "Unavailable", Workspace: "Unavailable" }, setupProfile, null, false) }),
+  "setup-spectator": withSnapshot({ ...setup, lease: { ...owned.lease, owner_client_id: "fixture-other-client" } }),
+  "setup-empty": withSnapshot(setup, { frameMode: "empty" }),
+  "setup-corrupt": withSnapshot(setup, { frameMode: "corrupt" }),
+  "setup-frozen": withSnapshot(setup, { frameMode: "frozen" }),
   initializing: withSnapshot({
     ...snapshot, readiness: readiness({
       Backend: "Initializing", Storage: "Initializing", Workspace: "Unavailable", Command: "Unavailable",
@@ -125,12 +144,12 @@ const scenarios = {
       { ...confirmed, reviewed_at_ms: foundSession.ended_at_ms - 2, evidence_media: { ...confirmed.evidence_media, availability: "Missing" } },
     ],
   }),
-  "controller-ready": withSnapshot({ ...owned, readiness: readiness(controllerReady, fixtureProfile, null, true) }),
-  "gestures-ready": withSnapshot({ ...owned, readiness: readiness(gesturesReady, fixtureProfile, null, true) }),
+  "controller-ready": withSnapshot({ ...compatible, readiness: readiness(controllerReady, fixtureProfile, null, false) }),
+  "gestures-ready": withSnapshot({ ...compatible, readiness: readiness(gesturesReady, fixtureProfile, null, false) }),
   "camera-unavailable": withSnapshot({
-    ...owned, readiness: readiness({
+    ...compatible, readiness: readiness({
       ...gesturesReady, RobotVideo: "Unavailable", DisplayedRobotVideo: "Unavailable",
-    }, fixtureProfile, null, true),
+    }, fixtureProfile, null, false),
   }, snapshotReadFailure),
   "active-readiness-retry": withSnapshot(pausedState, { ...snapshotReadFailure, sessions: [paused, foundSession], matches: [confirmed] }),
   candidate: withSnapshot({ ...active(candidateSession), pending_candidate: pending }, {

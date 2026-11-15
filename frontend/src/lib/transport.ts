@@ -1,6 +1,6 @@
 import type {
   BootstrapResponse, Channel, EmergencyStopRequest, Error as ApiError, EventEnvelope, HttpBodies,
-  HttpResponses, Object as LostObject, Token,
+  FrameMetadata, HttpResponses, Object as LostObject, Token, WorkspaceHeartbeat,
 } from "@/generated/api-v1";
 
 export type ClientContext = Pick<BootstrapResponse, "backend_boot_id" | "capability" | "client_id">;
@@ -42,6 +42,11 @@ export type ProtectedMedia = {
   };
 };
 
+export type SocketOffer = { path: string; protocols: readonly string[] };
+export type ReadSocket = { protocol: "laf.v1"; close(): void };
+export type EventSocket = ReadSocket & { heartbeat(body: WorkspaceHeartbeat): boolean };
+export type SocketObserver<Message> = { message(value: Message): void; closed(): void };
+
 export interface ApplicationTransport {
   subscribeRetention?(onChange: (removedOwners?: readonly string[]) => void): () => void;
   bootstrap(signal?: AbortSignal): Promise<ReadResult<BootstrapResponse>>;
@@ -51,8 +56,9 @@ export interface ApplicationTransport {
     request: ProtectedRequest & { id?: string },
   ): Promise<ReadResult<HttpResponses[`GET ${Path}`]>>;
   snapshot(request: ProtectedRequest): Promise<ReadResult<HttpResponses["GET /snapshot"]>>;
-  subscribeEvents(request: ProtectedRequest, onEvent: (event: EventEnvelope) => void): () => void;
-  subscribeFrames(request: ProtectedRequest, source: "robot" | "webcam", onFrame: (frame: Uint8Array) => void): () => void;
+  connectEvents(request: ProtectedRequest, offer: SocketOffer, observer: SocketObserver<EventEnvelope>): ReadResult<EventSocket>;
+  connectFrames(request: ProtectedRequest, source: FrameMetadata["source"], offer: SocketOffer,
+    observer: SocketObserver<Uint8Array>): ReadResult<ReadSocket>;
   media(id: string, request: ProtectedRequest): Promise<ReadResult<ProtectedMedia>>;
   emergency(body: EmergencyStopRequest, request: ProtectedRequest): Promise<ReadResult<HttpResponses["POST /emergency-stop"]>>;
   dispose(): void;
