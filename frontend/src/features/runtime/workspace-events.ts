@@ -54,10 +54,6 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
   if (current && event.event_seq < current.event_seq) return current;
   if (event.type === "snapshot") {
     const { payload } = event;
-    const previous = current?.pending_candidate;
-    const candidate = payload.pending_candidate;
-    if (previous && candidate && (previous.id === candidate.id || session?.revision === payload.active_session?.revision) &&
-        !sameCapture(previous, candidate)) return;
     if (!validSnapshot(payload, boot) || payload.event_seq !== event.event_seq ||
         (payload.active_session?.id ?? null) !== event.session_id ||
         (payload.active_session?.revision ?? null) !== event.session_revision) return;
@@ -70,6 +66,10 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
   if (session?.id === event.session_id && event.session_revision !== null && event.session_revision < session.revision) return;
   if (event.type === "snapshot") {
     const { payload } = event;
+    const previous = current?.pending_candidate;
+    const candidate = payload.pending_candidate;
+    if (previous && candidate && (previous.id === candidate.id || session?.revision === payload.active_session?.revision) &&
+        !sameCapture(previous, candidate)) return;
     if (current && (payload.runtime.control_generation < current.runtime.control_generation ||
       payload.retention.settings.revision < current.retention.settings.revision ||
       (current.active_object && current.active_object.id === payload.active_object?.id &&
