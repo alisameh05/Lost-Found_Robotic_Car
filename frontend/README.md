@@ -43,7 +43,7 @@ npm.cmd run verify
 | `npm test` | Verify accessible navigation, fields, pending actions and read retry, and validate fixture responses and binary vectors. |
 | `npm run contracts:fixtures` | Run the public contract and fixture checks on their own. |
 | `npm run build` | Create the local production build. |
-| `npm run test:e2e` | Test both modes against the production build on loopback ports 3100 and 3101. |
+| `npm run test:e2e` | Test the production build on loopback ports 3100 (fixture with harness), 3101 (disconnected), and 3102 (fixture without harness). |
 
 The seed records the API document version, its line-ending-normalized SHA-256 and the endpoint catalogue. Ajv verifies the complete Draft 2020-12 definitions against fixture payloads. The contract checks also validate relationships between resources, readiness and profile bounds, and binary frame envelopes. Deliberately invalid vectors are exercised separately. In Phase 04, replace the documentation-derived generation input with backend-owned OpenAPI plus event and frame exports. Compare wire fields, required/nullability rules, enums, limits and fixture validation against this baseline before removing the seed.
 

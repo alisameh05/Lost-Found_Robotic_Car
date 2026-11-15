@@ -7,22 +7,23 @@ import { PageHeader } from "@/components/layout/page-header";
 import layout from "@/components/layout/support-page.module.css";
 import { Button } from "@/components/ui/button";
 import { LoadingState, Notice } from "@/components/ui/feedback";
-import { useEligibleSearchSetup, useRuntime, useRuntimeView } from "@/features/runtime";
+import { useEligibleSearchSetup, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import type { Component, ControlMode, Health } from "@/generated/api-v1";
 import { searchSetupHref, supportHref, type SearchSetupContext } from "@/lib/search-setup-context";
 import { InactiveInput, PathRow, paths, ProximityAdvisory } from "./device-observations";
 import styles from "./devices.module.css";
-import { describeDeviceReadiness, modeLabels } from "./readiness-summary";
+import { describeDeviceReadiness, deviceReadinessView, modeLabels } from "./readiness-summary";
 
 const connectionAndMatchingComponents = new Set<Component["component"]>(["Command", "RobotVideo", "AI"]);
 
-function ReadinessNotice({ loading, disconnected, health, snapshotFailed, summary, mode }: {
+export function ReadinessNotice({ loading, disconnected, health, snapshotFailed, summary, mode, compact = false }: {
   loading: boolean;
   disconnected?: boolean;
   health?: Health;
   snapshotFailed: boolean;
   summary: ReturnType<typeof describeDeviceReadiness>;
   mode: ControlMode;
+  compact?: boolean;
 }) {
   if (loading) return <LoadingState label="Loading device readiness" announce={false} />;
   if (disconnected) return <Notice title="Backend unavailable" tone="danger">Connect the local application to see device observations.</Notice>;
@@ -49,10 +50,9 @@ function ReadinessNotice({ loading, disconnected, health, snapshotFailed, summar
   const label = modeLabels[mode];
   if (summary.status === "Unavailable") {
     const first = summary.unavailable[0];
-    return <Notice title={`${label} requirements unavailable`} tone="danger">
-      Check {summary.unavailable.map((component) => paths[component].label).join(", ")}.
-      {" "}{paths[first].check}
-    </Notice>;
+    const detail = compact ? undefined : <>Check {summary.unavailable.map((component) => paths[component].label).join(", ")}.
+      {" "}{paths[first].check}</>;
+    return <Notice title={`${label} requirements unavailable`} tone="danger">{detail}</Notice>;
   }
   if (summary.status === "Initializing") {
     return <Notice title={`${label} requirements initializing`} tone="warning">
@@ -60,7 +60,7 @@ function ReadinessNotice({ loading, disconnected, health, snapshotFailed, summar
     </Notice>;
   }
   return <Notice title={`${label} requirements ready`} tone="success">
-    All required paths report Ready. The search workspace checks Start and Resume eligibility separately.
+    {!compact && "All required paths report Ready. The search workspace checks Start and Resume eligibility separately."}
   </Notice>;
 }
 
@@ -72,23 +72,12 @@ function PathList({ observations }: { observations: Component[] }) {
 export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
   const view = useRuntimeView();
   const runtimeState = useRuntime();
+  const refresh = useRefreshRuntime();
   const { context, checking } = useEligibleSearchSetup(setup);
   const [inspectedMode, setInspectedMode] = useState<ControlMode>("Gestures");
-  const snapshot = view.failedRead ? undefined : view.snapshot;
-  const session = snapshot?.active_session;
-  const active = session?.state === "Searching" || session?.state === "Paused" ? session : undefined;
-  const activeModeUnavailable = !snapshot && !!view.health?.active_session_state;
   const setupMode = context?.mode ?? (checking ? setup?.mode : undefined);
-  const mode = active?.control_mode ?? setupMode ?? inspectedMode;
-  const readiness = snapshot?.readiness ?? view.health?.readiness;
-  const summary = describeDeviceReadiness(activeModeUnavailable ? undefined : readiness, mode);
+  const { snapshot, active, activeModeUnavailable, mode, readiness, summary } = deviceReadinessView(view, setupMode ?? inspectedMode);
   const canRefresh = !view.disconnected && runtimeState;
-
-  function refresh() {
-    if (!runtimeState) return;
-    if (runtimeState.connection) void runtimeState.connection.runtime.refresh();
-    else runtimeState.select(runtimeState.selection.id);
-  }
 
   return (
     <div className={layout.page}>

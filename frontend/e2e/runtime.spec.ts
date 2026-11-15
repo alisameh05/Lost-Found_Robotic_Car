@@ -56,7 +56,7 @@ test("follows the active identity supplied by the fixture across previews", asyn
   await expect(page.getByRole("button", { name: "Emergency Stop" })).toHaveCount(0);
   await scenario.selectOption("failed");
   await page.getByRole("button", { name: "Retry snapshot" }).click();
-  await expect(page.getByRole("region", { name: "Search status" }).getByRole("alert")).toContainText("STORAGE_UNAVAILABLE");
+  await expect(page.getByRole("region", { name: "Search status" }).getByRole("status")).toContainText("Search status unavailable");
   await emergencyRequests(page, 0);
 });
 
@@ -100,10 +100,9 @@ for (const [scenario, input, panel, result] of [
     }
     const response = page.getByRole("status").filter({ hasText: "Motion permission revoked" });
     await expect(response).toContainText(result);
-    const search = page.getByRole("region", { name: "Search status" });
+    const search = page.getByRole("region", { name: "Active search", exact: true });
     await expect(search.getByText("Paused", { exact: true })).toBeVisible();
-    await expect(search.getByText(/Motion permission · Disarmed/)).toBeVisible();
-    await expect(search.getByText(`Committed session · ${scenario === "searching" ? "Paused" : "Searching"}`)).toBeVisible();
+    if (scenario === "emergency-pending") await expect(search.getByText("Save pending · Committed session Searching")).toBeVisible();
     await expect(save.getByRole("status")).toContainText("Save pending");
     await expect(save.getByRole("button", { name: "Deliver save result" })).toBeVisible();
     await emergencyRequests(page, 1, true);

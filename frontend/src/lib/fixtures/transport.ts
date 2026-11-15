@@ -74,6 +74,8 @@ export function createFixtureTransport({
   let failDetail = scene.recordsRecovery;
   let expireContinuation = scene.recordsRecovery;
   let failHistory = scene.historyRecovery;
+  let walletDetailsRead = false;
+  let failDashboardHistory = scene.dashboardRecovery;
   let failMatches = scene.historyRecovery;
   let expireSessionCursor = scene.historyRecovery;
   let invalidateMatchCursor = scene.historyRecovery;
@@ -172,7 +174,7 @@ export function createFixtureTransport({
       return error ? { kind: "api-error", status: 503, error } : ok(snapshotRead());
     },
     "GET /objects": ({ query }) => {
-      if (failList) {
+      if (failList && query?.limit === undefined) {
         failList = false;
         return { kind: "unavailable" };
       }
@@ -187,12 +189,19 @@ export function createFixtureTransport({
         failDetail = false;
         return { kind: "unavailable" };
       }
-      return objectRead(id);
+      const result = objectRead(id);
+      if (id === sampleObject.id && result.kind === "ok") walletDetailsRead = true;
+      return result;
     },
     "GET /objects/{id}/sessions": ({ id, query }) => {
       const parent = objectRead(id);
       if (parent.kind !== "ok") return parent;
-      if (id === sampleObject.id && failHistory) {
+      if (id === sampleObject.id && failDashboardHistory) {
+        failDashboardHistory = false;
+        return { kind: "unavailable" };
+      }
+      // Arm the history failure after reading the wallet details.
+      if (id === sampleObject.id && failHistory && walletDetailsRead) {
         failHistory = false;
         return { kind: "unavailable" };
       }

@@ -2,7 +2,7 @@
 import { cleanup, render, screen } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test, vi } from "vitest";
-import { DashboardRuntime, readFixtureShell } from "@/features/runtime";
+import { DashboardFixtureControls, readFixtureShell } from "@/features/runtime";
 import RouteError from "./error";
 import Loading from "./(operator)/loading";
 
@@ -13,7 +13,7 @@ test("the fixture label and emergency action stay available in route loading and
   const retry = vi.fn();
   const user = userEvent.setup();
   const FixtureShell = await readFixtureShell();
-  const view = render(<FixtureShell harnessEnabled><DashboardRuntime /></FixtureShell>);
+  const view = render(<FixtureShell harnessEnabled><DashboardFixtureControls /></FixtureShell>);
   await user.selectOptions(await screen.findByLabelText("Fixture scenario", {}, { timeout: 5000 }), "searching");
   const emergency = await screen.findByRole("button", { name: "Emergency Stop" });
   const label = "Fixture mode · Sample data · No robot connected";

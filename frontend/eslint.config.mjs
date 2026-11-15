@@ -23,7 +23,7 @@ const architecture = {
       const [targetLayer, targetFeature, entry] = to.split("/");
       const publicEntry = !entry || /^index(?:\.[cm]?[jt]sx?)?$/.test(entry);
       const siblingAllows = {
-        dashboard: ["objects", "search"],
+        dashboard: ["objects", "search", "devices"],
         search: ["objects", "devices", "control-guide"],
       };
 

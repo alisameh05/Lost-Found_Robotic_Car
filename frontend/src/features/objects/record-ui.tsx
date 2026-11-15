@@ -13,11 +13,12 @@ import styles from "./records.module.css";
 export const objectHref = (id: string) => `/objects/${encodeURIComponent(id)}`;
 
 const dateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "medium", timeZone: "UTC" });
+const compactDateFormat = new Intl.DateTimeFormat(undefined, { dateStyle: "medium", timeStyle: "short", timeZone: "UTC" });
 
-export function RecordTime({ value }: { value: number }) {
+export function RecordTime({ value, compact = false }: { value: number; compact?: boolean }) {
   const date = new Date(value);
   if (!Number.isFinite(date.getTime())) return <span>{value} ms since Unix epoch</span>;
-  return <time dateTime={date.toISOString()}>{dateFormat.format(date)} UTC</time>;
+  return <time dateTime={date.toISOString()}>{(compact ? compactDateFormat : dateFormat).format(date)} UTC</time>;
 }
 
 export function ObjectStatus({ status }: { status: ObjectRecord["status"] }) {

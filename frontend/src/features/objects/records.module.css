@@ -152,6 +152,15 @@
 .sessionSummary { flex: 1 1 min(26rem, 100%); justify-content: space-between; }
 .sessionTimes { display: grid; gap: var(--space-1); }
 .sessionFacts, .captureTimes, .activity time { color: var(--muted); font-size: .875rem; }
+.compactSession {
+  display: flex;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  color: var(--muted);
+  font-size: .875rem;
+}
+.compactSession [data-found] { color: var(--success); }
 .captureSection { gap: var(--space-2); }
 .captureGrid {
   display: grid;
