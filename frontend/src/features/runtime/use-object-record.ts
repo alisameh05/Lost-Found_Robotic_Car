@@ -13,7 +13,7 @@ export function useObjectRecord(id: string | undefined) {
   const params = useMemo(() => ({ id: id ?? "" }), [id]);
   const { result, snapshotAtRead, retry } = useProtectedRead("GET /objects/{id}", params, id !== undefined);
   const runtime = useRuntime()?.connection?.runtime;
-  const { snapshot } = useRuntimeView();
+  const { snapshot, removedOwners } = useRuntimeView();
   const record = result?.kind === "ok" && result.data.id === id ? result.data : undefined;
   const { expires_at_ms: expiresAt, retention_grace: grace } = record ?? {};
   const activeOwner = Boolean(id && snapshot?.active_session?.object_id === id);
@@ -21,6 +21,7 @@ export function useObjectRecord(id: string | undefined) {
   const canUseGrace = activeOwner || (grace && snapshot === snapshotAtRead);
   const now = runtime?.serverTime();
   const expired = !canUseGrace && expiresAt !== undefined && now !== undefined && now >= expiresAt;
+  const removed = Boolean(record && id && removedOwners?.has(id));
 
   useEffect(() => {
     if (expiresAt === undefined || !runtime || grace) return;
@@ -48,5 +49,6 @@ export function useObjectRecord(id: string | undefined) {
     };
   }, [activeOwner, expiresAt, grace, retry, runtime]);
 
-  return { result, snapshotAtRead, retry, object: expired ? undefined : record, absence: expired ? 410 as const : recordAbsence(result) };
+  return { result, snapshotAtRead, retry, object: expired || removed ? undefined : record,
+    absence: expired || removed ? 410 as const : recordAbsence(result) };
 }

@@ -22,12 +22,16 @@ export function createScenarioHarness() {
       const controls = openControlScript();
       let requests: readonly ObservedMutation[] = [];
       const observers = new Set<() => void>();
-      const transport = createFixtureTransport({ scenario, now, scriptedRegistration: controls.waitForDelivery, observeMutation(route, body) {
-        requests = [...requests, { route, ...(route === "POST /emergency-stop" ? { body: structuredClone(body) } : {}) }];
+      const transport = createFixtureTransport({ scenario, now, manualCleanup: true,
+        scriptedRegistration: controls.waitForDelivery, observeMutation(route, body) {
+        requests = [...requests, { route, ...(["POST /emergency-stop", "POST /settings/retention-preview", "PUT /settings/retention"].includes(route)
+          ? { body: structuredClone(body) } : {}) }];
         for (const notify of observers) notify();
       } });
       return {
         transport,
+        retention: transport.controls,
+        advanceTime(ms: number) { offset += ms; transport.controls.clockChanged(); },
         async submitSample(label: string, outcome: "Committed" | "Failed", signal: AbortSignal) {
           const bootstrap = await transport.bootstrap(signal);
           if (bootstrap.kind !== "ok") return "Failed";
@@ -35,7 +39,7 @@ export function createScenarioHarness() {
         },
         readSample: controls.read,
         deliverSample: controls.deliver,
-        expire() { offset = 9 * day; },
+        expire() { offset = Math.max(offset, 9 * day); transport.controls.clockChanged(); },
         readRequests: () => requests,
         subscribeRequests(notify: () => void) {
           observers.add(notify);

@@ -17,7 +17,7 @@ function useRecentSessionPage(owner?: ObjectRecord) {
 
 export function useRecentRecords() {
   const runtime = useRuntime()?.connection?.runtime;
-  const { snapshot, failedRead } = useRuntimeView();
+  const { snapshot, failedRead, removedOwners } = useRuntimeView();
   const catalogue = useProtectedRead("GET /objects", objectQuery);
   // Suppress the previous scope while its replacement is being read.
   const objectPage = catalogue.result?.kind === "ok" && catalogue.snapshotAtRead !== snapshot ? undefined : catalogue.result;
@@ -30,7 +30,7 @@ export function useRecentRecords() {
 
   const now = runtime?.serverTime();
   const hasGrace = (object: ObjectRecord) => object.retention_grace || activeOwner === object.id;
-  const visible = owners.filter(({ owner, history }) => !recordAbsence(history) &&
+  const visible = owners.filter(({ owner, history }) => !removedOwners?.has(owner.id) && !recordAbsence(history) &&
     (now === undefined || owner.expires_at_ms > now || hasGrace(owner)));
   const sessions = visible.flatMap(({ owner, history }) => history?.kind === "ok"
     ? history.data.items.filter(({ object_id }) => object_id === owner.id).map((session) => ({ session, owner }))
@@ -39,22 +39,6 @@ export function useRecentRecords() {
     (left.id === right.id ? 0 : left.id > right.id ? -1 : 1));
   const deadline = Math.min(...visible.filter(({ owner }) => !hasGrace(owner)).map(({ owner }) => owner.expires_at_ms));
   const { retry } = catalogue;
-
-  useEffect(() => {
-    if (!runtime || !recentObjects.length) return;
-    const currentRuntime = runtime;
-    function onWake() {
-      if (document.visibilityState === "visible" && !currentRuntime.getView().loading) {
-        void currentRuntime.refresh({ readBootstrap: true });
-      }
-    }
-    window.addEventListener("focus", onWake);
-    document.addEventListener("visibilitychange", onWake);
-    return () => {
-      window.removeEventListener("focus", onWake);
-      document.removeEventListener("visibilitychange", onWake);
-    };
-  }, [recentObjects.length, runtime]);
 
   useEffect(() => {
     if (!runtime || !Number.isFinite(deadline)) return;

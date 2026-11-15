@@ -263,11 +263,11 @@ test("serializes review receipts, recovery failures, and retention outcomes", as
   contract("SessionAction", ack);
   contract("MutationResponse", data(await recovery.request("POST /sessions/{id}/actions", { id: base.session_id, context: recoveryContext, body: ack })));
 
-  let now = sampleTime;
-  const idle = createFixtureTransport({ now: () => now });
-  const idleContext = data(await idle.bootstrap());
-  expect(data(await idle.request("GET /settings", { context: idleContext })).retention_days).toBe(7);
   for (const retention_days of [1, 30]) {
+    let now = sampleTime;
+    const idle = createFixtureTransport({ now: () => now });
+    const idleContext = data(await idle.bootstrap());
+    expect(data(await idle.request("GET /settings", { context: idleContext })).retention_days).toBe(7);
     const request = { expected_revision: 1, retention_days };
     contract("RetentionPreviewRequest", request);
     const preview = data(await idle.request("POST /settings/retention-preview", { context: idleContext, body: request }));

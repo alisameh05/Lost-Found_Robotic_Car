@@ -54,6 +54,21 @@ export function RuntimeProvider({ openTransport, harnessEnabled = false, childre
   }, [openTransport, selection]);
 
   const connection = current?.generation === selection.generation ? current : undefined;
+  const runtime = connection?.runtime;
+  useEffect(() => {
+    if (!runtime) return;
+    const wake = () => {
+      if (document.visibilityState === "visible" && !runtime.getView().loading) void runtime.refresh({ readBootstrap: true });
+    };
+    window.addEventListener("focus", wake);
+    window.addEventListener("online", wake);
+    document.addEventListener("visibilitychange", wake);
+    return () => {
+      window.removeEventListener("focus", wake);
+      window.removeEventListener("online", wake);
+      document.removeEventListener("visibilitychange", wake);
+    };
+  }, [runtime]);
   const view = useSyncExternalStore(
     connection?.runtime.subscribe ?? noSubscription,
     connection?.runtime.getView ?? (!openTransport ? () => disconnected : failed === selection.generation ? () => unavailable : initialView),

@@ -45,7 +45,7 @@ test("concurrent registration attempts join one receipt and current protected re
   now = record.expires_at_ms;
   await expect(list()).resolves.toMatchObject({ data: { items: [] } });
   await expect(transport.media(record.reference_media.id, { context })).resolves.toMatchObject({ status: 410 });
-  await expect(transport.request("POST /objects", request)).resolves.toMatchObject({ error: { code: "ACTION_EXPIRED" } });
+  await expect(transport.request("POST /objects", request)).resolves.toMatchObject({ error: { code: "EXPIRED" } });
   transport.dispose();
 });
 

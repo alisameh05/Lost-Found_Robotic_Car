@@ -29,6 +29,8 @@ test.describe("fixture preview", () => {
         await expect(page.getByText(fixtureLabel, { exact: true })).toBeVisible();
         if (title === "Session Details") {
           await expect(page.getByRole("region", { name: "Session record" })).toBeVisible();
+        } else if (title === "Settings") {
+          await expect(page.getByRole("region", { name: "Saved retention" })).toContainText("7 days");
         } else if (!["Dashboard", "Objects / History", "Object Details", "Register Object", "Devices", "Control Guide"].includes(title)) {
           await expect(page.getByText("Phase 01 preview", { exact: true })).toBeVisible();
         }

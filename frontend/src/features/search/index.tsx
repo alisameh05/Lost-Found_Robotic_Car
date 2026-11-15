@@ -3,26 +3,26 @@
 import { notFound } from "next/navigation";
 import { DataUnavailable, Preview, PreviewLinks } from "@/components/layout/preview";
 import { DataFeedback, LoadingState } from "@/components/ui/feedback";
-import { useRuntimeRead, useRuntimeView } from "@/features/runtime";
+import { useObjectRecord, useRuntimeRead, useRuntimeView } from "@/features/runtime";
 import type { ControlMode } from "@/generated/api-v1";
 import { supportHref } from "@/lib/search-setup-context";
 
 export function SearchSetupScreen({ objectId, mode }: { objectId: string; mode?: ControlMode }) {
-  const object = useRuntimeRead("/objects/{id}", objectId);
-  if (object?.kind === "api-error" && object.status === 404) notFound();
-  if (object && object.kind !== "ok") return <DataUnavailable />;
+  const { object, result, absence } = useObjectRecord(objectId);
+  if (absence === 404) notFound();
+  if (!object && result && absence !== 410) return <DataUnavailable />;
 
   return (
     <Preview title="Search Setup" description="Target setup, mode selection and starting a search are planned for a later phase.">
       {object ? <>
-        <section className="panel"><h2>Sample target</h2><p>{object.data.name}</p></section>
+        <section className="panel"><h2>Sample target</h2><p>{object.name}</p></section>
         <PreviewLinks links={[
-          { href: `/objects/${object.data.id}`, label: "Back to Object Details" },
-          ...(object.data.status === "Lost" ? [
-            { href: supportHref("/devices", { objectId: object.data.id, mode }), label: "View Devices" },
+          { href: `/objects/${object.id}`, label: "Back to Object Details" },
+          ...(object.status === "Lost" ? [
+            { href: supportHref("/devices", { objectId: object.id, mode }), label: "View Devices" },
           ] : []),
         ]} />
-      </> : <LoadingState label="Loading sample target" />}
+      </> : absence === 410 ? <DataFeedback state="expired" /> : <LoadingState label="Loading sample target" />}
     </Preview>
   );
 }
@@ -33,13 +33,15 @@ const sessionPreviews = {
 };
 
 export function SessionScreen({ sessionId, view }: { sessionId: string; view: keyof typeof sessionPreviews }) {
-  const { snapshot } = useRuntimeView();
+  const { snapshot, removedOwners } = useRuntimeView();
   const active = view === "live" && snapshot?.active_session?.id === sessionId ? snapshot.active_session : undefined;
   const result = useRuntimeRead("/sessions/{id}", sessionId, !active);
-  const session = active ?? (result?.kind === "ok" ? result.data : undefined);
+  const candidate = active ?? (result?.kind === "ok" ? result.data : undefined);
+  const removed = candidate && removedOwners?.has(candidate.object_id);
+  const session = removed ? undefined : candidate;
   if (!session && result?.kind === "api-error" && result.status === 404) notFound();
   const expired = result?.kind === "api-error" && result.error.code === "EXPIRED" ? result.error : undefined;
-  if (!session && result && !expired) return <DataUnavailable />;
+  if (!session && result && !expired && !removed) return <DataUnavailable />;
   const base = `/sessions/${encodeURIComponent(sessionId)}`;
   return (
     <Preview {...sessionPreviews[view]}>
@@ -58,7 +60,7 @@ export function SessionScreen({ sessionId, view }: { sessionId: string; view: ke
           ...(view === "live" ? [] : [{ href: `${base}/live`, label: "Preview Search Workspace" }]),
           ...(view === "result" ? [] : [{ href: `${base}/result`, label: "Preview Search Result" }]),
         ]} />
-      </> : expired ? <DataFeedback state="expired" detail={expired.message} />
+      </> : expired || removed ? <DataFeedback state="expired" detail={expired?.message} />
         : <LoadingState label="Loading sample session" />}
     </Preview>
   );
