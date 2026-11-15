@@ -12,15 +12,18 @@ export type LoadImage = (signal: AbortSignal) => Promise<{ kind: "ok"; image: Bl
 type ImageState = ({ kind: "ok"; url: string } | MediaFailure) & { load: LoadImage };
 
 export function ProtectedImage({
-  load, label, alt, width, height, target, box, targetOnly, onDisplay,
+  load, label, alt, width, height, target, box, targetOnly, zoom, onDisplay,
 }: { load: LoadImage; label: string; alt: string; width: number; height: number; target?: Rect; box?: Rect; targetOnly?: boolean;
+  zoom?: boolean;
   onDisplay?: (available: boolean | undefined) => void }) {
   const [state, setState] = useState<ImageState>();
-  const [inspection, setInspection] = useState<ImageState>();
+  const [inspection, setInspection] = useState<{ image: ImageState; scale: number }>();
   const frameId = useId();
   const evidenceViewport = useRef<HTMLDivElement>(null);
   const evidenceBox = useRef<HTMLSpanElement>(null);
-  const enlarged = inspection !== undefined && inspection === state && state.load === load;
+  const available = state?.load === load && state.kind === "ok";
+  const scale = available && inspection?.image === state ? inspection.scale : 1;
+  const enlarged = scale > 1;
 
   useEffect(() => {
     const viewport = evidenceViewport.current;
@@ -31,11 +34,18 @@ export function ProtectedImage({
       top: outline.offsetTop + (outline.offsetHeight - viewport.clientHeight) / 2,
     });
     centerBox();
-    viewport.focus({ preventScroll: true });
     const resize = new ResizeObserver(centerBox);
     resize.observe(viewport);
     return () => resize.disconnect();
+  }, [enlarged, scale]);
+
+  useEffect(() => {
+    if (enlarged) evidenceViewport.current?.focus({ preventScroll: true });
   }, [enlarged]);
+
+  function setScale(next: number) {
+    if (available) setInspection({ image: state, scale: next });
+  }
 
   useEffect(() => {
     const lifetime = new AbortController();
@@ -89,7 +99,7 @@ export function ProtectedImage({
     if (box && !crop) return <div ref={evidenceViewport} id={frameId} className={styles.evidenceViewport} data-enlarged={enlarged}
       role={enlarged ? "region" : undefined} aria-label={enlarged ? "Enlarged captured evidence" : undefined}
       tabIndex={enlarged ? 0 : undefined}>
-      <div className={styles.evidenceFrame}>
+      <div className={styles.evidenceFrame} style={{ width: `${100 * scale}%` }}>
         {image}
         <span ref={evidenceBox} aria-hidden="true" className={styles.box} style={{
           left: `${100 * box.x / width}%`, top: `${100 * box.y / height}%`,
@@ -106,11 +116,17 @@ export function ProtectedImage({
 
   return <>
     {!targetOnly && <MediaViewport label={label}>{renderImage()}</MediaViewport>}
-    {box && state?.load === load && state.kind === "ok" && <Button className={styles.inspect}
+    {box && available && <Button className={styles.inspect}
       aria-expanded={enlarged} aria-controls={frameId}
-      onClick={() => setInspection(enlarged ? undefined : state)}>
+      onClick={() => setScale(enlarged ? 1 : 2)}>
       {enlarged ? "Close inspection" : "Inspect evidence"}
     </Button>}
+    {box && zoom && available && <div className="control-row" role="group" aria-label="Captured evidence zoom">
+      <Button disabled={scale === 1} onClick={() => setScale(scale - 1)}>Zoom out</Button>
+      <output aria-label="Zoom level">{scale}×</output>
+      <Button disabled={scale === 4} onClick={() => setScale(scale + 1)}>Zoom in</Button>
+      <Button disabled={scale === 1} onClick={() => setScale(1)}>Reset view</Button>
+    </div>}
     {target && <MediaViewport label="Selected target">{renderImage(target)}</MediaViewport>}
   </>;
 }

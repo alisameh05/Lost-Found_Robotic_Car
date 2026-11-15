@@ -1,6 +1,7 @@
 import type { EventEnvelope, Operation, Snapshot } from "@/generated/api-v1";
 import { componentNames } from "@/generated/api-v1";
 import { conforms } from "@/lib/fixture-contracts";
+import { pendingReview } from "@/lib/match-evidence";
 
 function completeReadiness(readiness: Snapshot["readiness"]) {
   const names = new Set(readiness.components.map(({ component }) => component));
@@ -21,7 +22,8 @@ export function validSnapshot(state: Snapshot, boot: string) {
     state.qualification_profile_id === (state.qualification_profile?.profile_id ?? null) &&
     state.active_session?.state !== "Ended" &&
     state.runtime.control_generation === state.lease.control_generation &&
-    (state.active_object?.id ?? null) === (state.active_session?.object_id ?? null);
+    (state.active_object?.id ?? null) === (state.active_session?.object_id ?? null) &&
+    (!state.pending_candidate || pendingReview(state));
 }
 
 function withOperation(state: Snapshot, operation: Operation | null) {
@@ -74,11 +76,14 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
       // A new active record needs the matching object from a fresh snapshot.
       if (session.state !== "Ended" && session.object_id !== next.active_object?.id) return;
       return withOperation({ ...next, runtime, active_session: session.state === "Ended" ? null : session,
-        active_object: session.state === "Ended" ? null : next.active_object }, event.payload.operation);
+        active_object: session.state === "Ended" ? null : next.active_object,
+        pending_candidate: session.state === "Paused" && session.pause_causes.some(({ cause }) => cause === "CandidateReview")
+          ? next.pending_candidate : null }, event.payload.operation);
     }
     case "candidate_pending":
-      if (!session || event.payload.match.session_id !== session.id ||
-          event.payload.match.object_id !== session.object_id || event.payload.control_generation !== next.runtime.control_generation) return;
+      if (!session || event.session_id !== session.id || event.session_revision !== session.revision ||
+          event.payload.control_generation !== next.runtime.control_generation || !pendingReview(next, event.payload.match) ||
+          (next.pending_candidate && next.pending_candidate.id !== event.payload.match.id)) return;
       return { ...next, pending_candidate: event.payload.match };
     case "recovery_changed":
       if (event.payload.failures.some((failure) => failure.session_id !== session?.id)) return;

@@ -5,7 +5,7 @@ import { fixtureError } from "./responses";
 
 type Response = ReadResult<MutationResponse>;
 export type SearchDelivery = "commit" | "pending" | "fail" | "lose-response" | "undelivered";
-type SearchAction = "start" | "pause" | "resume" | "stop";
+type SearchAction = "start" | "pause" | "resume" | "stop" | "confirm" | "reject";
 
 export function openSearchSaves(publish: () => void) {
   const receipts = new Map<string, {
@@ -45,9 +45,9 @@ export function openSearchSaves(publish: () => void) {
       return next;
     },
     script(next: SearchDelivery) { delivery = next; },
-    finish(commit: boolean) {
+    finish(commit: boolean, only?: SearchAction) {
       for (const [id, receipt] of receipts) {
-        if (!receipt.settle) continue;
+        if (!receipt.settle || (only && receipt.action !== only)) continue;
         receipts.delete(id);
         record(id, receipt.owner, receipt.fingerprint, receipt.settle(commit));
       }

@@ -1,5 +1,5 @@
 import type {
-  EventEnvelope, FrameMetadata, FrontendProfile, LeaseAcquire, LeaseRelease, LeaseResponse, PublicLease, Snapshot, WorkspaceHeartbeat,
+  EventEnvelope, FrameMetadata, FrontendProfile, LeaseAcquire, LeaseRelease, LeaseResponse, Match, PublicLease, Snapshot, WorkspaceHeartbeat,
 } from "@/generated/api-v1";
 import { conforms } from "../fixture-contracts";
 import type { EventSocket, ReadSocket, SocketObserver } from "../transport";
@@ -55,13 +55,20 @@ export function openFixtureWorkspace({
   const frames = { robot: cameraFrame("robot"), webcam: cameraFrame("webcam") };
   const modeBySource = { robot: frameMode, webcam: "live" } satisfies Record<Source, FrameMode> as Record<Source, FrameMode>;
 
-  function publish(kind: "snapshot" | "readiness_changed" = "snapshot") {
+  function publish(kind: "snapshot" | "readiness_changed" = "snapshot", candidate?: Match) {
     watermark++;
     for (const [client, connection] of events) {
       const state = read(client);
       const snapshot = { ...snapshotEvent(state), occurred_at_ms: now() };
-      connection.enqueue(kind === "snapshot" ? snapshot :
+      connection.enqueue(candidate ? { ...snapshot, payload: { ...state, pending_candidate: null } } : kind === "snapshot" ? snapshot :
         { ...snapshot, type: kind, payload: { readiness: state.readiness, runtime: state.runtime } });
+    }
+    if (!candidate) return;
+    watermark++;
+    for (const [client, connection] of events) {
+      const state = read(client);
+      connection.enqueue({ ...snapshotEvent(state), type: "candidate_pending", occurred_at_ms: now(),
+        payload: { match: candidate, control_generation: state.runtime.control_generation } });
     }
   }
 
@@ -253,6 +260,12 @@ export function openFixtureWorkspace({
     hasEvents: () => events.size > 0,
     canAcquire: (client: string) => !!profile && events.has(client),
     observations: () => ({ workspace: !!owner?.workspace, displayed: !!owner?.acknowledged && frameFresh(owner.acknowledged, monotonic()) }),
+    captureEvidence() {
+      checkDeadline();
+      const frame = owner?.acknowledged;
+      if (!frame || modeBySource.robot !== "live" || !available("robot") || !frameFresh(frame, monotonic())) return;
+      return { metadata: frame.metadata, bytes: frame.payload.slice(), isFresh: () => frameFresh(frame, monotonic()) };
+    },
     owns(client: string, secret: string) {
       checkDeadline();
       return owner?.client === client && owner.secret === secret && events.has(client);

@@ -13,7 +13,9 @@ import { devicePaths } from "@/features/devices";
 import { objectHref, RecordAbsent, RecordReadFailure, RecordTime, ReferenceImage, sessionHref } from "@/features/objects";
 import { recordAbsence, searchActionKey, unresolved, useRefreshRuntime, useRuntime, useRuntimeRead, useRuntimeView } from "@/features/runtime";
 import type { Snapshot } from "@/generated/api-v1";
+import { pendingReview } from "@/lib/match-evidence";
 import { ActionFeedback } from "./action-feedback";
+import { MatchReview } from "./match-review";
 import { InputControls } from "./search-fixture-controls";
 import { duration, searchMode } from "./session-facts";
 import styles from "./session.module.css";
@@ -22,9 +24,11 @@ export function LiveSearchScreen({ sessionId }: { sessionId: string }) {
   const { snapshot, searchActions } = useRuntimeView();
   const router = useRouter();
   const stop = searchActions?.[searchActionKey("stop", sessionId)];
+  const confirm = searchActions?.[searchActionKey("confirm", sessionId)];
+  const terminal = confirm?.stage === "committed" ? confirm : stop?.stage === "committed" ? stop : undefined;
   useEffect(() => {
-    if (stop?.stage === "committed" && stop.session?.id === sessionId) router.replace(`${sessionHref(sessionId)}/result`);
-  }, [router, sessionId, stop]);
+    if (terminal?.session?.id === sessionId) router.replace(`${sessionHref(sessionId)}/result`);
+  }, [router, sessionId, terminal]);
   const active = snapshot?.active_session?.id === sessionId && snapshot.active_object;
   const read = useRuntimeRead("/sessions/{id}", sessionId, !active);
   const refresh = useRefreshRuntime();
@@ -33,7 +37,9 @@ export function LiveSearchScreen({ sessionId }: { sessionId: string }) {
   const absent = recordAbsence(read);
   return <div className={styles.page}>
     <PageHeader title="Live Search Workspace" />
-    {absent ? <RecordAbsent status={absent} title="Session" />
+    {terminal && !terminal.session ? <Notice title="Record removed after expiry">
+      The search ended and the expired record is no longer available.
+    </Notice> : absent ? <RecordAbsent status={absent} title="Session" />
       : !read ? <LoadingState label="Loading search session" />
       : read.kind !== "ok" ? <RecordReadFailure title="Search workspace unavailable" retry={refresh} />
       : read.data.state === "Ended" ? <Notice title="Search has ended">
@@ -69,6 +75,8 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const state = effective.effective_session_state;
   const ready = owner && workspace.previewLive && workspace.usable && connected;
   const blocked = !connected || !owner || unresolved(stop);
+  const candidate = pendingReview(snapshot, snapshot.pending_candidate) ? snapshot.pending_candidate : null;
+  const stopSearch = () => { void runtime?.submitSearch({ kind: "stop", sessionId }); };
 
   useEffect(() => {
     if (robot.current && webcam.current && profile) return runtime?.mountWorkspace(robot.current, webcam.current, sessionId);
@@ -165,7 +173,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
           ? <Button disabled={blocked || unresolved(pause)} onClick={() => { void runtime?.submitSearch({ kind: "pause", sessionId }); }}>Pause</Button>
           : <Button disabled={blocked || !ready || !readiness.can_resume || unresolved(resume)}
             onClick={() => { void runtime?.submitSearch({ kind: "resume", sessionId }); }}>Resume</Button>}
-        <Button variant="destructive" disabled={blocked} onClick={() => { void runtime?.submitSearch({ kind: "stop", sessionId }); }}>Stop Search</Button>
+        {!candidate && <Button variant="destructive" disabled={blocked} onClick={stopSearch}>Stop Search</Button>}
       </div>
     </Panel>
     {destination && <Panel className={styles.exit} aria-label="Leave search workspace">
@@ -186,6 +194,9 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
       </div>
     </Panel>}
     {help && <Panel id="live-control-help"><ModeInstructions mode={mode} title="Control Help" /></Panel>}
+    <div role="status" className="visually-hidden">{candidate && "Potential match. Search paused for review."}</div>
+    {candidate && <MatchReview key={candidate.evidence_media.id} match={candidate} object={object}
+      canAct={owner && connected} canStop={!blocked} stop={stopSearch} />}
     <div className={styles.workspace}>
       <div className={styles.views}>
         <div className={styles.cameras}>

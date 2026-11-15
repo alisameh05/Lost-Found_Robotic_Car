@@ -30,14 +30,18 @@
 }
 .thumbnail img { width: 100%; }
 
-.workspace, .cameras, .result {
+.workspace, .cameras, .result, .comparison {
   display: grid;
   gap: var(--space-4);
   min-width: 0;
 }
 .workspace { grid-template-columns: minmax(0, 3fr) minmax(12rem, 1fr); }
 .cameras { grid-template-columns: minmax(0, 1fr) minmax(0, 1.7fr); }
-.result { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.result, .comparison { grid-template-columns: repeat(2, minmax(0, 1fr)); }
+.comparison { margin-block: var(--space-3); align-items: start; }
+.comparison > figure { margin: 0; min-width: 0; }
+.found { justify-content: space-between; border-color: var(--success); }
+.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: var(--space-3); }
 
 .camera { overflow: hidden; padding: 0; min-width: 0; }
 .camera header, .camera p { padding: var(--space-3); }
@@ -64,6 +68,6 @@
   .rail { grid-template-columns: repeat(auto-fit, minmax(min(100%, 13rem), 1fr)); }
 }
 @media (max-width: 52rem) {
-  .cameras, .result { grid-template-columns: minmax(0, 1fr); }
+  .cameras, .result, .comparison { grid-template-columns: minmax(0, 1fr); }
   .target .actions { margin-inline-start: 0; }
 }

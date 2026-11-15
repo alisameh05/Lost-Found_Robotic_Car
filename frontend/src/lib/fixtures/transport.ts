@@ -1,10 +1,11 @@
 import type {
-  EmergencyStopRequest, EventEnvelope, FrameMetadata, HttpResponses, LeaseAcquire, LeaseRelease, Object as LostObject, Session,
+  EmergencyStopRequest, EventEnvelope, FrameMetadata, HttpResponses, LeaseAcquire, LeaseRelease, Match, Object as LostObject, Session,
   RetentionChange, RetentionPreviewRequest,
   SessionAction, Snapshot, StartRequest, TicketRequest,
 } from "@/generated/api-v1";
 import { compatibleProfile, conforms } from "../fixture-contracts";
 import { maxObjectNameLength, normalizeObjectName } from "../object-name";
+import { pendingReview } from "../match-evidence";
 import type {
   ApplicationTransport, Endpoint, HttpRequest, ObjectQuery, ProtectedMedia, ProtectedPath,
   ProtectedRequest, ReadResult, SocketObserver, SocketOffer,
@@ -22,6 +23,7 @@ import { fixtureOk as ok, fixtureError as error } from "./responses";
 import { openSocketTickets } from "./socket-tickets";
 import { openFixtureWorkspace, type FrameMode } from "./workspace";
 import { committedSearch, openSearchSaves, type SearchDelivery } from "./search-saves";
+import { capturePng } from "./capture-png";
 
 type FixtureOptions = {
   scenario?: ScenarioId;
@@ -41,8 +43,11 @@ const expired = error(410, "EXPIRED", "Sample record expired.");
 const invalid = error(422, "VALIDATION_FAILED", "A sample request field is invalid.");
 const conflict = error(409, "REVISION_CONFLICT", "Sample revision has changed.");
 type OrdinaryAction = Extract<SessionAction, { action: "pause" | "resume" | "stop" }>;
+type ReviewAction = Extract<SessionAction, { action: "confirm" | "reject" }>;
+type CandidateObservation = "visible" | "exit" | "uncertain" | "unprepared" | "mismatched" | "stale" | "corrupt-media" | "missing-media";
 type SearchInput = "neutral" | "invalid" | "forward" | "backward" | "left" | "right";
 const searchBusy = error(503, "CAPACITY_REACHED", "A sample search action is still saving.");
+const evidenceUnavailable = error(503, "MEDIA_UNAVAILABLE", "The captured evidence is unavailable.");
 
 export function createFixtureTransport({
   scenario = "idle", now: fixtureNow, monotonic = () => performance.now(), startSpecimen = false,
@@ -63,6 +68,8 @@ export function createFixtureTransport({
   let { snapshot } = scene;
   const clients = new Set([bootstrap.client_id]);
   let { objects, sessions, matches } = scene;
+  const captures = new Map<string, { bytes: Uint8Array; readFault?: "corrupt-media" | "missing-media" }>();
+  let suppressedSession: string | undefined;
   let snapshotError = scene.snapshotError;
   const lifetime = new AbortController();
   const pages = fixturePages();
@@ -88,6 +95,7 @@ export function createFixtureTransport({
       for (const owner of owners.keys()) searchSaves.purge(owner);
       objects = objects.filter(({ id }) => !owners.has(id));
       sessions = sessions.filter(({ object_id }) => !owners.has(object_id));
+      for (const match of matches) if (owners.has(match.object_id)) captures.delete(match.evidence_media.id);
       matches = matches.filter(({ object_id }) => !owners.has(object_id));
       registrations.purge(owners);
     },
@@ -134,6 +142,8 @@ export function createFixtureTransport({
     const completed = operations.filter(({ persistence }) => persistence !== "Pending").slice(-64);
     return {
       ...snapshot, event_seq: workspace.watermark(), active_object, readiness: readinessRead(client),
+      runtime: { ...snapshot.runtime, persistence_pending: snapshot.runtime.persistence_pending ||
+        (snapshot.active_session !== null && searchSaves.pending()) },
       lease: snapshot.lease.state === "Owned" ? snapshot.lease : { ...snapshot.lease, can_acquire: workspace.canAcquire(client) },
       retention: { ...retention.read(), active_object_expires_at_ms: active_object?.expires_at_ms ?? null,
         active_object_grace: active_object?.retention_grace ?? false },
@@ -321,7 +331,7 @@ export function createFixtureTransport({
     if (client !== body.client_id) return error(403, "CLIENT_INVALID", "Unknown sample client.");
     const read = sessionRead(body.session_id);
     if (read.kind !== "ok") return read;
-    const fingerprint = JSON.stringify([body.action, body.session_id, body.expected_revision]);
+    const fingerprint = JSON.stringify([body.action, body.session_id, body.expected_revision, client, body.client_lease_id]);
     const retry = searchSaves.replay(body.action_id, fingerprint);
     if (retry) return retry;
     if (!workspace.owns(client, body.client_lease_id)) return error(403, "LEASE_REQUIRED", "The current sample lease is required.");
@@ -342,9 +352,10 @@ export function createFixtureTransport({
       snapshot = { ...snapshot, runtime: { ...snapshot.runtime, effective_session_state: "Paused" } };
       if (wasSearching) advanceGeneration();
       // A safety action must prevent an older pending Resume from granting permission later.
-      if (body.action === "stop" ? searchSaves.pending() : searchSaves.pending("resume")) searchSaves.finish(false);
+      if (searchSaves.pending("resume")) searchSaves.finish(false, "resume");
+      if (body.action === "stop" && searchSaves.pending("pause")) searchSaves.finish(false, "pause");
     }
-    if (searchSaves.pending()) {
+    if (body.action === "stop" ? searchSaves.pending("stop") : searchSaves.pending()) {
       workspace.publish();
       return searchBusy;
     }
@@ -353,6 +364,7 @@ export function createFixtureTransport({
       const session = snapshot.active_session;
       if (!session || session.id !== active.id || session.state === "Ended") return error(409, "INVALID_TRANSITION", "Sample session is inactive.");
       if (storageBlocked()) return unavailableStorage;
+      if (session.revision !== body.expected_revision) return conflict;
       if (body.action === "resume") {
         if (!workspace.owns(client, body.client_lease_id) || !readinessRead(client).can_resume ||
             session.revision !== body.expected_revision) return error(409, "RECOVERY_REQUIRED", "Resume conditions changed before saving.");
@@ -365,10 +377,8 @@ export function createFixtureTransport({
         return committedSearch(body.action_id, { session: resumed });
       }
       if (body.action === "stop") {
-        const candidate = snapshot.pending_candidate;
-        const match = candidate && { ...candidate, disposition: "NotReviewed" as const, reviewed_at_ms: null };
-        if (match) matches = matches.map((item) => item.id === match.id ? match : item);
         const grace = snapshotRead().active_object?.retention_grace;
+        const match = stopPendingReview();
         const ended = endFixtureSearch();
         return committedSearch(body.action_id, grace ? {} : { session: ended, match });
       }
@@ -378,6 +388,119 @@ export function createFixtureTransport({
       snapshot = { ...snapshot, active_session: paused };
       return committedSearch(body.action_id, { session: paused });
     });
+  }
+
+  function stopPendingReview() {
+    const candidate = snapshot.pending_candidate;
+    if (!candidate) return null;
+    const match: Match = { ...candidate, disposition: "NotReviewed", reviewed_at_ms: null };
+    matches = matches.map((item) => item.id === match.id ? match : item);
+    snapshot = { ...snapshot, pending_candidate: null };
+    return match;
+  }
+
+  function reviewAction(body: ReviewAction, client: string) {
+    if (client !== body.client_id) return error(403, "CLIENT_INVALID", "Unknown sample client.");
+    const read = sessionRead(body.session_id);
+    if (read.kind !== "ok") return read;
+    const fingerprint = JSON.stringify([body.action, body.session_id, body.expected_revision, body.candidate_id, client, body.client_lease_id]);
+    const retry = searchSaves.replay(body.action_id, fingerprint);
+    if (retry) return retry;
+
+    function check() {
+      const active = snapshot.active_session;
+      if (active?.id !== body.session_id) return error(409, "INVALID_TRANSITION", "Sample session is inactive.");
+      if (!workspace.owns(client, body.client_lease_id)) return error(403, "LEASE_REQUIRED", "The current sample lease is required.");
+      if (active.revision !== body.expected_revision) return conflict;
+      const candidate = matches.find(({ id }) => id === body.candidate_id);
+      if (!candidate) return missing;
+      if (candidate.session_id !== active.id) return error(409, "OWNERSHIP_MISMATCH", "Candidate belongs to a different sample session.");
+      if (active.state !== "Paused" || snapshot.pending_candidate?.id !== candidate.id || !pendingReview(snapshot, candidate)) {
+        return error(409, "INVALID_TRANSITION", "The candidate is no longer awaiting review.");
+      }
+      const capture = captures.get(candidate.evidence_media.id);
+      const mediaAvailable = candidate.evidence_media.availability === "Available" &&
+        (capture ? !capture.readFault : !!startSpecimen || scenario === "candidate");
+      if (body.action === "confirm" && !mediaAvailable) return evidenceUnavailable;
+      if (storageBlocked()) return unavailableStorage;
+      return ok({ active, candidate });
+    }
+
+    const admission = check();
+    if (admission.kind !== "ok") return admission;
+    if (searchSaves.pending("confirm") || searchSaves.pending("reject") ||
+        (body.action === "reject" && searchSaves.pending("stop"))) return searchBusy;
+    const delivery = searchSaves.takeDelivery();
+    if (delivery === "undelivered") return { kind: "unavailable" } as const;
+    if (delivery === "pending") snapshot = { ...snapshot, runtime: { ...snapshot.runtime, persistence_pending: true } };
+    return searchSaves.admit(body.action, body.action_id, admission.data.active.object_id, fingerprint, delivery, () => {
+      const current = check();
+      if (current.kind !== "ok") return current;
+      const { active, candidate } = current.data;
+      const reviewed_at_ms = now();
+      const match: Match = { ...candidate, disposition: body.action === "confirm" ? "Confirmed" : "Rejected", reviewed_at_ms };
+      const object = snapshotRead().active_object!;
+      matches = matches.map((item) => item.id === match.id ? match : item);
+      if (body.action === "confirm") {
+        const found: LostObject = { ...object, status: "Found", found_at_ms: reviewed_at_ms, revision: object.revision + 1 };
+        objects = objects.map((item) => item.id === found.id ? found : item);
+        registrations.updateObject(found);
+        const session = endFixtureSearch("Confirmed", reviewed_at_ms);
+        return committedSearch(body.action_id, object.retention_grace ? {} : { object: found, session, match });
+      }
+      const session: Session = { ...active, revision: active.revision + 1, pause_causes: [
+        ...active.pause_causes.filter(({ cause }) => cause !== "CandidateReview"), { cause: "ReviewRejected", failure_id: null },
+      ] };
+      suppressedSession = active.id;
+      saveSession(session);
+      snapshot = { ...snapshot, active_session: session, pending_candidate: null };
+      return committedSearch(body.action_id, { session, match });
+    });
+  }
+
+  async function observeCandidate(observation: CandidateObservation) {
+    workspace.checkDeadline();
+    const active = snapshot.active_session;
+    if (!active) return;
+    if (suppressedSession === active.id) {
+      // Uncertain continuity preserves suppression until an exit is observed.
+      if (observation === "exit") suppressedSession = undefined;
+      return;
+    }
+    if (observation === "exit" || observation === "uncertain" || observation === "unprepared" || searchSaves.pending() || storageBlocked() ||
+        active.state !== "Searching" || snapshot.runtime.effective_session_state !== "Searching" || snapshot.pending_candidate ||
+        !snapshot.readiness.components.some(({ component, status }) => component === "AI" && status === "Ready")) return;
+    const capture = workspace.captureEvidence();
+    if (!capture) return;
+    const { metadata } = capture;
+    const generation = snapshot.runtime.control_generation;
+    const bytes = await capturePng(capture.bytes, metadata).catch(() => undefined);
+    workspace.checkDeadline();
+    if (!bytes || !capture.isFresh() || lifetime.signal.aborted || snapshot.active_session !== active || snapshot.runtime.control_generation !== generation ||
+        snapshot.runtime.effective_session_state !== "Searching" || searchSaves.pending() || storageBlocked()) return;
+    const captured_at_ms = observation === "stale" ? active.started_at_ms - 1 : metadata.received_at_ms;
+    const { width, height } = metadata;
+    // Position of the sample wallet in the bundled camera frame.
+    const box = { x: Math.floor(width * 0.63), y: Math.floor(height * 0.78),
+      width: Math.ceil(width * 0.18), height: Math.ceil(height * 0.17) };
+    const match: Match = { id: crypto.randomUUID(), session_id: observation === "mismatched" ? sampleSession.id : active.id,
+      object_id: active.object_id, frame_id: metadata.frame_id, stream_epoch: metadata.stream_epoch,
+      captured_at_ms, box, disposition: "Pending", reviewed_at_ms: null,
+      evidence_media: { id: crypto.randomUUID(), role: "Evidence", content_type: "image/png", width, height,
+        byte_length: bytes.byteLength, created_at_ms: now(), availability: "Available" } };
+    const session: Session = { ...active, state: "Paused", revision: active.revision + 1,
+      pause_causes: [{ cause: "CandidateReview", failure_id: null }] };
+    const paused = { ...snapshot, active_session: session,
+      runtime: { ...snapshot.runtime, effective_session_state: "Paused" as const, motion_permission: "Disarmed" as const } };
+    if (!pendingReview(paused, match)) return;
+    const readFault = observation === "corrupt-media" || observation === "missing-media" ? observation : undefined;
+    captures.set(match.evidence_media.id, { bytes, readFault });
+    matches = [...matches, match];
+    saveSession(session);
+    snapshot = { ...paused, pending_candidate: match };
+    resetInput();
+    advanceGeneration();
+    workspace.publish("snapshot", match);
   }
 
   function retentionImpact(days: number, time: number) {
@@ -468,6 +591,7 @@ export function createFixtureTransport({
       if (body.action === "pause" || body.action === "resume" || (body.action === "stop" && !startSpecimen)) {
         return ordinaryAction(body, context.client_id);
       }
+      if (!startSpecimen && (body.action === "confirm" || body.action === "reject")) return reviewAction(body, context.client_id);
       if (!startSpecimen) return error(409, "INVALID_TRANSITION", "This sample action is unavailable.");
       const session = sessionRead(id);
       if (session.kind !== "ok") return session;
@@ -544,10 +668,12 @@ export function createFixtureTransport({
     },
   };
 
-  function endFixtureSearch(end_reason: Extract<Session, { state: "Ended" }>["end_reason"] = "Stopped") {
+  function endFixtureSearch(end_reason: Extract<Session, { state: "Ended" }>["end_reason"] = "Stopped", endedAt = now()) {
     const active = snapshot.active_session;
     if (!active) return;
-    const ended: Session = { ...active, state: "Ended", end_reason, ended_at_ms: now(), revision: active.revision + 1, pause_causes: [] };
+    const ended: Session = { ...active, state: "Ended", end_reason, ended_at_ms: endedAt, revision: active.revision + 1, pause_causes: [] };
+    if (end_reason === "Stopped") stopPendingReview();
+    suppressedSession = undefined;
     saveSession(ended);
     resetInput();
     const control_generation = snapshot.runtime.control_generation + 1;
@@ -558,6 +684,9 @@ export function createFixtureTransport({
       readiness: { ...snapshot.readiness, can_resume: false, can_start: { Gestures: false, Controller: false } } };
     retention.sweep();
     scheduleRetention();
+    const competing = end_reason === "Confirmed" ? ["stop"] as const : ["confirm", "reject"] as const;
+    // Settle any losing save against the committed terminal state.
+    for (const action of competing) if (searchSaves.pending(action)) searchSaves.finish(true, action);
     invalidate();
     return ended;
   }
@@ -578,6 +707,7 @@ export function createFixtureTransport({
       changeFrames(mode: FrameMode) { workspace.changeFrames(mode); },
       disconnectEvents() { workspace.disconnectEvents(bootstrap.client_id); },
       scriptSearch(delivery: SearchDelivery) { searchSaves.script(delivery); },
+      observeCandidate,
       dropNextRelease() { dropRelease = true; },
       finishSearchSave(commit: boolean) {
         snapshot = { ...snapshot, runtime: { ...snapshot.runtime, persistence_pending: false } };
@@ -674,7 +804,10 @@ export function createFixtureTransport({
         if ((scene.recordsRecovery && id === "sample-keys-a-reference") ||
             (scene.historyRecovery && id === "sample-earlier-evidence-4")) return { kind: "unavailable" };
         if (scene.recordsRecovery && id === "sample-usb-reference") return missing;
-        const bytes = registered?.bytes ?? sampleMediaBytes(id, media.content_type);
+        const capture = captures.get(id);
+        if (capture?.readFault === "missing-media") return missing;
+        const bytes = capture?.bytes.slice() ?? registered?.bytes ?? sampleMediaBytes(id, media.content_type);
+        if (capture?.readFault === "corrupt-media") bytes.fill(0);
         if ((scene.recordsRecovery && id === "sample-keys-Z-reference") ||
             (scene.historyRecovery && id === "sample-earlier-evidence-2")) bytes.fill(0);
         return ok({ bytes, headers: {
@@ -690,6 +823,7 @@ export function createFixtureTransport({
       retentionListeners.clear();
       pages.clear();
       registrations.clear();
+      captures.clear();
     },
   } satisfies ApplicationTransport & { controls: object };
 }
