@@ -1,18 +1,40 @@
 "use client";
 
-import { useEffect, useState, type CSSProperties } from "react";
+import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
 import { MediaViewport } from "@/components/layout/panel";
+import { Button } from "@/components/ui/button";
 import { DataFeedback, LoadingState } from "@/components/ui/feedback";
 import type { Rect } from "@/generated/api-v1";
+import styles from "./protected-image.module.css";
 
 type MediaFailure = { kind: "expired" | "missing" | "not-found" | "unavailable" | "corrupt" | "decode-error"; detail?: string };
 export type LoadImage = (signal: AbortSignal) => Promise<{ kind: "ok"; image: Blob } | MediaFailure>;
 type ImageState = ({ kind: "ok"; url: string } | MediaFailure) & { load: LoadImage };
 
 export function ProtectedImage({
-  load, label, alt, width, height, target,
-}: { load: LoadImage; label: string; alt: string; width: number; height: number; target?: Rect }) {
+  load, label, alt, width, height, target, box, targetOnly,
+}: { load: LoadImage; label: string; alt: string; width: number; height: number; target?: Rect; box?: Rect; targetOnly?: boolean }) {
   const [state, setState] = useState<ImageState>();
+  const [inspection, setInspection] = useState<ImageState>();
+  const frameId = useId();
+  const evidenceViewport = useRef<HTMLDivElement>(null);
+  const evidenceBox = useRef<HTMLSpanElement>(null);
+  const enlarged = inspection !== undefined && inspection === state && state.load === load;
+
+  useEffect(() => {
+    const viewport = evidenceViewport.current;
+    const outline = evidenceBox.current;
+    if (!enlarged || !viewport || !outline) return;
+    const centerBox = () => viewport.scrollTo({
+      left: outline.offsetLeft + (outline.offsetWidth - viewport.clientWidth) / 2,
+      top: outline.offsetTop + (outline.offsetHeight - viewport.clientHeight) / 2,
+    });
+    centerBox();
+    viewport.focus({ preventScroll: true });
+    const resize = new ResizeObserver(centerBox);
+    resize.observe(viewport);
+    return () => resize.disconnect();
+  }, [enlarged]);
 
   useEffect(() => {
     const lifetime = new AbortController();
@@ -38,6 +60,11 @@ export function ProtectedImage({
     if (state?.load !== load) return <LoadingState label="Loading image" announce={false} />;
     if (state.kind !== "ok") return <DataFeedback state={state.kind} detail={state.detail} />;
 
+    function failedDecode() {
+      if (state?.kind !== "ok") return;
+      URL.revokeObjectURL(state.url);
+      setState((current) => current === state ? { load, kind: "decode-error" } : current);
+    }
     // Protected object URLs are local and temporary. The crop uses the same decoded source.
     const image = ( // eslint-disable-next-line @next/next/no-img-element
       <img
@@ -45,12 +72,23 @@ export function ProtectedImage({
         style={crop && {
           width: `${100 * width / crop.width}%`, left: `${-100 * crop.x / crop.width}%`, top: `${-100 * crop.y / crop.height}%`,
         }}
-        onError={() => {
-          URL.revokeObjectURL(state.url);
-          setState((current) => current === state ? { load, kind: "decode-error" } : current);
-        }}
+        onError={failedDecode}
+        onLoad={box ? ({ currentTarget }) => {
+          if (currentTarget.naturalWidth !== width || currentTarget.naturalHeight !== height) failedDecode();
+        } : undefined}
       />
     );
+    if (box && !crop) return <div ref={evidenceViewport} id={frameId} className={styles.evidenceViewport} data-enlarged={enlarged}
+      role={enlarged ? "region" : undefined} aria-label={enlarged ? "Enlarged captured evidence" : undefined}
+      tabIndex={enlarged ? 0 : undefined}>
+      <div className={styles.evidenceFrame}>
+        {image}
+        <span ref={evidenceBox} aria-hidden="true" className={styles.box} style={{
+          left: `${100 * box.x / width}%`, top: `${100 * box.y / height}%`,
+          width: `${100 * box.width / width}%`, height: `${100 * box.height / height}%`,
+        }} />
+      </div>
+    </div>;
     return crop ? (
       <div className="protected-crop" style={{ "--crop-ratio": crop.width / crop.height, aspectRatio: "var(--crop-ratio)" } as CSSProperties}>
         {image}
@@ -59,7 +97,12 @@ export function ProtectedImage({
   }
 
   return <>
-    <MediaViewport label={label}>{renderImage()}</MediaViewport>
+    {!targetOnly && <MediaViewport label={label}>{renderImage()}</MediaViewport>}
+    {box && state?.load === load && state.kind === "ok" && <Button className={styles.inspect}
+      aria-expanded={enlarged} aria-controls={frameId}
+      onClick={() => setInspection(enlarged ? undefined : state)}>
+      {enlarged ? "Close inspection" : "Inspect evidence"}
+    </Button>}
     {target && <MediaViewport label="Selected target">{renderImage(target)}</MediaViewport>}
   </>;
 }

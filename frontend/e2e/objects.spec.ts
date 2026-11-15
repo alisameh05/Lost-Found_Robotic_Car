@@ -87,11 +87,13 @@ test("recovers failed list and detail reads and restarts an expired cursor with 
 test("shows Found metadata, protected reference failures, and distinct expired and missing records", async ({ page }) => {
   await page.goto("/objects/sample-headphones");
   await expect(page.getByText("Found", { exact: true })).toBeVisible();
-  await expect(page.getByText("Confirmed", { exact: true })).toBeVisible();
-  await expect(page.locator("time")).toHaveCount(3);
+  const reference = page.getByRole("region", { name: "Object reference and selected target" });
+  const record = page.getByRole("region", { name: "Object record" });
+  await expect(record.getByText("Confirmed", { exact: true }).first()).toBeVisible();
+  await expect(record.locator(":scope > dl time")).toHaveCount(3);
   await expect(page.getByRole("button", { name: "Start Search" })).toHaveAccessibleDescription("This object has already been found.");
-  await expect(page.getByText("Media corrupt", { exact: true })).toHaveCount(2);
-  await expect(page.getByRole("img")).toHaveCount(0);
+  await expect(reference.getByText("Media corrupt", { exact: true })).toHaveCount(2);
+  await expect(reference.getByRole("img")).toHaveCount(0);
   await page.goto("/objects/sample-expired");
   await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
   await page.goto("/objects/sample-purged");

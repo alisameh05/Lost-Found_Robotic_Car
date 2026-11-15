@@ -5,7 +5,7 @@ import type { LoadImage } from "@/components/media/protected-image";
 import type { Media } from "@/generated/api-v1";
 import { useRuntime } from "./runtime-provider";
 
-export function useProtectedImage({ id, availability }: Media) {
+export function useProtectedImage({ id, availability, role }: Media) {
   const runtime = useRuntime()?.connection?.runtime;
   return useCallback<LoadImage>(async (signal) => {
     if (availability === "Missing") return { kind: "missing" };
@@ -16,9 +16,10 @@ export function useProtectedImage({ id, availability }: Media) {
       return { kind: "ok", image: new Blob([bytes], { type: headers["Content-Type"] }) };
     }
     if (result?.kind === "api-error" && result.status === 410) {
-      return { kind: "expired", detail: "Access to this reference has ended." };
+      return { kind: "expired", detail: "Access to this image has ended." };
     }
     if (result?.kind === "api-error" && result.status === 404) return { kind: "not-found" };
-    return { kind: "unavailable", detail: "The reference image could not be retrieved." };
-  }, [availability, id, runtime]);
+    return { kind: "unavailable", detail: role === "Evidence"
+      ? "The captured evidence could not be retrieved." : "The reference image could not be retrieved." };
+  }, [availability, id, role, runtime]);
 }

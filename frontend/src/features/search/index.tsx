@@ -21,7 +21,6 @@ export function SearchSetupScreen({ objectId }: { objectId: string }) {
 }
 
 const sessionPreviews = {
-  details: { title: "Session Details", description: "Session history and saved evidence are planned for a later phase." },
   live: { title: "Search Workspace", description: "Camera feeds and manual controls are planned for a later phase." },
   result: { title: "Search Result", description: "Evidence review and recorded outcomes are planned for a later phase." },
 };
@@ -48,7 +47,7 @@ export function SessionScreen({ sessionId, view }: { sessionId: string; view: ke
         </section>
         <PreviewLinks links={[
           { href: `/objects/${session.object_id}`, label: "View sample object" },
-          ...(view === "details" ? [] : [{ href: base, label: "Back to Session Details" }]),
+          { href: base, label: "Back to Session Details" },
           ...(view === "live" ? [] : [{ href: `${base}/live`, label: "Preview Search Workspace" }]),
           ...(view === "result" ? [] : [{ href: `${base}/result`, label: "Preview Search Result" }]),
         ]} />

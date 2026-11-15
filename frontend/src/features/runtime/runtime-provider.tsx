@@ -100,12 +100,10 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
   }, [runtime, load, attempt, snapshot, ready, enabled]);
 
   const current = enabled && read?.runtime === runtime && read?.load === load && read.attempt === attempt;
-  return {
-    result: current ? read.result : connected ? undefined : failedRead,
-    retry: () => {
-      if (connected) setAttempt((previous) => previous + 1);
-      else if (runtime) void runtime.refresh();
-      else if (state) state.select(state.selection.id);
-    },
-  };
+  const retry = useCallback(() => {
+    if (connected) setAttempt((previous) => previous + 1);
+    else if (runtime) void runtime.refresh();
+    else if (state) state.select(state.selection.id);
+  }, [connected, runtime, state]);
+  return { result: current ? read.result : connected ? undefined : failedRead, retry };
 }

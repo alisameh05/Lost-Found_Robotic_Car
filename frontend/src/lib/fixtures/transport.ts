@@ -18,7 +18,7 @@ import {
   sampleRetentionPreview, startReceipt,
 } from "./mutations";
 import { fixturePages } from "./pages";
-import { day, expiredObject, healthFor, leaseId, recoveryFailure, requestId, sampleTime } from "./samples";
+import { day, expiredObject, healthFor, leaseId, recoveryFailure, requestId, sampleObject, sampleSession, sampleTime } from "./samples";
 import { readScenario, type ScenarioId } from "./scenarios";
 import { eventVectors, frameVector, snapshotEvent } from "./vectors";
 
@@ -65,6 +65,10 @@ export function createFixtureTransport({
   let failList = scene.recordsRecovery;
   let failDetail = scene.recordsRecovery;
   let expireContinuation = scene.recordsRecovery;
+  let failHistory = scene.historyRecovery;
+  let failMatches = scene.historyRecovery;
+  let expireSessionCursor = scene.historyRecovery;
+  let invalidateMatchCursor = scene.historyRecovery;
 
   function signalFor(signal?: AbortSignal) {
     return signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
@@ -88,7 +92,8 @@ export function createFixtureTransport({
 
   function eligibleObjects() {
     const time = now();
-    return [...scene.objects.filter((object) => object.expires_at_ms > time || object.retention_grace),
+    return [...scene.objects.filter((object) => object.expires_at_ms > time ||
+        (object.retention_grace && snapshot.active_session?.object_id === object.id)),
       ...registrations.records().map(({ object }) => object)];
   }
 
@@ -169,15 +174,33 @@ export function createFixtureTransport({
     },
     "GET /objects/{id}/sessions": ({ id, query }) => {
       const parent = objectRead(id);
+      if (parent.kind !== "ok") return parent;
+      if (id === sampleObject.id && failHistory) {
+        failHistory = false;
+        return { kind: "unavailable" };
+      }
+      if (id === sampleObject.id && query?.cursor && expireSessionCursor) {
+        expireSessionCursor = false;
+        return error(400, "CURSOR_EXPIRED", "Sample session cursor expired.");
+      }
       const sessions = scene.sessions.map((session) => snapshot.active_session?.id === session.id ? snapshot.active_session : session);
-      return parent.kind === "ok" ? pages.read(sessions.filter((session) => session.object_id === id),
-        (session) => session.started_at_ms, `sessions:${id}`, query ?? {}, now()) : parent;
+      return pages.read(sessions.filter((session) => session.object_id === id),
+        (session) => session.started_at_ms, `sessions:${id}`, query ?? {}, now());
     },
     "GET /sessions/{id}": ({ id }) => sessionRead(id),
     "GET /sessions/{id}/matches": ({ id, query }) => {
       const parent = sessionRead(id);
-      return parent.kind === "ok" ? pages.read(scene.matches.filter((match) => match.session_id === id),
-        (match) => match.captured_at_ms, `matches:${id}`, query ?? {}, now()) : parent;
+      if (parent.kind !== "ok") return parent;
+      if (id === sampleSession.id && failMatches) {
+        failMatches = false;
+        return { kind: "unavailable" };
+      }
+      if (id === sampleSession.id && query?.cursor && invalidateMatchCursor) {
+        invalidateMatchCursor = false;
+        return error(400, "CURSOR_INVALID", "Sample match cursor invalid.");
+      }
+      return pages.read(scene.matches.filter((match) => match.session_id === id),
+        (match) => match.captured_at_ms, `matches:${id}`, query ?? {}, now());
     },
     "GET /settings": () => ok(snapshot.retention.settings),
     "POST /objects": (request) => registrations.submit(request as HttpRequest<"POST /objects">),
@@ -376,10 +399,12 @@ export function createFixtureTransport({
           kind: "api-error", status: 503,
           error: { code: "MEDIA_UNAVAILABLE", message: `Sample media is ${media.availability.toLowerCase()}.`, retryable: media.availability === "Missing" },
         };
-        if (scene.recordsRecovery && id === "sample-keys-a-reference") return { kind: "unavailable" };
+        if ((scene.recordsRecovery && id === "sample-keys-a-reference") ||
+            (scene.historyRecovery && id === "sample-earlier-evidence-4")) return { kind: "unavailable" };
         if (scene.recordsRecovery && id === "sample-usb-reference") return missing;
         const bytes = registered?.bytes ?? sampleMediaBytes(id, media.content_type);
-        if (scene.recordsRecovery && id === "sample-keys-Z-reference") bytes.fill(0);
+        if ((scene.recordsRecovery && id === "sample-keys-Z-reference") ||
+            (scene.historyRecovery && id === "sample-earlier-evidence-2")) bytes.fill(0);
         return ok({ bytes, headers: {
           "Content-Type": media.content_type, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Accept-Ranges": "none",
         } });
