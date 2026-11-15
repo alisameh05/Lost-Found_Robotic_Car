@@ -7,7 +7,7 @@ type SampleRead = "unavailable" | "empty";
 
 export function openControlScript() {
   let reads = 0;
-  let pending: { outcome: Outcome; delivery: ReturnType<typeof Promise.withResolvers<void>> } | undefined;
+  let pending: { actionId: string; outcome: Outcome; signal: AbortSignal; delivery: ReturnType<typeof Promise.withResolvers<void>> } | undefined;
 
   return {
     async read(signal: AbortSignal): Promise<SampleRead> {
@@ -31,11 +31,12 @@ export function openControlScript() {
       label: string, outcome: Outcome, createdAt: number) {
       request.signal.throwIfAborted();
       if (pending) throw new Error("A sample request is already pending.");
-      pending = { outcome, delivery: Promise.withResolvers<void>() };
+      const actionId = crypto.randomUUID();
+      pending = { actionId, outcome, signal: request.signal, delivery: Promise.withResolvers<void>() };
       try {
         const result = await transport.request("POST /objects", {
           ...request, actionCreatedAtMs: createdAt,
-          body: { action_id: crypto.randomUUID(), name: label, roi: sampleSwatchRect,
+          body: { action_id: actionId, name: label, roi: sampleSwatchRect,
             reference_image: new Blob([sampleImage("image/jpeg")], { type: "image/jpeg" }) },
         });
         return result.kind === "ok" ? result.data.persistence : "Failed";
@@ -43,17 +44,19 @@ export function openControlScript() {
         pending = undefined;
       }
     },
-    async waitForDelivery(signal: AbortSignal): Promise<Outcome | undefined> {
+    async waitForDelivery(actionId: string, signal: AbortSignal): Promise<Outcome | undefined> {
       signal.throwIfAborted();
       const submission = pending;
-      if (!submission) return;
-      const abort = () => submission.delivery.reject(signal.reason);
-      signal.addEventListener("abort", abort, { once: true });
+      if (!submission || submission.actionId !== actionId) return;
+      const scope = AbortSignal.any([signal, submission.signal]);
+      if (scope.aborted) return "Failed";
+      const abort = () => submission.delivery.resolve();
+      scope.addEventListener("abort", abort, { once: true });
       try {
         await submission.delivery.promise;
-        return submission.outcome;
+        return scope.aborted ? "Failed" : submission.outcome;
       } finally {
-        signal.removeEventListener("abort", abort);
+        scope.removeEventListener("abort", abort);
       }
     },
     deliver() { pending?.delivery.resolve(); },

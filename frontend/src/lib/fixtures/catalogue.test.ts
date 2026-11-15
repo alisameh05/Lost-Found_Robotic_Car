@@ -189,22 +189,23 @@ test("checks bootstrap protection headers, channel offers, and workspace heartbe
 });
 
 test("keeps pending, committed and failed mutations distinct from plain validation and conflict errors", async () => {
-  for (const [scenario, status, persistence] of [
-    ["idle", 201, "Committed"], ["initializing", 202, "Pending"], ["failed", 503, "Failed"],
-  ] as const) {
-    const transport = createFixtureTransport({ scenario });
-    const context = data(await transport.bootstrap());
-    const fields = { action_id: actionId, name: sampleObject.name, roi: sampleSwatchRect };
+  const transport = createFixtureTransport({ scenario: "registration-recovery", now: () => sampleTime,
+    normalizeRegistration: async (blob) => ({ blob, width: 32, height: 24 }) });
+  const registrationContext = data(await transport.bootstrap());
+  for (const [status, persistence] of [[503, "Failed"], [202, "Pending"], [201, "Committed"]] as const) {
+    const fields = { action_id: crypto.randomUUID(), name: sampleObject.name, roi: sampleSwatchRect };
     contract("RegistrationFields", fields);
-    const request = { context, actionCreatedAtMs: sampleTime, body: {
+    const request = { context: registrationContext, actionCreatedAtMs: sampleTime, body: {
       ...fields, reference_image: new Blob([sampleImage("image/jpeg")], { type: "image/jpeg" }),
     } };
     const response = await transport.request("POST /objects", request);
     const mutation = data(response, status);
     contract("MutationResponse", mutation);
     expect(mutation.persistence).toBe(persistence);
-    if (persistence === "Committed") expect(response).toHaveProperty("location", "/api/v1/objects/sample-new-object");
-    const error = await transport.request("POST /objects", { ...request, body: { ...request.body, roi: { ...fields.roi, width: 99 } } });
+    if (persistence === "Committed") expect(response).toHaveProperty("location", `/api/v1/objects/${mutation.result?.object?.id}`);
+    const error = await transport.request("POST /objects", { ...request, body: {
+      ...request.body, action_id: crypto.randomUUID(), roi: { ...fields.roi, width: 99 },
+    } });
     expect(error).toMatchObject({ kind: "api-error", status: 422, error: {
       retryable: false, field_errors: [{ path: "/roi/width" }],
     } });

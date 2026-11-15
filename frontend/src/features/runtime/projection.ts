@@ -16,11 +16,14 @@ type RuntimeView = {
   emergency?: EmergencyFeedback;
 };
 
+export type RegistrationAction = Pick<HttpRequest<"POST /objects">, "body" | "actionCreatedAtMs">;
+
 export function openRuntimeProjection(transport: ApplicationTransport) {
   const lifetime = new AbortController();
   const subscribers = new Set<() => void>();
   let view: RuntimeView = { loading: true };
   let context: ProtectedRequest["context"] | undefined;
+  let clock: { server: number; received: number } | undefined;
   let readRequest: AbortController | undefined;
   let uncertainRequest: EmergencyStopRequest | undefined;
 
@@ -38,14 +41,14 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     for (const notify of subscribers) notify();
   }
 
-  async function refresh() {
+  async function refresh({ readBootstrap = false } = {}) {
     if (lifetime.signal.aborted) return;
     readRequest?.abort();
     readRequest = new AbortController();
     const signal = AbortSignal.any([lifetime.signal, readRequest.signal]);
     update({ loading: true, failedRead: undefined });
     try {
-      if (!context) {
+      if (!context || readBootstrap) {
         const bootstrap = await transport.bootstrap(signal);
         if (signal.aborted) return;
         if (bootstrap.kind !== "ok") {
@@ -53,6 +56,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
           return;
         }
         context = bootstrap.data;
+        clock = { server: bootstrap.data.server_time_ms, received: performance.now() };
         update({ connected: true });
       }
       const request = { context, signal };
@@ -102,6 +106,13 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     },
     refresh,
     emergency,
+    submissionTime() {
+      if (clock && !lifetime.signal.aborted) return clock.server + Math.floor(performance.now() - clock.received);
+    },
+    async register(action: RegistrationAction, signal: AbortSignal) {
+      if (!context) return { kind: "unavailable" } as const;
+      return transport.request("POST /objects", { ...action, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+    },
     async get<Path extends ProtectedPath>(path: Path, id: string | undefined, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;
       return transport.get(path, { id, context, signal: AbortSignal.any([signal, lifetime.signal]) });

@@ -3,18 +3,14 @@ import type {
   RetentionPreview, SessionAction, Snapshot,
 } from "@/generated/api-v1";
 import type { ReadResult } from "../transport";
-import { foundSession, sampleObject, sampleSession, sampleTime, searching } from "./samples";
+import { foundSession, sampleSession, sampleTime, searching } from "./samples";
 
 export const emptyResult: MutationResult = { object: null, session: null, match: null, settings: null, deletion: null };
 export const storageError = { code: "STORAGE_UNAVAILABLE", message: "Sample save failed.", retryable: true } satisfies ApiError;
-export const validationError = {
-  code: "VALIDATION_FAILED", message: "A sample request field is invalid.", retryable: false,
-  field_errors: [{ path: "/roi/width", code: "OUT_OF_RANGE", message: "Width must fit the normalized source image." }],
-} satisfies ApiError;
 
 export function mutation(
   action_id: string, persistence: MutationResponse["persistence"], result: MutationResult, status = 200, location?: string,
-): ReadResult<MutationResponse> {
+): Extract<ReadResult<MutationResponse>, { kind: "ok" }> {
   const data: MutationResponse = persistence === "Committed" ? { action_id, persistence, result, error: null }
     : persistence === "Pending" ? { action_id, persistence, result: null, error: null }
       : { action_id, persistence, result: null, error: storageError };
@@ -46,7 +42,6 @@ export function sampleRetentionPreview(
 }
 
 // Fixed receipts for later screens to inspect. These do not advance the scenario.
-export const registrationReceipt = { ...emptyResult, object: sampleObject };
 export const startReceipt = { ...emptyResult, session: { ...searching, id: "sample-new-search" } };
 export const stopReceipt = { ...emptyResult, session: sampleSession };
 

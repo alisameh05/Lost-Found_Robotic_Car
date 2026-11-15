@@ -84,7 +84,11 @@ function MediaInspector({ runtime, expire, mediaExamples }: {
         <select id="fixture-media" value={selected} onChange={(event) => setSelected(event.target.value)}>
           {mediaExamples.map(({ id, name }) => <option key={id} value={id}>{name}</option>)}
         </select>
-        <Button onClick={() => { expire(); setRevision(revision + 1); }}>Expire sample media</Button>
+        <Button onClick={() => {
+          expire();
+          setRevision(revision + 1);
+          void runtime.refresh({ readBootstrap: true });
+        }}>Expire sample media</Button>
       </div>
       <ProtectedImage
         key={revision} load={load} label={`Sample image · ${example.label}`}

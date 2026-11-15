@@ -72,6 +72,7 @@ const scenarios = {
     }, null, null, false),
   }, { snapshotError: { code: "STORAGE_UNAVAILABLE", message: "Sample storage is unavailable.", retryable: true } }, "Failed"),
   empty: withSnapshot(snapshot, { objects: [], sessions: [], matches: [] }),
+  "registration-recovery": initial,
   "records-recovery": withSnapshot(snapshot, {
     recordsRecovery: true,
     objects: libraryRecords.map((record) => ["sample-keys-a", "sample-keys-Z", "sample-usb"].includes(record.id)
