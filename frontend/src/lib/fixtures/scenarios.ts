@@ -50,6 +50,10 @@ function active(session: typeof searching | typeof paused, overrides: Partial<Sn
 
 const searchingState = active(searching);
 const pausedState = active(paused);
+const snapshotReadFailure = {
+  snapshotError: { code: "INTERNAL_ERROR", message: "Sample snapshot could not be read.", retryable: true },
+  snapshotErrorOnce: true,
+} satisfies Partial<Scenario>;
 const graceObject = { ...expiredObject, retention_grace: true };
 const graceSession = { ...paused, id: "sample-grace-search", object_id: graceObject.id };
 const graceMatch: Match = {
@@ -119,10 +123,8 @@ const scenarios = {
     ...owned, readiness: readiness({
       ...gesturesReady, RobotVideo: "Unavailable", DisplayedRobotVideo: "Unavailable",
     }, fixtureProfile, null, true),
-  }, {
-    snapshotError: { code: "INTERNAL_ERROR", message: "Sample snapshot could not be read.", retryable: true },
-    snapshotErrorOnce: true,
-  }),
+  }, snapshotReadFailure),
+  "active-readiness-retry": withSnapshot(pausedState, { ...snapshotReadFailure, sessions: [paused, foundSession], matches: [confirmed] }),
   candidate: withSnapshot({ ...active(candidateSession), pending_candidate: pending }, {
     sessions: [candidateSession, foundSession], matches: [pending, rejected, confirmed],
   }),

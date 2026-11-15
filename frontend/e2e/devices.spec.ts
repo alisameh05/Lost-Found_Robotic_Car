@@ -83,6 +83,17 @@ test("reads typed startup and degraded health and retries a failed snapshot", as
   await selectScenario(page, "ended");
   await openDevices(page);
   await expect(page.getByRole("region", { name: "Advisory only" })).toContainText("valid clear reading");
+
+  await selectScenario(page, "active-readiness-retry");
+  await openDevices(page);
+  await expect(page.getByText("Mode unavailable. Retry readiness to identify the locked mode.")).toBeVisible();
+  await expect(page.getByLabel("Readiness mode")).toHaveCount(0);
+  const active = page.getByRole("link", { name: "Return to Active Search" });
+  await expect(active).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Emergency Stop" })).toBeVisible();
+  await retry.click();
+  await expect(active).toHaveAttribute("href", "/sessions/sample-search/live");
+  await expect(page.getByText("Locked to active search · Paused")).toBeVisible();
 });
 
 test("round-trips a verified setup context through Devices and the Control Guide", async ({ page }) => {
@@ -103,9 +114,11 @@ test("round-trips a verified setup context through Devices and the Control Guide
   await page.keyboard.press("Enter");
   await expect(page).toHaveURL(/\/objects\/sample-wallet\/search\?mode=Controller$/);
 
-  await page.goto("/devices?object=sample-headphones&mode=Controller");
-  await expect(page.getByRole("region", { name: "Required for Gestures" })).toBeVisible();
-  await expect(page.getByRole("link", { name: "Return to Search Setup" })).toHaveCount(0);
+  for (const object of ["sample-headphones", "sample-keys-a"]) {
+    await page.goto(`/devices?object=${object}&mode=Controller`);
+    await expect(page.getByLabel("Readiness mode")).toHaveValue("Gestures");
+    await expect(page.getByRole("link", { name: "Return to Search Setup" })).toHaveCount(0);
+  }
 });
 
 test("shows the actual active mode and keeps Emergency Stop keyboard-operable from the guide", async ({ page }) => {
@@ -124,6 +137,7 @@ test("shows the actual active mode and keeps Emergency Stop keyboard-operable fr
   const gestures = page.getByRole("region", { name: "Gesture directions and stop" });
   await expect(gestures).toContainText(/mirrored webcam view.*up for forward, down for backward, left for left, or right for right/);
   await expect(gestures).toContainText("closed fist, no hand, multiple hands, or ambiguous or invalid pointing");
+  await expect(gestures).toContainText("Release the pointing gesture to stop.");
   const controller = page.getByRole("region", { name: "PS4 controller" });
   await expect(controller).toContainText("up for forward, down for backward, left for left, or right for right");
   await expect(controller).toContainText("Release the D-pad to stop. Conflicting directions also stop ordinary movement.");

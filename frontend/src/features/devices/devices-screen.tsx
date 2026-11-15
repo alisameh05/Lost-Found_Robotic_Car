@@ -14,7 +14,7 @@ import { InactiveInput, PathRow, paths, ProximityAdvisory } from "./device-obser
 import styles from "./devices.module.css";
 import { describeDeviceReadiness, modeLabels } from "./readiness-summary";
 
-const pathsAndServices = new Set<Component["component"]>(["Command", "RobotVideo", "AI"]);
+const connectionAndMatchingComponents = new Set<Component["component"]>(["Command", "RobotVideo", "AI"]);
 
 function ReadinessNotice({ loading, disconnected, health, snapshotFailed, summary, mode }: {
   loading: boolean;
@@ -40,7 +40,7 @@ function ReadinessNotice({ loading, disconnected, health, snapshotFailed, summar
     </Notice>;
   }
   if (snapshotFailed || !health || summary.status === "Unknown") {
-    return <Notice title={summary.status === "Unknown" ? "Device readiness unavailable" : "Device readiness incomplete"} tone="danger">
+    return <Notice title={health || summary.status !== "Unknown" ? "Device readiness incomplete" : "Device readiness unavailable"} tone="danger">
       {snapshotFailed && health ? "The snapshot is unavailable. Showing the reported health observations."
         : "Some observations could not be retrieved. Check the local application and retry readiness."}
     </Notice>;
@@ -72,13 +72,16 @@ function PathList({ observations }: { observations: Component[] }) {
 export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
   const view = useRuntimeView();
   const runtimeState = useRuntime();
-  const context = useEligibleSearchSetup(setup);
+  const { context, checking } = useEligibleSearchSetup(setup);
   const [inspectedMode, setInspectedMode] = useState<ControlMode>("Gestures");
-  const session = view.snapshot?.active_session;
-  const active = session?.state === "Searching" || session?.state === "Paused" ? session : undefined;
-  const mode = active?.control_mode ?? context?.mode ?? inspectedMode;
   const snapshot = view.failedRead ? undefined : view.snapshot;
-  const summary = describeDeviceReadiness(snapshot?.readiness ?? view.health?.readiness, mode);
+  const session = snapshot?.active_session;
+  const active = session?.state === "Searching" || session?.state === "Paused" ? session : undefined;
+  const activeModeUnavailable = !snapshot && !!view.health?.active_session_state;
+  const setupMode = context?.mode ?? (checking ? setup?.mode : undefined);
+  const mode = active?.control_mode ?? setupMode ?? inspectedMode;
+  const readiness = snapshot?.readiness ?? view.health?.readiness;
+  const summary = describeDeviceReadiness(activeModeUnavailable ? undefined : readiness, mode);
   const canRefresh = !view.disconnected && runtimeState;
 
   function refresh() {
@@ -90,10 +93,20 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
   return (
     <div className={layout.page}>
       <PageHeader title="Devices" description="Check the paths required for the selected control mode."
-        actions={active || context?.mode ? (
+        actions={active ? (
           <div className={styles.mode}>
             <strong>{modeLabels[mode]}</strong>
-            <p>{active ? `Locked to active search · ${view.snapshot?.runtime.effective_session_state ?? active.state}` : "From Search Setup"}</p>
+            <p>Locked to active search · {snapshot?.runtime.effective_session_state ?? active.state}</p>
+          </div>
+        ) : activeModeUnavailable ? (
+          <div className={styles.mode}>
+            <strong>Active search · {view.health?.active_session_state}</strong>
+            <p>Mode unavailable. Retry readiness to identify the locked mode.</p>
+          </div>
+        ) : setupMode ? (
+          <div className={styles.mode}>
+            <strong>{modeLabels[mode]}</strong>
+            <p>{checking ? "Checking Search Setup" : "From Search Setup"}</p>
           </div>
         ) : !view.disconnected && (
           <div className={styles.mode}>
@@ -121,6 +134,12 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
         )}
       </div>
       <div className={layout.columns}>
+        {activeModeUnavailable && readiness && (
+          <section aria-labelledby="reported-readiness-title">
+            <h2 id="reported-readiness-title">Reported readiness</h2>
+            <PathList observations={readiness.components} />
+          </section>
+        )}
         {summary.selected && (
           <section aria-labelledby="required-title">
             <h2 id="required-title">Required for {modeLabels[mode]}</h2>
@@ -131,11 +150,11 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
               </div>
               <div>
                 <h3>Shared connections and matching</h3>
-                <PathList observations={summary.shared.filter(({ component }) => pathsAndServices.has(component))} />
+                <PathList observations={summary.shared.filter(({ component }) => connectionAndMatchingComponents.has(component))} />
               </div>
               <div>
                 <h3>Shared application prerequisites</h3>
-                <PathList observations={summary.shared.filter(({ component }) => !pathsAndServices.has(component))} />
+                <PathList observations={summary.shared.filter(({ component }) => !connectionAndMatchingComponents.has(component))} />
               </div>
             </div>
           </section>
@@ -152,7 +171,7 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
         </div>
       </div>
       <nav aria-label="Device links" className={layout.footer}>
-        <Link className="button button--secondary" href={supportHref("/control-guide", context)}>Open Control Guide</Link>
+        <Link className="button button--secondary" href={supportHref("/control-guide", checking ? setup : context)}>Open Control Guide</Link>
         {context && <Link className="button button--primary" href={searchSetupHref(context)}>
           <ArrowRight size={18} aria-hidden="true" /> Return to Search Setup
         </Link>}

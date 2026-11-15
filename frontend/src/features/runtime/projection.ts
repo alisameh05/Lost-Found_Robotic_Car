@@ -46,7 +46,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     readRequest?.abort();
     readRequest = new AbortController();
     const signal = AbortSignal.any([lifetime.signal, readRequest.signal]);
-    update({ loading: true, failedRead: undefined });
+    update({ loading: true });
     try {
       if (!context || readBootstrap) {
         const bootstrap = await transport.bootstrap(signal);

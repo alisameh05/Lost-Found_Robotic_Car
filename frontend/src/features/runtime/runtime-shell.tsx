@@ -10,19 +10,20 @@ import { useRuntime, useRuntimeView } from "./runtime-provider";
 
 export function RuntimeFrame({ children }: { children: ReactNode }) {
   const runtime = useRuntime()?.connection?.runtime;
-  const { snapshot, emergency } = useRuntimeView();
+  const { snapshot, health, failedRead, emergency } = useRuntimeView();
   const session = snapshot?.active_session;
   const active = session?.state === "Searching" || session?.state === "Paused";
+  const offerEmergency = active || !!health?.active_session_state;
 
   return (
-    <AppShell fixtureEnabled activeSearch={snapshot && active && (
+    <AppShell fixtureEnabled activeSearch={snapshot && active && !failedRead && (
       <div className="active-search">
         <p>{snapshot.runtime.effective_session_state ?? session.state}{snapshot.active_object && ` · ${snapshot.active_object.name}`}</p>
         <Link href={`/sessions/${encodeURIComponent(session.id)}/live`}>Return to Active Search</Link>
       </div>
-    )} priorityAction={(active || emergency) && (
+    )} priorityAction={(offerEmergency || emergency) && (
       <div className="emergency-bar">
-        {active && (
+        {offerEmergency && (
           <button className="button emergency-button" type="button"
             aria-disabled={emergency?.kind === "sending" || undefined}
             onClick={() => { void runtime?.emergency(); }}>

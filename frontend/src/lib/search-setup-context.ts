@@ -1,6 +1,17 @@
-import type { ControlMode } from "@/generated/api-v1";
+import type { ControlMode, Health, Object as ObjectRecord, Snapshot } from "@/generated/api-v1";
 
 export type SearchSetupContext = { objectId: string; mode?: ControlMode };
+
+export function searchSetupBlockReason(object: ObjectRecord, { snapshot, health }: { snapshot?: Snapshot; health?: Health }) {
+  const state = snapshot?.runtime.effective_session_state ?? snapshot?.active_session?.state ?? health?.active_session_state;
+  const storage = snapshot?.readiness.components.find(({ component }) => component === "Storage");
+  if (object.status === "Found") return "This object has already been found.";
+  if (state === "Searching" || state === "Paused") return `End the ${state.toLowerCase()} session before starting another search.`;
+  if (health?.storage_integrity === "Unavailable" || storage?.status === "Unavailable") return "Storage is unavailable.";
+  if (health?.storage_integrity === "Reconciling" || storage?.status === "Initializing") return "Storage is being checked.";
+  if (object.retention_grace) return "This expired record is available for its existing search only.";
+  if (object.reference_media.availability !== "Available") return "The reference image is unavailable.";
+}
 
 export function readSetupMode(value: string | string[] | undefined): ControlMode | undefined {
   if (value === "Gestures" || value === "Controller") return value;

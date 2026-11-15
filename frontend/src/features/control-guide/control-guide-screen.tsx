@@ -9,13 +9,13 @@ import { searchSetupHref, supportHref, type SearchSetupContext } from "@/lib/sea
 import { ControlGuideContent } from "./control-guide-content";
 
 export function ControlGuideScreen({ setup }: { setup?: SearchSetupContext }) {
-  const context = useEligibleSearchSetup(setup);
+  const { context, checking } = useEligibleSearchSetup(setup);
   return (
     <div className={layout.page}>
       <PageHeader title="Control Guide" description="Movement, stopping, match review and recovery." />
       <ControlGuideContent />
       <nav aria-label="Control Guide links" className={layout.footer}>
-        <Link className="button button--secondary" href={supportHref("/devices", context)}>View Devices</Link>
+        <Link className="button button--secondary" href={supportHref("/devices", checking ? setup : context)}>View Devices</Link>
         {context && <Link className="button button--primary" href={searchSetupHref(context)}>
           <ArrowRight size={18} aria-hidden="true" /> Return to Search Setup
         </Link>}

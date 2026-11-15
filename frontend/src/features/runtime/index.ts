@@ -5,3 +5,4 @@ export type { RegistrationAction, RuntimeProjection } from "./projection";
 export { useCursorPage, useProtectedRead } from "./use-protected-read";
 export { useProtectedImage } from "./use-protected-image";
 export { useEligibleSearchSetup } from "./use-eligible-search-setup";
+export { recordAbsence, useObjectRecord } from "./use-object-record";

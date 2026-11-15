@@ -11,20 +11,20 @@ export function ControlGuideContent({ heading: Heading = "h2" }: { heading?: "h2
           <Heading id={`${id}-gestures`}>Gesture directions and stop</Heading>
           <p>In the mirrored webcam view, hold one extended index finger pointing up for forward, down for backward,
             left for left, or right for right.</p>
-          <p>A closed fist, no hand, multiple hands, or ambiguous or invalid pointing stops ordinary movement.</p>
+          <p>Release the pointing gesture to stop. A closed fist, no hand, multiple hands, or ambiguous or invalid pointing stops ordinary movement.</p>
         </section>
         <section className={styles.rule} aria-labelledby={`${id}-ps4`}>
           <Heading id={`${id}-ps4`}>PS4 controller</Heading>
           <p>On the DualShock 4, hold D-pad up for forward, down for backward, left for left, or right for right.
             Release the D-pad to stop. Conflicting directions also stop ordinary movement.</p>
-          <p>Press Circle for Emergency Stop. The UI Emergency Stop works in either mode.</p>
+          <p>Press Circle for Emergency Stop. The UI Emergency Stop works in either mode. Gesture input is inactive in Controller mode.</p>
         </section>
         <section className={styles.rule} aria-labelledby={`${id}-session`}>
           <Heading id={`${id}-session`}>Pause, Stop Search and Emergency Stop</Heading>
           <dl className={styles.actions}>
             <div><dt>Pause</dt><dd>Stops motion and matching while keeping the session active.</dd></div>
             <div><dt>Stop Search</dt><dd>Stops motion and matching and ends the session.</dd></div>
-            <div><dt>Emergency Stop</dt><dd>Stops motion immediately and pauses the session with recovery required.</dd></div>
+            <div><dt>Emergency Stop</dt><dd>Revokes motion permission immediately and pauses the session with recovery required.</dd></div>
           </dl>
         </section>
       </div>
