@@ -74,6 +74,7 @@ export function createFixtureTransport({
   let failDetail = scene.recordsRecovery;
   let expireContinuation = scene.recordsRecovery;
   let failHistory = scene.historyRecovery;
+  let failDashboardHistory = scene.dashboardRecovery;
   let failMatches = scene.historyRecovery;
   let expireSessionCursor = scene.historyRecovery;
   let invalidateMatchCursor = scene.historyRecovery;
@@ -172,7 +173,7 @@ export function createFixtureTransport({
       return error ? { kind: "api-error", status: 503, error } : ok(snapshotRead());
     },
     "GET /objects": ({ query }) => {
-      if (failList) {
+      if (failList && query?.limit === undefined) {
         failList = false;
         return { kind: "unavailable" };
       }
@@ -192,7 +193,12 @@ export function createFixtureTransport({
     "GET /objects/{id}/sessions": ({ id, query }) => {
       const parent = objectRead(id);
       if (parent.kind !== "ok") return parent;
-      if (id === sampleObject.id && failHistory) {
+      if (id === sampleObject.id && failDashboardHistory) {
+        failDashboardHistory = false;
+        return { kind: "unavailable" };
+      }
+      // The short Dashboard page must not consume the Object Details recovery script.
+      if (id === sampleObject.id && failHistory && (query?.limit === undefined || query.limit === 5)) {
         failHistory = false;
         return { kind: "unavailable" };
       }

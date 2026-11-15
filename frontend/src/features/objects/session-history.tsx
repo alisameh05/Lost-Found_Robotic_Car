@@ -18,7 +18,13 @@ export function useObjectSessions(objectId: string, limit?: number, enabled = tr
   return useCursorPage("GET /objects/{id}/sessions", scope, enabled);
 }
 
-export function SessionSummary({ session }: { session: Session }) {
+export function SessionSummary({ session, compact = false }: { session: Session; compact?: boolean }) {
+  const outcome = session.end_reason === "Confirmed" ? "Found" : session.end_reason;
+  if (compact) return <div className={styles.compactSession}>
+    <span>{modeLabel(session.control_mode)} · <RecordTime value={session.started_at_ms} compact /></span>
+    <span data-found={outcome === "Found" || undefined}>{session.state}{outcome && ` · ${outcome}`}</span>
+  </div>;
+
   return <div className={styles.sessionSummary}>
     <div className={styles.sessionTimes}>
       <div>Started <RecordTime value={session.started_at_ms} /></div>
@@ -27,7 +33,7 @@ export function SessionSummary({ session }: { session: Session }) {
     <div className={styles.sessionFacts}>
       <span>{modeLabel(session.control_mode)}</span>
       <StatusBadge tone={session.state === "Paused" ? "warning" : "muted"}>{session.state}</StatusBadge>
-      {session.end_reason && <span>{session.end_reason === "Confirmed" ? "Found" : session.end_reason}</span>}
+      {outcome && <span>{outcome}</span>}
     </div>
   </div>;
 }

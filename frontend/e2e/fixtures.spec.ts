@@ -3,9 +3,9 @@ import { expect, test } from "@playwright/test";
 test("resets the fixture transport and projects its snapshot and health into the dashboard", async ({ page }) => {
   await page.goto("http://127.0.0.1:3100/");
   const scenario = page.getByLabel("Fixture scenario");
-  const status = page.getByRole("region", { name: "Search status" });
+  const status = page.getByRole("region", { name: "Active search", exact: true });
   await scenario.selectOption("initializing");
-  await expect(status.getByText("Initializing fixture application", { exact: true })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Device readiness" }).getByText("Initializing services", { exact: true })).toBeVisible();
   await scenario.selectOption("searching");
   await expect(status.getByText("Searching", { exact: true })).toBeVisible();
   await scenario.selectOption("paused");
@@ -14,9 +14,9 @@ test("resets the fixture transport and projects its snapshot and health into the
   await expect(status.getByText("Paused", { exact: true })).toBeVisible();
   await expect(status.getByText(/Save pending/)).toBeVisible();
   await scenario.selectOption("failed");
-  await expect(status.getByRole("alert")).toContainText("STORAGE_UNAVAILABLE");
+  await expect(page.getByRole("region", { name: "Search status" }).getByRole("status")).toContainText("Search status unavailable");
   await scenario.selectOption("controller-ready");
-  await expect(page.getByText("Gestures unavailable · Controller ready")).toBeVisible();
+  await expect(page.getByText("Gestures requirements unavailable")).toBeVisible();
   await scenario.selectOption("ended");
   await expect(page.getByText("No active search", { exact: true })).toBeVisible();
   await page.reload();

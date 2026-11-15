@@ -17,6 +17,7 @@ type Scenario = {
   snapshotErrorOnce?: boolean;
   recordsRecovery?: boolean;
   historyRecovery?: boolean;
+  dashboardRecovery?: boolean;
   emergency: "Committed" | "Pending" | "Failed" | "network";
 };
 
@@ -74,6 +75,10 @@ const candidateSession: typeof paused = { ...paused, pause_causes: [{ cause: "Ca
 const recoverySession: typeof paused = {
   ...paused, revision: 3, pause_causes: [{ cause: "RecoveryRequired", failure_id: recoveryFailure.failure_id }],
 };
+const dashboardTies = [
+  { ...sampleSession, id: "sample-tied-search-a", object_id: libraryRecords[1].id },
+  { ...sampleSession, id: "sample-tied-search-Z", object_id: foundObject.id },
+];
 
 const scenarios = {
   idle: initial,
@@ -94,6 +99,9 @@ const scenarios = {
     }, null, null, false),
   }, { snapshotError: { code: "STORAGE_UNAVAILABLE", message: "Sample storage is unavailable.", retryable: true } }, "Failed"),
   empty: withSnapshot(snapshot, { objects: [], sessions: [], matches: [] }),
+  "dashboard-recovery": withSnapshot(snapshot, {
+    dashboardRecovery: true, sessions: [...initial.sessions, ...dashboardTies, ...earlierWalletSessions],
+  }),
   "registration-recovery": initial,
   "records-recovery": withSnapshot(snapshot, {
     recordsRecovery: true,

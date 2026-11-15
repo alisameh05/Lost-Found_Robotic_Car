@@ -50,6 +50,10 @@ test.each(scenarioIds)("validates the %s fixture's bootstrap, snapshot, health a
       expect(await transport.request("GET /objects/{id}/sessions", { id: owner.id, context: bootstrap }))
         .toEqual({ kind: "unavailable" });
     }
+    if (scene.dashboardRecovery && owner.id === sampleObject.id) {
+      expect(await transport.request("GET /objects/{id}/sessions", { id: owner.id, context: bootstrap, query: { limit: 3 } }))
+        .toEqual({ kind: "unavailable" });
+    }
     const sessions = data(await transport.request("GET /objects/{id}/sessions", { id: owner.id, context: bootstrap }));
     contract("SessionPage", sessions);
     for (const session of sessions.items) {

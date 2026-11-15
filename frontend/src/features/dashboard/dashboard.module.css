@@ -1,0 +1,136 @@
+.dashboard {
+  display: grid;
+  grid-template-columns: minmax(0, 2fr) minmax(0, 1fr);
+  grid-template-areas:
+    "search devices"
+    "objects devices"
+    "objects sessions";
+  grid-template-rows: auto auto 1fr;
+  gap: var(--space-6);
+  align-items: start;
+  margin-bottom: var(--space-8);
+}
+
+.dashboard h2, .dashboard h3 { margin: 0; }
+.dashboard p { margin: 0; }
+.muted { color: var(--muted); font-size: .875rem; }
+
+.active, .searchStatus {
+  grid-area: search;
+  display: grid;
+  gap: var(--space-3);
+  padding: var(--space-6);
+  background: var(--surface);
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+}
+
+.active { border-color: var(--teal); }
+.active h2 { color: var(--teal); }
+.active h3 { font-size: 1.625rem; line-height: 1.2; }
+.searchStatus > button { justify-self: start; }
+
+.sectionHeading, .activeActions, .deviceActions {
+  display: flex;
+  align-items: center;
+  flex-wrap: wrap;
+  gap: var(--space-3);
+}
+
+.sectionHeading { justify-content: space-between; }
+.sectionHeading :is(h2, a), .deviceList li > :first-child {
+  display: flex;
+  align-items: center;
+  gap: var(--space-2);
+}
+
+.sectionHeading svg, .deviceList svg { flex: none; }
+.sectionHeading a, .activeActions p { color: var(--muted); font-size: .875rem; }
+.sectionHeading a { color: var(--teal); font-weight: 600; min-height: var(--control-height); }
+
+.objects { grid-area: objects; }
+.devices { grid-area: devices; }
+.searches { grid-area: sessions; }
+.objects, .devices, .searches {
+  display: grid;
+  min-width: 0;
+  gap: var(--space-3);
+}
+
+.counts {
+  display: grid;
+  grid-template-columns: repeat(auto-fit, minmax(min(100%, 7rem), 1fr));
+  gap: var(--space-3);
+  margin: 0;
+}
+
+.counts div, .deviceList {
+  border: 1px solid var(--border);
+  background: var(--surface);
+  border-radius: var(--radius-panel);
+}
+
+.counts div { padding: var(--space-3) var(--space-4); }
+.counts dt { color: var(--muted); }
+.counts dd { margin: 0; font-size: 2rem; font-weight: 700; }
+.counts div:last-child dd { color: var(--success); }
+
+.rows, .deviceList { margin: 0; list-style: none; padding: 0; }
+.rows li { border-bottom: 1px solid var(--border); }
+.objectRow, .sessionRow {
+  display: grid;
+  align-items: center;
+  min-height: var(--control-height);
+  gap: var(--space-3);
+  padding: var(--space-3) var(--space-1);
+  color: var(--ink);
+  text-decoration: none;
+}
+
+.objectRow { grid-template-columns: auto minmax(0, 1fr) auto auto; }
+.objectRow .muted { display: block; }
+.objectRow:hover strong, .sessionRow:hover strong { text-decoration: underline; text-underline-offset: .2em; }
+.recordIcon {
+  display: grid;
+  place-items: center;
+  width: var(--control-height);
+  aspect-ratio: 1;
+  background: var(--surface);
+  color: var(--teal);
+  border-radius: var(--radius-panel);
+}
+
+.sessionRow { grid-template-columns: auto minmax(0, 1fr); align-items: start; }
+.sessionRow > svg { color: var(--muted); }
+.sessionRow strong { display: block; margin-bottom: var(--space-1); }
+
+.deviceList { padding: var(--space-2) var(--space-3); }
+.deviceList li {
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  flex-wrap: wrap;
+  gap: var(--space-1) var(--space-2);
+  padding: var(--space-2) 0;
+}
+
+.deviceList li + li { border-top: 1px solid var(--border); }
+.deviceList li > :last-child { color: var(--muted); font-size: .875rem; }
+.deviceList li > [data-observation="Ready"], .deviceList li > [data-observation="Clear"] { color: var(--success); }
+.deviceList li > [data-observation="Unavailable"] { color: var(--danger); }
+.deviceList li > [data-observation="Initializing"], .deviceList li > [data-observation="Warning"] { color: var(--warning); }
+
+@container (max-width: 46rem) {
+  .dashboard {
+    grid-template-columns: minmax(0, 1fr);
+    grid-template-areas: "search" "objects" "devices" "sessions";
+    grid-template-rows: auto;
+  }
+}
+
+@container (max-width: 25rem) {
+  .objectRow { grid-template-columns: minmax(0, 1fr) auto; }
+  .recordIcon, .objectRow > svg { display: none; }
+}
+.layout { container-type: inline-size; }
+
