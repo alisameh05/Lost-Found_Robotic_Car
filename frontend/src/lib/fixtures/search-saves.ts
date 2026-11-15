@@ -25,12 +25,23 @@ export function openSearchSaves(publish: () => void) {
     return response;
   }
 
+  function publishSaves() {
+    publish();
+    // An all-null terminal operation can be delivered to connected clients without retaining an expired receipt.
+    for (const [id, { response: { data } }] of receipts) {
+      if (data.persistence === "Committed" && Object.values(data.result).every((value) => value === null)) receipts.delete(id);
+    }
+  }
+
   return {
     replay(id: string, fingerprint: string): Response | undefined {
       const receipt = receipts.get(id);
       if (!receipt) return;
-      return receipt.fingerprint === fingerprint ? receipt.response :
-        fixtureError(409, "ACTION_ID_CONFLICT", "This sample action ID was already used for another intent.");
+      if (receipt.fingerprint !== fingerprint) {
+        return fixtureError(409, "ACTION_ID_CONFLICT", "This sample action ID was already used for another intent.");
+      }
+      const { data } = receipt.response;
+      if (data.persistence !== "Failed" || !data.error.retryable) return receipt.response;
     },
     pending: (action?: SearchAction) => [...receipts.values()].some((entry) => !!entry.settle && (!action || entry.action === action)),
     operations(): Operation[] {
@@ -51,18 +62,18 @@ export function openSearchSaves(publish: () => void) {
         receipts.delete(id);
         record(id, receipt.owner, receipt.fingerprint, receipt.settle(commit));
       }
-      publish();
+      publishSaves();
     },
     admit(action: SearchAction, id: string, owner: string, fingerprint: string, outcome: SearchDelivery, settle: () => Response) {
       if (outcome === "pending") {
         const response = mutation(id, "Pending", emptyResult);
         receipts.set(id, { action, owner, fingerprint, response, settle: (commit) =>
           commit ? settle() : mutation(id, "Failed", emptyResult) });
-        publish();
+        publishSaves();
         return response;
       }
       const response = record(id, owner, fingerprint, outcome === "fail" ? mutation(id, "Failed", emptyResult) : settle());
-      publish();
+      publishSaves();
       return outcome === "lose-response" ? { kind: "unavailable" } as const : response;
     },
   };

@@ -1,4 +1,4 @@
-import type { EventEnvelope, Operation, Snapshot } from "@/generated/api-v1";
+import type { EventEnvelope, Match, Operation, Snapshot } from "@/generated/api-v1";
 import { componentNames } from "@/generated/api-v1";
 import { conforms } from "@/lib/fixture-contracts";
 import { pendingReview } from "@/lib/match-evidence";
@@ -37,6 +37,16 @@ function withOperation(state: Snapshot, operation: Operation | null) {
   return { ...state, operations: [...pending, ...completed.slice(-64)] };
 }
 
+function sameCapture(left: Match, right: Match) {
+  const before = left.evidence_media;
+  const after = right.evidence_media;
+  return left.id === right.id && left.session_id === right.session_id && left.object_id === right.object_id &&
+    left.frame_id === right.frame_id && left.stream_epoch === right.stream_epoch && left.captured_at_ms === right.captured_at_ms &&
+    left.box.x === right.box.x && left.box.y === right.box.y && left.box.width === right.box.width && left.box.height === right.box.height &&
+    before.id === after.id && before.width === after.width && before.height === after.height &&
+    before.byte_length === after.byte_length && before.created_at_ms === after.created_at_ms;
+}
+
 // Undefined invalidates the stream. Returning the same state discards a duplicate.
 export function projectWorkspaceEvent(current: Snapshot | undefined, event: EventEnvelope, boot: string): Snapshot | undefined {
   if (!conforms("EventEnvelope", event) || event.backend_boot_id !== boot ||
@@ -44,6 +54,10 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
   if (current && event.event_seq < current.event_seq) return current;
   if (event.type === "snapshot") {
     const { payload } = event;
+    const previous = current?.pending_candidate;
+    const candidate = payload.pending_candidate;
+    if (previous && candidate && (previous.id === candidate.id || session?.revision === payload.active_session?.revision) &&
+        !sameCapture(previous, candidate)) return;
     if (!validSnapshot(payload, boot) || payload.event_seq !== event.event_seq ||
         (payload.active_session?.id ?? null) !== event.session_id ||
         (payload.active_session?.revision ?? null) !== event.session_revision) return;
@@ -83,7 +97,7 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
     case "candidate_pending":
       if (!session || event.session_id !== session.id || event.session_revision !== session.revision ||
           event.payload.control_generation !== next.runtime.control_generation || !pendingReview(next, event.payload.match) ||
-          (next.pending_candidate && next.pending_candidate.id !== event.payload.match.id)) return;
+          (next.pending_candidate && !sameCapture(next.pending_candidate, event.payload.match))) return;
       return { ...next, pending_candidate: event.payload.match };
     case "recovery_changed":
       if (event.payload.failures.some((failure) => failure.session_id !== session?.id)) return;

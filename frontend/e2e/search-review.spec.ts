@@ -104,6 +104,26 @@ test("recovers from failed and undelivered review saves", async ({ page }) => {
   await expect(page.getByRole("heading", { name: "Match confirmed and saved" })).toBeVisible();
 });
 
+test("keeps keyboard Emergency Stop available during inspection and a pending review save", async ({ page }) => {
+  await start(page);
+  await action(page, "Show sample candidate").click();
+  await action(page, "Hold next search save").click();
+  await action(page, "Confirm Match").click();
+  await expect(review(page).getByText("Save pending", { exact: true })).toBeVisible();
+  await action(page, "Inspect evidence").press("Enter");
+  await expect(page.getByRole("region", { name: "Enlarged captured evidence" })).toBeFocused();
+  await page.getByRole("complementary").getByRole("link", { name: "Return to Active Search" }).focus();
+  await page.keyboard.press("Tab");
+  await expect(action(page, "Emergency Stop")).toBeFocused();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText(/Motion permission revoked/)).toBeVisible();
+  await action(page, "Commit pending search save").click();
+  await expect(review(page).getByText("Save failed", { exact: true })).toBeVisible();
+  await expect(page).toHaveURL(/\/live$/);
+  await expect(action(page, "Confirm Match")).toBeDisabled();
+  await expect(review(page).getByText("Reviewed", { exact: true })).toHaveCount(0);
+});
+
 for (const [fault, feedback] of [["missing", "Media not found"], ["corrupt", "Image could not be decoded"]] as const) {
   test(`blocks confirmation of ${fault} evidence and keeps Emergency Stop operable`, async ({ page }) => {
     await start(page);

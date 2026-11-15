@@ -38,8 +38,8 @@ export function MatchReview({ match, object, canAct, canStop, stop }: {
       <Button variant="destructive" disabled={!canStop} onClick={stop}>Stop Search</Button>
     </div>
     <ActionFeedback label="Confirming match" feedback={confirm?.candidateId === match.id ? confirm : undefined}
-      retry={() => { void runtime?.retrySearch("confirm", sessionId); }} />
+      canRetryFailed={!blocked && displayed === true} retry={() => { void runtime?.retrySearch("confirm", sessionId); }} />
     <ActionFeedback label="Rejecting match" feedback={reject?.candidateId === match.id ? reject : undefined}
-      retry={() => { void runtime?.retrySearch("reject", sessionId); }} />
+      canRetryFailed={!blocked} retry={() => { void runtime?.retrySearch("reject", sessionId); }} />
   </ModelessPanel>;
 }

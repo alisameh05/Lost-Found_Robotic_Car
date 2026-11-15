@@ -7,7 +7,8 @@ export type SearchIntent = { kind: "start"; object: ObjectRecord; mode: ControlM
   | { kind: "confirm" | "reject"; sessionId: string; candidateId: string };
 
 export type SearchFeedback = ({ stage: "sending" | "pending" | "unknown" }
-  | { stage: "rejected" | "failed"; message: string }
+  | { stage: "rejected"; message: string }
+  | { stage: "failed"; message: string; retryable: boolean }
   | { stage: "committed"; session: Session | null }) & { candidateId?: string };
 
 type ActionBody = StartRequest | Exclude<SessionAction, { action: "acknowledge" }>;
@@ -64,7 +65,7 @@ export function openSearchActions({
       if (!resultMatches(action, data.result)) return false;
       action.feedback = { stage: "committed", session: data.result.session };
     } else if (data.persistence === "Failed") {
-      action.feedback = { stage: "failed", message: data.error.message };
+      action.feedback = { stage: "failed", message: data.error.message, retryable: data.error.retryable };
     } else {
       action.feedback = { stage: "pending" };
     }
@@ -132,7 +133,8 @@ export function openSearchActions({
     retry(key: string, context: ClientContext) {
       const action = actions.get(key);
       if (action && sameContext(action.context, context) &&
-          (action.feedback.stage === "unknown" || action.feedback.stage === "pending")) return send(action);
+          (action.feedback.stage === "unknown" || action.feedback.stage === "pending" ||
+            (action.feedback.stage === "failed" && action.feedback.retryable))) return send(action);
     },
     clear() {
       for (const action of actions.values()) clearTimeout(action.timer);

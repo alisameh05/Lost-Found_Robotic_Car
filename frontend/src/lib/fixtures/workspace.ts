@@ -55,21 +55,20 @@ export function openFixtureWorkspace({
   const frames = { robot: cameraFrame("robot"), webcam: cameraFrame("webcam") };
   const modeBySource = { robot: frameMode, webcam: "live" } satisfies Record<Source, FrameMode> as Record<Source, FrameMode>;
 
+  function emit(project: (state: Snapshot, envelope: EventEnvelope) => EventEnvelope) {
+    watermark++;
+    for (const [client, connection] of events) {
+      const state = read(client);
+      connection.enqueue(project(state, { ...snapshotEvent(state), occurred_at_ms: now() }));
+    }
+  }
+
   function publish(kind: "snapshot" | "readiness_changed" = "snapshot", candidate?: Match) {
-    watermark++;
-    for (const [client, connection] of events) {
-      const state = read(client);
-      const snapshot = { ...snapshotEvent(state), occurred_at_ms: now() };
-      connection.enqueue(candidate ? { ...snapshot, payload: { ...state, pending_candidate: null } } : kind === "snapshot" ? snapshot :
-        { ...snapshot, type: kind, payload: { readiness: state.readiness, runtime: state.runtime } });
-    }
-    if (!candidate) return;
-    watermark++;
-    for (const [client, connection] of events) {
-      const state = read(client);
-      connection.enqueue({ ...snapshotEvent(state), type: "candidate_pending", occurred_at_ms: now(),
-        payload: { match: candidate, control_generation: state.runtime.control_generation } });
-    }
+    emit((state, envelope) => kind === "snapshot"
+      ? { ...envelope, type: "snapshot", payload: candidate ? { ...state, pending_candidate: null } : state }
+      : { ...envelope, type: kind, payload: { readiness: state.readiness, runtime: state.runtime } });
+    if (candidate) emit((state, envelope) => ({ ...envelope, type: "candidate_pending",
+      payload: { match: candidate, control_generation: state.runtime.control_generation } }));
   }
 
   function frameFresh(frame: Frame, time: number) {
@@ -256,15 +255,21 @@ export function openFixtureWorkspace({
 
   return {
     publish,
+    publishRemoval: (object_id: string) => emit((_state, envelope) => ({
+      ...envelope, type: "object_removed", payload: { object_id, reason: "Expired" },
+    })),
     watermark: () => watermark,
     hasEvents: () => events.size > 0,
     canAcquire: (client: string) => !!profile && events.has(client),
     observations: () => ({ workspace: !!owner?.workspace, displayed: !!owner?.acknowledged && frameFresh(owner.acknowledged, monotonic()) }),
     captureEvidence() {
       checkDeadline();
+      const client = owner?.client;
       const frame = owner?.acknowledged;
-      if (!frame || modeBySource.robot !== "live" || !available("robot") || !frameFresh(frame, monotonic())) return;
-      return { metadata: frame.metadata, bytes: frame.payload.slice(), isFresh: () => frameFresh(frame, monotonic()) };
+      const connection = client && video.robot.get(client);
+      if (!client || !connection || !frame || modeBySource.robot !== "live" || !available("robot") || !frameFresh(frame, monotonic())) return;
+      return { metadata: frame.metadata, bytes: frame.payload.slice(), isFresh: () => modeBySource.robot === "live" &&
+        video.robot.get(client) === connection && available("robot") && frameFresh(frame, monotonic()) };
     },
     owns(client: string, secret: string) {
       checkDeadline();

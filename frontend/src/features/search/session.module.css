@@ -41,7 +41,7 @@
 .comparison { margin-block: var(--space-3); align-items: start; }
 .comparison > figure { margin: 0; min-width: 0; }
 .found { justify-content: space-between; border-color: var(--success); }
-.facts { display: grid; grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); gap: var(--space-3); }
+.facts { display: grid; grid-template-columns: repeat(3, minmax(0, 1fr)); gap: var(--space-3); }
 
 .camera { overflow: hidden; padding: 0; min-width: 0; }
 .camera header, .camera p { padding: var(--space-3); }
@@ -69,5 +69,6 @@
 }
 @media (max-width: 52rem) {
   .cameras, .result, .comparison { grid-template-columns: minmax(0, 1fr); }
+  .facts { grid-template-columns: repeat(auto-fit, minmax(min(100%, 12rem), 1fr)); }
   .target .actions { margin-inline-start: 0; }
 }

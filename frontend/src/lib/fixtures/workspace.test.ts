@@ -256,7 +256,8 @@ test.each(["confirm", "stop"] as const)("commits only %s when the other terminal
   await transport.controls.observeCandidate("visible");
   const paused = await snapshot();
   const pending = paused.pending_candidate!;
-  expect(pending).toMatchObject({ ...frame, session_id: started.id, disposition: "Pending", reviewed_at_ms: null });
+  expect({ frame_id: pending.frame_id, stream_epoch: pending.stream_epoch }).toEqual(frame);
+  expect(pending).toMatchObject({ session_id: started.id, disposition: "Pending", reviewed_at_ms: null });
   expect(paused.runtime).toMatchObject({ effective_session_state: "Paused", motion_permission: "Disarmed" });
   expect(paused.runtime.control_generation).toBeGreaterThan(searching.runtime.control_generation);
   expect(events.find(({ type }) => type === "candidate_pending")).toMatchObject({
@@ -278,6 +279,8 @@ test.each(["confirm", "stop"] as const)("commits only %s when the other terminal
   await expect(request({ ...confirm, candidate_id: "sample-confirmed" })).resolves.toMatchObject({ error: { code: "OWNERSHIP_MISMATCH" } });
   const winningAction = winner === "confirm" ? confirm : stop;
   const losingAction = winner === "confirm" ? stop : confirm;
+  transport.controls.scriptSearch("fail");
+  expect(data(await request(losingAction)).persistence).toBe("Failed");
   transport.controls.scriptSearch("pending");
   const pendingReceipt = data(await request(losingAction));
   expect(pendingReceipt.persistence).toBe("Pending");

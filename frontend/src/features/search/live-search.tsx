@@ -21,7 +21,7 @@ import { duration, searchMode } from "./session-facts";
 import styles from "./session.module.css";
 
 export function LiveSearchScreen({ sessionId }: { sessionId: string }) {
-  const { snapshot, searchActions } = useRuntimeView();
+  const { snapshot, searchActions, removedOwners } = useRuntimeView();
   const router = useRouter();
   const stop = searchActions?.[searchActionKey("stop", sessionId)];
   const confirm = searchActions?.[searchActionKey("confirm", sessionId)];
@@ -29,7 +29,7 @@ export function LiveSearchScreen({ sessionId }: { sessionId: string }) {
   useEffect(() => {
     if (terminal?.session?.id === sessionId) router.replace(`${sessionHref(sessionId)}/result`);
   }, [router, sessionId, terminal]);
-  const active = snapshot?.active_session?.id === sessionId && snapshot.active_object;
+  const active = snapshot?.active_session?.id === sessionId && snapshot.active_object && !removedOwners?.has(snapshot.active_object.id);
   const read = useRuntimeRead("/sessions/{id}", sessionId, !active);
   const refresh = useRefreshRuntime();
 
@@ -254,7 +254,8 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
       <ActionFeedback label="Resuming search" feedback={resume} retry={() => { void runtime?.retrySearch("resume", sessionId); }} />
       <ActionFeedback label="Stopping search" feedback={stop} retry={() => { void runtime?.retrySearch("stop", sessionId); }} />
     </div>
-    <InputControls mode={mode} disabled={!searching || !ready} />
+    <InputControls mode={mode} disabled={!searching || !ready ||
+      !readiness.components.some(({ component, status }) => component === "DisplayedRobotVideo" && status === "Ready")} />
     <footer className={styles.actions}>
       <Link href={objectHref(object.id)} className="button button--secondary">View Object Details</Link>
       <Link href={sessionHref(sessionId)} className="button button--secondary">View Session Details</Link>
