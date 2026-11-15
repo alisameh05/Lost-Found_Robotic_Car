@@ -1,4 +1,5 @@
 import type { Media } from "@/generated/api-v1";
+import referenceImages from "./reference-images.json";
 
 // Original synthetic 32 × 24 RGB swatch, encoded as JPEG and PNG with System.Drawing.
 // Keep bytes inside the fixture adapter so the preview uses the protected-media path.
@@ -8,6 +9,20 @@ const png = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAYCAYAAACbU/80AAAAAXNSR0IArs4c6QAAAAR
 export const imageWidth = 32;
 export const imageHeight = 24;
 
+// Local design references derived from pen design/generated-1.png and generated.png.
+export function sampleReference(id: string) {
+  if (id === "sample-wallet-reference" || id === "sample-bottle-reference") return referenceImages[id];
+}
+
+export function sampleMediaBytes(id: string, contentType: Media["content_type"]) {
+  const reference = sampleReference(id);
+  return reference ? decode(reference.base64) : sampleImage(contentType);
+}
+
 export function sampleImage(contentType: Media["content_type"]) {
-  return Uint8Array.from(atob(contentType === "image/jpeg" ? jpeg : png), (byte) => byte.charCodeAt(0));
+  return decode(contentType === "image/jpeg" ? jpeg : png);
+}
+
+function decode(encoded: string) {
+  return Uint8Array.from(atob(encoded), (byte) => byte.charCodeAt(0));
 }

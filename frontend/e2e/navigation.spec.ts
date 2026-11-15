@@ -27,7 +27,9 @@ test.describe("fixture preview", () => {
         if (navigation === "refresh") await page.reload();
         await expect(page.getByRole("heading", { level: 1, name: title })).toBeVisible();
         await expect(page.getByText(fixtureLabel, { exact: true })).toBeVisible();
-        await expect(page.getByText("Phase 01 preview", { exact: true })).toBeVisible();
+        if (title !== "Objects / History" && title !== "Object Details") {
+          await expect(page.getByText("Phase 01 preview", { exact: true })).toBeVisible();
+        }
         await expect(page.getByRole("navigation", { name: "Main navigation" }).getByRole("link", { name: section, exact: true }))
           .toHaveAttribute("aria-current", path.startsWith("/sessions") || path.split("/").length > 2 ? "location" : "page");
       }
@@ -51,16 +53,13 @@ test.describe("fixture preview", () => {
     await page.keyboard.press("Enter");
     await expect(page.getByRole("main")).toBeFocused();
     await page.getByRole("navigation").getByRole("link", { name: "Objects / History" }).click();
-    await page.getByRole("link", { name: "Black wallet" }).click();
-    await page.getByRole("link", { name: "Sample search session" }).click();
-    await page.getByRole("link", { name: "Preview Search Workspace" }).click();
-    await expect(page.getByRole("heading", { name: "Search Workspace" })).toBeVisible();
-    await expect(page.getByText("No active search", { exact: true })).toBeVisible();
+    await page.getByRole("link", { name: "View details for Black wallet" }).click();
+    await page.getByRole("link", { name: "Start Search" }).click();
+    await expect(page.getByRole("heading", { name: "Search Setup" })).toBeVisible();
     await page.goBack();
-    await expect(page.getByRole("heading", { name: "Session Details" })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Object Details" })).toBeVisible();
     await page.goForward();
-    await expect(page.getByRole("heading", { name: "Search Workspace" })).toBeVisible();
-    await expect(page.getByText("No active search", { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Search Setup" })).toBeVisible();
     expect(unexpectedRequests).toEqual([]);
     expect(sockets).toEqual([]);
     expect(await page.evaluate(() => [localStorage.length, sessionStorage.length])).toEqual([0, 0]);

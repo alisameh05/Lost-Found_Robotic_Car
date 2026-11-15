@@ -24,6 +24,8 @@ type RouteBody<Route> = Route extends "POST /objects"
   ? { body: HttpBodies["POST /objects"] & { reference_image: Blob }; actionCreatedAtMs: number }
   : Route extends keyof HttpBodies ? { body: HttpBodies[Route] } : { body?: never };
 export type HttpRequest<Route extends Endpoint> = ProtectedRequest & RouteParams<Route> & RouteQuery<Route> & RouteBody<Route>;
+export type ReadEndpoint = `GET ${ProtectedPath}`;
+export type ReadParams<Route extends ReadEndpoint> = RouteParams<Route> & RouteQuery<Route>;
 
 export type ProtectedMedia = {
   bytes: Uint8Array<ArrayBuffer>;

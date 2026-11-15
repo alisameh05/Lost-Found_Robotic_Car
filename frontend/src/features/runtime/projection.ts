@@ -1,5 +1,5 @@
 import type { EmergencyStopRequest, EmergencyStopResponse, Health, Snapshot } from "@/generated/api-v1";
-import type { ApplicationTransport, ProtectedPath, ProtectedRequest, ReadResult } from "@/lib/transport";
+import type { ApplicationTransport, HttpRequest, ProtectedPath, ProtectedRequest, ReadEndpoint, ReadParams, ReadResult } from "@/lib/transport";
 
 type EmergencyFeedback =
   | { kind: "sending" }
@@ -7,6 +7,7 @@ type EmergencyFeedback =
   | Exclude<ReadResult<never>, { kind: "ok" }>;
 
 type RuntimeView = {
+  disconnected?: boolean;
   snapshot?: Snapshot;
   failedRead?: Exclude<ReadResult<never>, { kind: "ok" }>;
   loading: boolean;
@@ -104,6 +105,12 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     async get<Path extends ProtectedPath>(path: Path, id: string | undefined, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;
       return transport.get(path, { id, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+    },
+    async read<Route extends ReadEndpoint>(route: Route, params: ReadParams<Route>, signal: AbortSignal) {
+      if (!context) return { kind: "unavailable" } as const;
+      // GET routes have no body. Keep the protected context at the runtime boundary.
+      const request = { ...params, context, signal: AbortSignal.any([signal, lifetime.signal]) } as HttpRequest<Route>;
+      return transport.request(route, request);
     },
     async media(id: string, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;

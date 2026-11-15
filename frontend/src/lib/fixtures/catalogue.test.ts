@@ -3,12 +3,12 @@ import { compatibleProfile, compatibleQualification, conforms, type Definition }
 import { parseFrame } from "./frame";
 import { protectedHeaders, socketOffer, type ReadResult } from "../transport";
 import type { SessionAction, WorkspaceHeartbeat } from "@/generated/api-v1";
-import { sampleImage } from "./images";
+import { sampleImage, sampleMediaBytes } from "./images";
 import { storageError } from "./mutations";
 import { readScenario, scenarioIds } from "./scenarios";
 import { follows, validEvent, validMatch, validObject, validSession, validSnapshot } from "./semantics";
 import {
-  actionId, bootstrapFacts, clientId, day, fixtureProfile, foundObject, leaseId, requestId, sampleObject,
+  actionId, bootstrapFacts, clientId, day, fixtureProfile, foundObject, leaseId, requestId, sampleObject, sampleSwatchRect,
   sampleSession, sampleTime, snapshot,
 } from "./samples";
 import { createFixtureTransport } from "./transport";
@@ -39,6 +39,9 @@ test.each(scenarioIds)("validates the %s fixture's bootstrap, snapshot, health a
     expect(data(snapshotRead)).toEqual(scene.snapshot);
   }
 
+  if (scene.recordsRecovery) {
+    expect(await transport.request("GET /objects", { context: bootstrap })).toEqual({ kind: "unavailable" });
+  }
   const listed = data(await transport.request("GET /objects", { context: bootstrap }));
   contract("ObjectPage", listed);
   for (const owner of listed.items) {
@@ -86,7 +89,7 @@ test("rejects invalid enum, types, UUID, safe integers, field nullability, dimen
   const active = readScenario("candidate").snapshot.active_session!;
   expect(validMatch({ ...candidate, object_id: foundObject.id }, active)).toBe(false);
   expect(validMatch({ ...candidate, box: { ...candidate.box, width: candidate.evidence_media.width + 1 } }, active)).toBe(false);
-  expect(validObject({ ...sampleObject, roi: { ...sampleObject.roi, x: 32 } })).toBe(false);
+  expect(validObject({ ...sampleObject, roi: { ...sampleObject.roi, x: sampleObject.reference_media.width } })).toBe(false);
   expect(validSession(sampleSession, foundObject)).toBe(false);
   expect(compatibleProfile({ ...fixtureProfile, heartbeat_deadline_ms: fixtureProfile.heartbeat_interval_ms })).toBe(false);
   expect(compatibleProfile({ ...fixtureProfile, evidence_kind: "Device" })).toBe(false);
@@ -104,8 +107,12 @@ test("keeps page limits, continuations and errors scoped without exposing owner 
   contract("Token", cursor);
   expect(cursor).not.toContain("sample");
   expect(data(await transport.request("GET /objects", { context, query: { limit: 1, cursor } })))
-    .toMatchObject({ items: [{ id: "sample-headphones" }], next_cursor: null });
-  expect(data(await transport.request("GET /objects", { context, query: { limit: 100 } })).items).toHaveLength(2);
+    .toMatchObject({ items: [{ id: "sample-office-keys" }] });
+  const defaultPage = data(await transport.request("GET /objects", { context }));
+  expect(defaultPage.items).toHaveLength(25);
+  expect(data(await transport.request("GET /objects", { context, query: { cursor: defaultPage.next_cursor! } })))
+    .toMatchObject({ items: [{ id: "sample-storage-tag-18" }, { id: "sample-storage-tag-19" }, { id: "sample-storage-tag-20" }], next_cursor: null });
+  expect(data(await transport.request("GET /objects", { context, query: { limit: 100 } })).items).toHaveLength(28);
   await expect(transport.request("GET /objects", { context, query: { limit: 101 } })).resolves.toMatchObject({ status: 422 });
   await expect(transport.request("GET /objects/{id}/sessions", { context, id: "sample-wallet", query: { limit: 1, cursor } }))
     .resolves.toMatchObject({ status: 400, error: { code: "CURSOR_INVALID" } });
@@ -117,11 +124,44 @@ test("keeps page limits, continuations and errors scoped without exposing owner 
   await expect(transport.request("GET /objects/{id}/sessions", { context, id: "sample-wallet" })).resolves.toMatchObject({ status: 410 });
 });
 
+test("matches Unicode names and literal wildcard characters before paging", async () => {
+  const transport = createFixtureTransport();
+  const context = data(await transport.bootstrap());
+  const query = { name: "\u0085STRASSE%_ CAFE\u0301\u2003", status: "Lost", limit: 1 } as const;
+  const first = data(await transport.request("GET /objects", { context, query }));
+  expect(first.items.map(({ id }) => id)).toEqual(["sample-keys-a"]);
+  expect(first.next_cursor).toBeTruthy();
+
+  const second = data(await transport.request("GET /objects", { context, query: {
+    ...query, name: "STRASSE%_ CAFÉ", cursor: first.next_cursor!,
+  } }));
+  expect(second.items.map(({ id }) => id)).toEqual(["sample-keys-Z"]);
+  expect(second.next_cursor).toBeNull();
+  expect(data(await transport.request("GET /objects", { context, query: { name: "%_" } })).items).toHaveLength(2);
+  const name = `\u2003${"🧭".repeat(120)}\u0085`;
+  expect(data(await transport.request("GET /objects", { context, query: { name } })).items).toEqual([]);
+  await expect(transport.request("GET /objects", { context, query: { name: `${name.trim()}🧭` } }))
+    .resolves.toMatchObject({ status: 422 });
+});
+
+test("a valid continuation may be empty after the remaining record expires", async () => {
+  let now = sampleTime + 7 * day - 67 * 3_600_000 - 1;
+  const transport = createFixtureTransport({ now: () => now });
+  const context = data(await transport.bootstrap());
+  const query = { limit: 27 };
+  const first = data(await transport.request("GET /objects", { context, query }));
+  expect(first.items).toHaveLength(27);
+  expect(first.next_cursor).toBeTruthy();
+  now += 1;
+  expect(data(await transport.request("GET /objects", { context, query: { ...query, cursor: first.next_cursor! } })))
+    .toEqual({ items: [], next_cursor: null });
+});
+
 test("checks bootstrap protection headers, channel offers, and workspace heartbeat shape", async () => {
   const transport = createFixtureTransport({ scenario: "controller-ready" });
   const context = data(await transport.bootstrap());
   const registration = { context, actionCreatedAtMs: sampleTime, body: {
-    action_id: actionId, name: sampleObject.name, roi: sampleObject.roi, reference_image: new Blob([sampleImage("image/jpeg")], { type: "image/jpeg" }),
+    action_id: actionId, name: sampleObject.name, roi: sampleSwatchRect, reference_image: new Blob([sampleImage("image/jpeg")], { type: "image/jpeg" }),
   } };
   const headers = protectedHeaders("POST /objects", registration);
   expect(headers.get("X-App-Capability")).toBe(context.capability);
@@ -154,7 +194,7 @@ test("keeps pending, committed and failed mutations distinct from plain validati
   ] as const) {
     const transport = createFixtureTransport({ scenario });
     const context = data(await transport.bootstrap());
-    const fields = { action_id: actionId, name: sampleObject.name, roi: sampleObject.roi };
+    const fields = { action_id: actionId, name: sampleObject.name, roi: sampleSwatchRect };
     contract("RegistrationFields", fields);
     const request = { context, actionCreatedAtMs: sampleTime, body: {
       ...fields, reference_image: new Blob([sampleImage("image/jpeg")], { type: "image/jpeg" }),
@@ -344,7 +384,7 @@ test("isolates fixtures, cancels outstanding reads, and removes subscriptions on
 
   const image = data(await first.media("sample-wallet-reference", { context }));
   expect(image.headers).toMatchObject({ "Cache-Control": "no-store", "Accept-Ranges": "none" });
-  expect(image.bytes).toEqual(sampleImage("image/jpeg"));
+  expect(image.bytes).toEqual(sampleMediaBytes("sample-wallet-reference", "image/jpeg"));
   contract("BootstrapResponse", bootstrapFacts);
 });
 

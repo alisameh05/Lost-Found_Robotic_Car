@@ -88,7 +88,7 @@ function MediaInspector({ runtime, expire, mediaExamples }: {
       </div>
       <ProtectedImage
         key={revision} load={load} label={`Sample image · ${example.label}`}
-        alt="Synthetic geometric swatch" width={160} height={120}
+        alt="Synthetic fixture image" width={160} height={120}
       />
     </>
   );

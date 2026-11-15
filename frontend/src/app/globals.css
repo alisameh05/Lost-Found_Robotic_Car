@@ -334,6 +334,8 @@ summary { cursor: pointer; }
   background: var(--canvas);
 }
 .media-frame img { display: block; max-width: 100%; height: auto; }
+.protected-crop { position: relative; overflow: hidden; width: 100%; }
+.protected-crop img { position: absolute; max-width: none; }
 
 @media (max-width: 44rem) {
   .app-shell { grid-template-columns: 1fr; }

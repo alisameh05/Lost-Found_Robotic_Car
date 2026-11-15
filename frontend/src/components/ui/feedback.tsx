@@ -64,7 +64,9 @@ const feedback = {
   empty: { label: "No data", icon: ArchiveX, tone: "muted" },
   expired: { label: "Record expired", icon: Clock, tone: "warning" },
   missing: { label: "Media missing", icon: FileQuestion, tone: "warning" },
+  "not-found": { label: "Media not found", icon: FileQuestion, tone: "warning" },
   corrupt: { label: "Media corrupt", icon: VideoOff, tone: "danger" },
+  "decode-error": { label: "Image could not be decoded", icon: VideoOff, tone: "danger" },
   unavailable: { label: "Media unavailable", icon: VideoOff, tone: "danger" },
 } as const;
 

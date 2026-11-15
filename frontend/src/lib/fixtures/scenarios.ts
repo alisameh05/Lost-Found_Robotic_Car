@@ -1,6 +1,6 @@
 import type { BootstrapResponse, Error as ApiError, Health, Match, Object as LostObject, Session, Snapshot } from "@/generated/api-v1";
 import {
-  bootstrapFacts, clear, expiredObject, fixtureProfile, foundObject, foundSession, healthFor, notReviewed, paused,
+  bootstrapFacts, clear, expiredObject, fixtureProfile, foundObject, foundSession, healthFor, libraryRecords, notReviewed, paused,
   pending, readiness, recoveryFailure, rejected, sampleObject, sampleSession, searching, snapshot, warning, confirmed,
 } from "./samples";
 
@@ -12,13 +12,13 @@ type Scenario = {
   sessions: readonly Session[];
   matches: readonly Match[];
   snapshotError?: ApiError;
+  recordsRecovery?: boolean;
   emergency: "Committed" | "Pending" | "Failed" | "network";
 };
 
-const records = [sampleObject, foundObject];
 const history = [notReviewed, rejected, confirmed];
 const initial: Scenario = {
-  bootstrap: bootstrapFacts, snapshot, health: healthFor(snapshot, "Ready"), objects: records,
+  bootstrap: bootstrapFacts, snapshot, health: healthFor(snapshot, "Ready"), objects: libraryRecords,
   sessions: [sampleSession, foundSession], matches: history, emergency: "Committed",
 };
 
@@ -72,6 +72,12 @@ const scenarios = {
     }, null, null, false),
   }, { snapshotError: { code: "STORAGE_UNAVAILABLE", message: "Sample storage is unavailable.", retryable: true } }, "Failed"),
   empty: withSnapshot(snapshot, { objects: [], sessions: [], matches: [] }),
+  "records-recovery": withSnapshot(snapshot, {
+    recordsRecovery: true,
+    objects: libraryRecords.map((record) => ["sample-keys-a", "sample-keys-Z", "sample-usb"].includes(record.id)
+      ? { ...record, reference_media: { ...record.reference_media, availability: "Available" } }
+      : record),
+  }),
   "controller-ready": withSnapshot({ ...owned, readiness: readiness(controllerReady, fixtureProfile, null, true) }),
   "gestures-ready": withSnapshot({ ...owned, readiness: readiness(gesturesReady, fixtureProfile, null, true) }),
   candidate: withSnapshot({ ...active(candidateSession), pending_candidate: pending }, {
