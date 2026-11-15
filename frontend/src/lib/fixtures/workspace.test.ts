@@ -131,3 +131,79 @@ test("presents one controlling lease and derives readiness from a scoped, fresh 
   expect(data(await releaseOnce())).toEqual(released);
   replacement.close();
 });
+
+test("scopes Start and subsequent actions to one live lease and expires an abandoned session to Paused", async ({ onTestFinished }) => {
+  vi.useFakeTimers();
+  vi.setSystemTime(sampleTime);
+  const transport = createFixtureTransport({ monotonic: () => Date.now() - sampleTime });
+  onTestFinished(() => { transport.dispose(); vi.useRealTimers(); });
+  const context = data(await transport.bootstrap());
+  const spectator = transport.controls.addClient();
+  const profile = context.qualification_profile!;
+  const eventSocket = data(transport.connectEvents({ context }, await ticket(transport, context, "events"), silent));
+  let frame: WorkspaceHeartbeat["displayed_robot_frame"] = null;
+  data(transport.connectFrames({ context }, "robot", await ticket(transport, context, "robot-video"), {
+    message(value) {
+      const { frame_id, stream_epoch } = parseFrameEnvelope(value, profile, "robot")!.metadata;
+      frame = { frame_id, stream_epoch };
+    },
+    closed() {},
+  }));
+  const lease = data(await transport.request("POST /control-lease", { context,
+    body: { client_id: context.client_id, request_id: crypto.randomUUID(), session_id: null, takeover: false } }));
+  const setup: WorkspaceHeartbeat = { type: "workspace_heartbeat", protocol_version: 1, backend_boot_id: context.backend_boot_id,
+    client_id: context.client_id, client_lease_id: lease.client_lease_id!, session_id: null, control_generation: lease.control_generation,
+    heartbeat_seq: 1, workspace_visible: true, workspace_focused: true, workspace_operational: true, displayed_robot_frame: frame };
+  expect(eventSocket.heartbeat(setup)).toBe(true);
+  const start = { client_id: context.client_id, client_lease_id: lease.client_lease_id!, object_id: "sample-wallet",
+    expected_revision: 1, control_mode: "Gestures", action_id: crypto.randomUUID() } as const;
+  await expect(transport.request("POST /sessions", { context, body: { ...start, expected_revision: 5 } }))
+    .resolves.toMatchObject({ error: { code: "REVISION_CONFLICT" } });
+  const committed = data(await transport.request("POST /sessions", { context, body: start }));
+  const session = committed.result!.session!;
+  const snapshot = async () => data(await transport.snapshot({ context }));
+  const { control_generation } = (await snapshot()).lease;
+  expect(control_generation).toBeGreaterThan(setup.control_generation);
+  await expect(transport.request("POST /sessions", { context, body: start })).resolves.toMatchObject({ data: committed });
+  await expect(transport.request("POST /sessions", { context, body: { ...start, action_id: crypto.randomUUID() } }))
+    .resolves.toMatchObject({ error: { code: "ACTIVE_SESSION_EXISTS" } });
+  expect(eventSocket.heartbeat({ ...setup, heartbeat_seq: 2 })).toBe(false);
+  const current = { ...setup, session_id: session.id, control_generation, heartbeat_seq: 2 };
+  expect(eventSocket.heartbeat(current)).toBe(false);
+  await vi.advanceTimersByTimeAsync(80);
+  expect(eventSocket.heartbeat({ ...current, displayed_robot_frame: frame })).toBe(true);
+
+  const pause = { action: "pause", session_id: session.id, expected_revision: session.revision,
+    client_id: spectator.client_id, client_lease_id: lease.client_lease_id!, action_id: crypto.randomUUID() } as const;
+  await expect(transport.request("POST /sessions/{id}/actions", { id: session.id, context: spectator, body: pause }))
+    .resolves.toMatchObject({ error: { code: "LEASE_REQUIRED" } });
+  transport.controls.input("Gestures", "neutral");
+  transport.controls.input("Gestures", "forward");
+  expect((await snapshot()).runtime.motion_permission).toBe("Armed");
+  const contextPause = { ...pause, client_id: context.client_id, action_id: crypto.randomUUID() };
+  const paused = data(await transport.request("POST /sessions/{id}/actions", { id: session.id, context, body: contextPause })).result!.session!;
+  const pauseGeneration = (await snapshot()).lease.control_generation;
+  expect(pauseGeneration).toBeGreaterThan(control_generation);
+  expect(eventSocket.heartbeat({ ...current, heartbeat_seq: 3, displayed_robot_frame: frame })).toBe(false);
+  await vi.advanceTimersByTimeAsync(80);
+  expect(eventSocket.heartbeat({ ...current, control_generation: pauseGeneration, heartbeat_seq: 3, displayed_robot_frame: frame })).toBe(true);
+  const repeated = data(await transport.request("POST /sessions/{id}/actions", { id: session.id, context, body: {
+    ...contextPause, action_id: crypto.randomUUID(), expected_revision: paused.revision,
+  } })).result!.session;
+  expect(repeated).toEqual(paused);
+  const resumed = data(await transport.request("POST /sessions/{id}/actions", { id: session.id, context, body: {
+    ...contextPause, action: "resume", action_id: crypto.randomUUID(), expected_revision: paused.revision,
+  } })).result!.session;
+  expect(resumed).toMatchObject({ id: session.id, state: "Searching" });
+  const resumeGeneration = (await snapshot()).lease.control_generation;
+  expect(resumeGeneration).toBeGreaterThan(pauseGeneration);
+  expect(eventSocket.heartbeat({ ...current, control_generation: pauseGeneration, heartbeat_seq: 4, displayed_robot_frame: frame })).toBe(false);
+  await vi.advanceTimersByTimeAsync(80);
+  expect(eventSocket.heartbeat({ ...current, control_generation: resumeGeneration, heartbeat_seq: 4, displayed_robot_frame: frame })).toBe(true);
+  transport.controls.input("Gestures", "neutral");
+  transport.controls.input("Gestures", "left");
+  expect((await snapshot()).runtime.motion_permission).toBe("Armed");
+  await vi.advanceTimersByTimeAsync(profile.heartbeat_deadline_ms + 1);
+  expect(await snapshot()).toMatchObject({ active_session: { id: session.id, state: "Paused" },
+    lease: { state: "Unowned" }, runtime: { effective_session_state: "Paused", motion_permission: "Disarmed" } });
+});

@@ -1,4 +1,4 @@
-import type { Channel, FrontendProfile, LeaseAcquire, LeaseRelease, Snapshot } from "@/generated/api-v1";
+import type { Channel, FrontendProfile, LeaseAcquire, LeaseRelease, LeaseResponse, Snapshot, StartRequest } from "@/generated/api-v1";
 import { conforms } from "@/lib/fixture-contracts";
 import { openFrameDisplay } from "@/lib/frame-display";
 import {
@@ -10,6 +10,7 @@ import { projectWorkspaceEvent, validSnapshot } from "./workspace-events";
 export type WorkspaceView = {
   eventsLive: boolean;
   previewLive: boolean;
+  webcamLive: boolean;
   controlling: boolean;
   usable: boolean;
   acquiring: boolean;
@@ -80,25 +81,33 @@ function readChannel<Socket extends ReadSocket>({
 }
 
 export function openWorkspace({
-  transport, context, profile, robot, webcam, serverTime, update, snapshot, recover,
+  transport, context, profile, serverTime, update, snapshot, recover,
 }: {
   transport: ApplicationTransport;
   context: ClientContext;
   profile: FrontendProfile;
-  robot: HTMLCanvasElement;
-  webcam?: HTMLCanvasElement;
   serverTime(): number | undefined;
   update(view: WorkspaceView): void;
   snapshot(value: Snapshot, removedOwner?: string): void;
   recover(): void;
 }) {
-  let view: WorkspaceView = { eventsLive: false, previewLive: false, controlling: false, usable: false, acquiring: false };
+  const robot = document.createElement("canvas");
+  robot.setAttribute("role", "img");
+  robot.setAttribute("aria-label", "Fixture robot camera view");
+  const webcam = document.createElement("canvas");
+  webcam.setAttribute("role", "img");
+  webcam.setAttribute("aria-label", "Fixture laptop webcam view");
+  let view: WorkspaceView = { eventsLive: false, previewLive: false, webcamLive: false, controlling: false, usable: false, acquiring: false };
   let state: Snapshot | undefined;
   let disposed = false;
   let lease: { secret: string; generation: number; session: string | null; sequence: number } | undefined;
   let acquisition: LeaseAcquire | undefined;
   let intent = 0;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let start: Pick<StartRequest, "action_id" | "object_id" | "control_mode"> | undefined;
+  let handoffSession: string | undefined;
+  let waitingForWorkspace = false;
+  let awaitingDraw = false;
 
   function report(changes: Partial<WorkspaceView>) {
     if (disposed || !Object.entries(changes).some(([key, value]) => view[key as keyof WorkspaceView] !== value)) return;
@@ -119,23 +128,32 @@ export function openWorkspace({
     report({ controlling: false });
   }
 
-  function sendRelease(current: NonNullable<typeof lease>) {
+  function sendRelease(current: NonNullable<typeof lease>): Promise<ReadResult<LeaseResponse>> {
     const body: LeaseRelease = { request_id: crypto.randomUUID(), client_id: context.client_id, client_lease_id: current.secret,
       session_id: current.session, control_generation: current.generation };
-    void transport.request("POST /control-lease/release", { body, context }).catch(() => {});
+    return transport.request("POST /control-lease/release", { body, context }).then<ReadResult<LeaseResponse>>((result) => {
+      if (result.kind === "ok" && (!conforms("LeaseResponse", result.data) || result.data.request_id !== body.request_id)) {
+        return { kind: "unavailable" };
+      }
+      return result;
+    }).catch(() => ({ kind: "unavailable" as const }));
   }
 
   function clearControl(message?: string) {
     intent++;
     acquisition = undefined;
+    start = undefined;
+    handoffSession = undefined;
+    waitingForWorkspace = false;
     const hadControl = lease !== undefined;
     forgetLease();
     report({ acquiring: false, retryAcquisition: false, ...(message && hadControl && { message }) });
   }
 
   function release(message?: string) {
-    if (lease) sendRelease(lease);
+    const result = lease ? sendRelease(lease) : undefined;
     clearControl(message);
+    return result;
   }
 
   function matchesAuthority(next: Snapshot, current: NonNullable<typeof lease>) {
@@ -150,6 +168,22 @@ export function openWorkspace({
 
   function apply(next: Snapshot, removedOwner?: string) {
     state = next;
+    const active = next.active_session;
+    const accepted = start && next.operations.find((operation) => operation.action_id === start?.action_id &&
+      operation.persistence === "Committed" && operation.result.session?.id === active?.id);
+    if (lease && lease.session === null && active && accepted && active.object_id === start?.object_id &&
+        active.control_mode === start.control_mode && next.lease.owner_client_id === context.client_id &&
+        next.lease.control_generation >= lease.generation && next.lease.control_generation === next.runtime.control_generation) {
+      lease = { ...lease, session: active.id, generation: next.lease.control_generation };
+      handoffSession = active.id;
+      waitingForWorkspace = true;
+    } else if (lease && active?.id === lease.session && next.lease.owner_client_id === context.client_id &&
+        next.lease.control_generation > lease.generation) {
+      // A consecutive owner snapshot can advance permission scope without transferring the lease.
+      lease = { ...lease, generation: next.lease.control_generation };
+      awaitingDraw = true;
+      robotVideo.forgetPresentation();
+    }
     if (lease && !matchesAuthority(next, lease)) {
       clearControl("Control was released. Acquire control again when available.");
     }
@@ -196,12 +230,17 @@ export function openWorkspace({
         if (surface.width !== image.width) surface.width = image.width;
         if (surface.height !== image.height) surface.height = image.height;
         drawing.drawImage(image, 0, 0);
-        return !drawing.isContextLost();
+        if (drawing.isContextLost()) return false;
+        if (source === "robot" && awaitingDraw && !waitingForWorkspace) {
+          awaitingDraw = false;
+          queueMicrotask(heartbeat);
+        }
+        return true;
       },
       changed(live) {
         if (live) connection.healthy();
-        if (source !== "robot") return;
-        if (!live) release("Control was released when the robot preview stopped updating.");
+        if (source === "webcam") { report({ webcamLive: live }); return; }
+        if (!live && !waitingForWorkspace && !awaitingDraw) release("Control was released when the robot preview stopped updating.");
         report({ previewLive: live });
       },
       epochChanged() { connection.reconnect(); },
@@ -215,6 +254,7 @@ export function openWorkspace({
     });
     return {
       displayed: display.displayedFrame,
+      forgetPresentation: display.reset,
       reset() {
         connection.reconnect();
         display.reset();
@@ -225,11 +265,11 @@ export function openWorkspace({
   }
 
   const robotVideo = video(robot, "robot");
-  const webcamVideo = webcam ? video(webcam, "webcam") : undefined;
+  let webcamVideo: ReturnType<typeof video> | undefined;
 
   function heartbeat() {
     const current = lease;
-    if (!current) return;
+    if (!current || waitingForWorkspace || awaitingDraw) return;
     checkSurface();
     const frame = robotVideo.displayed();
     if (current !== lease) return;
@@ -245,12 +285,22 @@ export function openWorkspace({
   }
 
   function checkSurface() {
+    // Only the disconnected canvas is expected during handoff. Document loss still revokes immediately.
+    if (waitingForWorkspace && navigator.onLine && document.visibilityState === "visible" && document.hasFocus()) return;
     const operational = usable();
     if (!operational && (lease || acquisition)) release("Control was released when the workspace became unavailable.");
     report({ usable: operational });
   }
 
   function lostFocus() {
+    // Report an ineligible owner even if the separate release request is lost.
+    if (lease) events.current()?.heartbeat({
+      type: "workspace_heartbeat", protocol_version: 1, backend_boot_id: context.backend_boot_id,
+      client_id: context.client_id, client_lease_id: lease.secret, session_id: lease.session,
+      control_generation: lease.generation, heartbeat_seq: ++lease.sequence,
+      workspace_visible: document.visibilityState === "visible", workspace_focused: false,
+      workspace_operational: false, displayed_robot_frame: null,
+    });
     release("Control was released when the workspace lost focus.");
     report({ usable: false });
   }
@@ -265,6 +315,7 @@ export function openWorkspace({
   window.addEventListener("offline", lostTransport);
   window.addEventListener("online", checkSurface);
   window.addEventListener("pagehide", lostFocus);
+  window.addEventListener("popstate", lostFocus, true);
   document.addEventListener("visibilitychange", checkSurface);
   robot.addEventListener("contextlost", checkSurface);
   const resize = new ResizeObserver(checkSurface);
@@ -273,6 +324,27 @@ export function openWorkspace({
   update(view);
 
   return {
+    resynchronize: events.reconnect,
+    mount(robotHost: HTMLElement, webcamHost?: HTMLElement, sessionId?: string) {
+      robotHost.append(robot);
+      if (webcamHost) {
+        webcamHost.append(webcam);
+        webcamVideo ??= video(webcam, "webcam");
+      }
+      if (sessionId && sessionId === handoffSession) {
+        handoffSession = undefined;
+        awaitingDraw = true;
+        waitingForWorkspace = false;
+        robotVideo.forgetPresentation();
+      }
+      checkSurface();
+    },
+    canHandOff(sessionId?: string) { return !!handoffSession && (!sessionId || handoffSession === sessionId); },
+    actionScope(session: string | null) {
+      if (lease?.session !== session || !view.controlling || !state || !matchesAuthority(state, lease)) return;
+      return { client_id: context.client_id, client_lease_id: lease.secret };
+    },
+    expectStart(body: StartRequest) { start = body; },
     async acquire() {
       if (!state || disposed || view.acquiring || lease || !view.eventsLive || !view.previewLive || !usable() ||
           (!state.lease.can_acquire && !acquisition)) return;
@@ -333,6 +405,7 @@ export function openWorkspace({
       window.removeEventListener("offline", lostTransport);
       window.removeEventListener("online", checkSurface);
       window.removeEventListener("pagehide", lostFocus);
+      window.removeEventListener("popstate", lostFocus, true);
       document.removeEventListener("visibilitychange", checkSurface);
       robot.removeEventListener("contextlost", checkSurface);
     },

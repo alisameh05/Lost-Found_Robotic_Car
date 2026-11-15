@@ -216,7 +216,8 @@ test("keeps grace evidence and keyboard Emergency Stop available during active i
   await page.getByLabel("Fixture scenario").selectOption("expiry-grace");
   const workspace = page.getByRole("complementary").getByRole("link", { name: "Return to Active Search" });
   await workspace.click();
-  await page.getByRole("link", { name: "Back to Session Details" }).click();
+  await page.getByRole("link", { name: "View Session Details" }).click();
+  await page.getByRole("button", { name: "Leave Paused" }).click();
   await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();
   const view = page.getByRole("main");
   const activeLink = view.getByRole("link", { name: "Return to Active Search" });
@@ -232,10 +233,12 @@ test("keeps grace evidence and keyboard Emergency Stop available during active i
   await activeLink.click();
   await expect(page).toHaveURL(/\/sessions\/sample-grace-search\/live$/);
   await page.getByRole("link", { name: "Dashboard", exact: true }).click();
+  await page.getByRole("button", { name: "Leave Paused" }).click();
   await expect(page.getByText("Fixture mutation requests (1)")).toBeVisible();
   await page.getByLabel("Fixture scenario").selectOption("candidate");
   await workspace.click();
-  await page.getByRole("link", { name: "Back to Session Details" }).click();
+  await page.getByRole("link", { name: "View Session Details" }).click();
+  await page.getByRole("button", { name: "Leave Paused" }).click();
   const pending = page.getByRole("article").filter({ hasText: "Pending" });
   await expect(pending.locator("time")).toHaveCount(1);
   const pendingFrame = pending.getByRole("img", { name: "Captured evidence" });

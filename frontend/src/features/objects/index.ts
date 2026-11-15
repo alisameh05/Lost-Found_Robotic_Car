@@ -3,3 +3,5 @@ export { ObjectDetailsScreen } from "./object-details";
 export { SessionDetailsScreen } from "./session-details";
 export { ObjectStatus, objectHref, RecordAbsent, RecordReadFailure, RecordTime, ReferenceImage, RegisterLink } from "./record-ui";
 export { SessionSummary, sessionHref, useObjectSessions } from "./session-history";
+export { CapturedEvidence } from "./captured-evidence";
+export { HistoryPager } from "./session-history";

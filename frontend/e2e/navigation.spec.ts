@@ -33,8 +33,10 @@ test.describe("fixture preview", () => {
           await expect(page.getByRole("region", { name: "Saved search target" })).toContainText("Black wallet");
         } else if (title === "Settings") {
           await expect(page.getByRole("region", { name: "Saved retention" })).toContainText("7 days");
-        } else if (!["Dashboard", "Objects / History", "Object Details", "Register Object", "Devices", "Control Guide"].includes(title)) {
-          await expect(page.getByText("Phase 01 preview", { exact: true })).toBeVisible();
+        } else if (title === "Search Workspace") {
+          await expect(page.getByText("Search has ended", { exact: true })).toBeVisible();
+        } else if (title === "Search Result") {
+          await expect(page.getByRole("region", { name: "Session summary" })).toContainText("Stopped by operator");
         }
         await expect(page.getByRole("navigation", { name: "Main navigation" }).getByRole("link", { name: section, exact: true }))
           .toHaveAttribute("aria-current", path.startsWith("/sessions") || path.split("/").length > 2 ? "location" : "page");

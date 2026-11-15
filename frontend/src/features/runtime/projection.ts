@@ -2,6 +2,7 @@ import type { EmergencyStopRequest, EmergencyStopResponse, FrontendProfile, Heal
 import { compatibleProfile } from "@/lib/fixture-contracts";
 import type { ApplicationTransport, HttpRequest, ProtectedPath, ProtectedRequest, ReadEndpoint, ReadParams, ReadResult } from "@/lib/transport";
 import { openWorkspace, type WorkspaceView } from "./workspace";
+import { openSearchActions, searchActionKey, type SearchFeedback, type SearchIntent, unresolved } from "./search-actions";
 
 type EmergencyFeedback =
   | { kind: "sending" }
@@ -19,6 +20,7 @@ type RuntimeView = {
   removedOwners?: ReadonlySet<string>;
   profile?: FrontendProfile;
   workspace?: WorkspaceView;
+  searchActions?: Readonly<Record<string, SearchFeedback>>;
 };
 
 export type RegistrationAction = Pick<HttpRequest<"POST /objects">, "body" | "actionCreatedAtMs">;
@@ -32,6 +34,13 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
   let readRequest: AbortController | undefined;
   let uncertainRequest: EmergencyStopRequest | undefined;
   let workspace: ReturnType<typeof openWorkspace> | undefined;
+  let surface: HTMLElement | undefined;
+  let handoffTimer: ReturnType<typeof setTimeout> | undefined;
+  const searchActions = openSearchActions({ transport, signal: lifetime.signal,
+    notify: (feedback) => update({ searchActions: feedback }), refresh: (code) => {
+      if (code === "REVISION_CONFLICT") workspace?.resynchronize();
+      else void refresh();
+    } });
 
   function serverTime() {
     if (clock && !lifetime.signal.aborted) return clock.server + Math.ceil(performance.now() - clock.received);
@@ -80,6 +89,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
           workspace?.dispose();
           workspace = undefined;
         }
+        if (!sameAuthority) searchActions.clear();
         context = bootstrap.data;
         clock = { server: bootstrap.data.server_time_ms, received: bootstrapStarted };
         update({ connected: true, profile: sameProfile ? view.profile : profile,
@@ -93,6 +103,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       ]);
       if (signal.aborted) return;
       const eventsLive = view.workspace?.eventsLive;
+      if (status.kind === "ok") searchActions.reconcile(status.data, request.context);
       update({
         snapshot: eventsLive ? view.snapshot : status.kind === "ok" ? status.data : view.snapshot,
         failedRead: status.kind === "ok" || eventsLive ? undefined : status,
@@ -135,6 +146,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     if (owners?.length) {
       // Immediately suppress data from protected reads that were already in flight.
       update({ removedOwners: new Set([...view.removedOwners ?? [], ...owners]) });
+      searchActions.purge(owners);
     }
     if (refreshQueued) return;
     refreshQueued = true;
@@ -150,30 +162,70 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     refresh,
     emergency,
     serverTime,
-    mountWorkspace(robot: HTMLCanvasElement, webcam?: HTMLCanvasElement) {
+    mountWorkspace(robot: HTMLElement, webcam?: HTMLElement, sessionId?: string) {
       if (!context || !view.profile || lifetime.signal.aborted) return () => {};
-      workspace?.dispose();
-      const active = openWorkspace({
-        transport, context, profile: view.profile, robot, webcam, serverTime,
+      clearTimeout(handoffTimer);
+      const reusable = sessionId && workspace?.canHandOff(sessionId) ? workspace : undefined;
+      if (!reusable) workspace?.dispose();
+      const active = reusable ?? openWorkspace({
+        transport, context, profile: view.profile, serverTime,
         update: (observation) => update({ workspace: observation }),
-        snapshot: (next, removedOwner) => update({ snapshot: next, failedRead: undefined,
-          ...(removedOwner && { removedOwners: new Set([...view.removedOwners ?? [], removedOwner]) }) }),
+        snapshot: (next, removedOwner) => {
+          update({ snapshot: next, failedRead: undefined,
+            ...(removedOwner && { removedOwners: new Set([...view.removedOwners ?? [], removedOwner]) }) });
+          if (removedOwner) searchActions.purge([removedOwner]);
+          if (context) searchActions.reconcile(next, context);
+        },
         recover: () => {
           update({ snapshot: undefined, failedRead: { kind: "unavailable" } });
           void refresh({ readBootstrap: true });
         },
       });
       workspace = active;
-      return () => {
+      surface = robot;
+      active.mount(robot, webcam, sessionId);
+      function unmount() {
+        if (workspace !== active || surface !== robot) return;
         active.dispose();
-        if (workspace !== active) return;
         workspace = undefined;
+        surface = undefined;
         update({ workspace: undefined });
         queueMicrotask(() => { void refresh(); });
+      }
+      return () => {
+        if (surface === robot && active.canHandOff()) {
+          handoffTimer = setTimeout(unmount, view.profile?.heartbeat_deadline_ms ?? 0);
+        } else unmount();
       };
     },
     acquireWorkspace: () => workspace?.acquire(),
     releaseWorkspace: () => workspace?.release(),
+    submitSearch(intent: SearchIntent) {
+      const state = view.snapshot;
+      if (!context || !workspace || !state || !view.workspace?.eventsLive) return;
+      const active = state.active_session;
+      const id = intent.kind === "start" ? intent.object.id : intent.sessionId;
+      const key = searchActionKey(intent.kind, id);
+      if (unresolved(view.searchActions?.[key])) return;
+      const scope = workspace.actionScope(intent.kind === "start" ? null : id);
+      if (!scope) return;
+      if (intent.kind === "start") {
+        if (active || !view.workspace.previewLive || !view.workspace.usable || !state.readiness.can_start[intent.mode] ||
+            intent.object.status !== "Lost" || intent.object.retention_grace ||
+            (serverTime() ?? Infinity) >= intent.object.expires_at_ms) return;
+        const body = { ...scope, action_id: crypto.randomUUID(), object_id: id,
+          expected_revision: intent.object.revision, control_mode: intent.mode };
+        workspace.expectStart(body);
+        return searchActions.submit(key, body, context, id);
+      }
+      if (active?.id !== id || (intent.kind === "resume" && (!state.readiness.can_resume ||
+          !view.workspace.previewLive || !view.workspace.usable))) return;
+      return searchActions.submit(key, { ...scope, action_id: crypto.randomUUID(), session_id: id,
+        expected_revision: active.revision, action: intent.kind }, context, active.object_id);
+    },
+    retrySearch(kind: SearchIntent["kind"], id: string) {
+      if (context) return searchActions.retry(searchActionKey(kind, id), context);
+    },
     async register(action: RegistrationAction, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;
       return transport.request("POST /objects", { ...action, context, signal: AbortSignal.any([signal, lifetime.signal]) });
@@ -201,8 +253,10 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       return transport.media(id, { context, signal: AbortSignal.any([signal, lifetime.signal]) });
     },
     dispose() {
+      clearTimeout(handoffTimer);
       workspace?.dispose();
       lifetime.abort();
+      searchActions.clear();
       unsubscribeRetention?.();
       subscribers.clear();
       transport.dispose();

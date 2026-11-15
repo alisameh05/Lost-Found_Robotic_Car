@@ -16,7 +16,8 @@ export function RuntimeFrame({ children }: { children: ReactNode }) {
   const session = snapshot?.active_session;
   const active = session?.state === "Searching" || session?.state === "Paused";
   const offerEmergency = active || !!health?.active_session_state ||
-    (!!connected && /^\/objects\/[^/]+\/search\/?$/.test(pathname ?? ""));
+    (!!connected && (/^\/objects\/[^/]+\/search\/?$/.test(pathname ?? "") ||
+      /^\/sessions\/[^/]+\/live\/?$/.test(pathname ?? "")));
 
   return (
     <AppShell fixtureEnabled activeSearch={snapshot && active && !failedRead && (
