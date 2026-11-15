@@ -3,11 +3,13 @@
 import { useCallback } from "react";
 import type { LoadImage } from "@/components/media/protected-image";
 import type { Media } from "@/generated/api-v1";
-import { useRuntime } from "./runtime-provider";
+import { useRuntime, useRuntimeView } from "./runtime-provider";
 
 export function useProtectedImage({ id, availability, role }: Media) {
   const runtime = useRuntime()?.connection?.runtime;
+  const { authority } = useRuntimeView();
   return useCallback<LoadImage>(async (signal) => {
+    if (authority === undefined) return { kind: "unavailable" };
     if (availability === "Missing") return { kind: "missing" };
     if (availability === "Corrupt") return { kind: "corrupt" };
     const result = await runtime?.media(id, signal);
@@ -21,5 +23,5 @@ export function useProtectedImage({ id, availability, role }: Media) {
     if (result?.kind === "api-error" && result.status === 404) return { kind: "not-found" };
     return { kind: "unavailable", detail: role === "Evidence"
       ? "The captured evidence could not be retrieved." : "The reference image could not be retrieved." };
-  }, [availability, id, role, runtime]);
+  }, [authority, availability, id, role, runtime]);
 }

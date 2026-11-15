@@ -8,12 +8,14 @@ export type SearchIntent = { kind: "start"; object: ObjectRecord; mode: ControlM
   | { kind: "confirm" | "reject"; sessionId: string; candidateId: string };
 
 export type SearchFeedback = ({ stage: "sending" | "pending" | "unknown" }
+  | { stage: "interrupted"; message: string }
   | { stage: "rejected"; message: string }
   | { stage: "failed"; message: string; retryable: boolean }
   | { stage: "committed"; session: Session | null }) & { candidateId?: string };
 
 type ActionBody = StartRequest | SessionAction;
-type Action = { context: ClientContext; body: ActionBody; objectId: string; feedback: SearchFeedback; timer?: ReturnType<typeof setTimeout> };
+type Action = { context: ClientContext; body: ActionBody; objectId: string; feedback: SearchFeedback;
+  request?: AbortController; timer?: ReturnType<typeof setTimeout> };
 
 export const searchActionKey = (kind: SearchIntent["kind"], id: string) => `${kind}:${id}`;
 export function unresolved(feedback?: SearchFeedback) {
@@ -29,14 +31,24 @@ export function openSearchActions({
   refresh(code?: ApiError["code"]): void;
 }) {
   const actions = new Map<string, Action>();
+  const interrupted = new Map<string, { objectId: string; feedback: SearchFeedback }>();
+  let synchronized = true;
 
   function publish() {
-    notify(Object.fromEntries([...actions].map(([key, { body, feedback }]) =>
-      [key, "candidate_id" in body ? { ...feedback, candidateId: body.candidate_id } : feedback])));
+    notify(Object.fromEntries([
+      ...[...interrupted].map(([key, { feedback }]) => [key, feedback]),
+      ...[...actions].map(([key, { body, feedback }]) =>
+        [key, "candidate_id" in body ? { ...feedback, candidateId: body.candidate_id } : feedback]),
+    ]));
   }
 
   function current(action: Action) {
-    return !signal.aborted && [...actions.values()].includes(action) && unresolved(action.feedback);
+    return synchronized && !signal.aborted && [...actions.values()].includes(action) && unresolved(action.feedback);
+  }
+
+  function cancel(action: Action) {
+    action.request?.abort();
+    clearTimeout(action.timer);
   }
 
   function resultMatches({ body, objectId }: Action, { session, match, object, settings, deletion }: MutationResult) {
@@ -77,7 +89,7 @@ export function openSearchActions({
   }
 
   function reconcile(snapshot: Snapshot, context: ClientContext) {
-    if (snapshot.backend_boot_id !== context.backend_boot_id) return;
+    if (!synchronized || snapshot.backend_boot_id !== context.backend_boot_id) return;
     for (const action of actions.values()) {
       if (!current(action) || !sameContext(action.context, context)) continue;
       const receipt = snapshot.operations.find((operation) => operation.action_id === action.body.action_id && operation.request_id === null);
@@ -90,26 +102,32 @@ export function openSearchActions({
     clearTimeout(action.timer);
     action.timer = setTimeout(async () => {
       if (!current(action)) return;
-      const snapshot = await transport.snapshot({ context: action.context, signal }).catch(() => undefined);
+      const request = action.request;
+      const snapshot = await transport.snapshot({ context: action.context,
+        signal: request ? AbortSignal.any([signal, request.signal]) : signal }).catch(() => undefined);
+      if (!request || request.signal.aborted) return;
       if (snapshot?.kind === "ok" && conforms("Snapshot", snapshot.data)) reconcile(snapshot.data, action.context);
       poll(action, remaining - 1);
     }, 250 * (4 - remaining));
   }
 
   async function send(action: Action) {
-    clearTimeout(action.timer);
+    cancel(action);
+    const request = new AbortController();
+    action.request = request;
+    const delivery = AbortSignal.any([signal, request.signal]);
     action.feedback = { stage: "sending" };
     publish();
     const { body, context } = action;
     let response: ReadResult<MutationResponse>;
     try {
       response = "control_mode" in body
-        ? await transport.request("POST /sessions", { context, signal, body })
-        : await transport.request("POST /sessions/{id}/actions", { context, signal, id: body.session_id, body });
+        ? await transport.request("POST /sessions", { context, signal: delivery, body })
+        : await transport.request("POST /sessions/{id}/actions", { context, signal: delivery, id: body.session_id, body });
     } catch {
       response = { kind: "unavailable" };
     }
-    if (!current(action)) return; // An ordered event may already have resolved this action.
+    if (delivery.aborted || !current(action)) return;
     if (response.kind === "api-error") {
       action.feedback = { stage: "rejected", message: `${response.error.code} · ${response.error.message}` };
       publish();
@@ -126,28 +144,52 @@ export function openSearchActions({
 
   return {
     reconcile,
+    synchronize(snapshot: Snapshot, context: ClientContext) {
+      synchronized = true;
+      reconcile(snapshot, context);
+    },
+    suspend() {
+      synchronized = false;
+      for (const action of actions.values()) {
+        cancel(action);
+        if (unresolved(action.feedback)) action.feedback = { stage: "unknown" };
+      }
+      publish();
+    },
+    changeAuthority() {
+      for (const [key, action] of actions) {
+        cancel(action);
+        if (unresolved(action.feedback)) interrupted.set(key, { objectId: action.objectId,
+          feedback: { stage: "interrupted", message: "The service changed before this action could be confirmed. Check the current saved records." } });
+      }
+      actions.clear();
+      publish();
+    },
     submit(key: string, body: ActionBody, context: ClientContext, objectId: string) {
-      if (unresolved(actions.get(key)?.feedback)) return;
+      if (!synchronized || unresolved(actions.get(key)?.feedback)) return;
+      interrupted.delete(key);
       const action: Action = { body, context, objectId, feedback: { stage: "sending" } };
       actions.set(key, action);
       return send(action);
     },
     retry(key: string, context: ClientContext) {
       const action = actions.get(key);
-      if (action && sameContext(action.context, context) &&
+      if (synchronized && action && sameContext(action.context, context) &&
           (action.feedback.stage === "unknown" || action.feedback.stage === "pending" ||
             (action.feedback.stage === "failed" && action.feedback.retryable))) return send(action);
     },
     clear() {
-      for (const action of actions.values()) clearTimeout(action.timer);
+      for (const action of actions.values()) cancel(action);
       actions.clear();
+      interrupted.clear();
       publish();
     },
     purge(owners: readonly string[]) {
+      for (const [key, action] of interrupted) if (owners.includes(action.objectId)) interrupted.delete(key);
       for (const [key, action] of actions) {
         if (!owners.includes(action.objectId) || (unresolved(action.feedback) &&
             "action" in action.body && (action.body.action === "stop" || action.body.action === "confirm"))) continue;
-        clearTimeout(action.timer);
+        cancel(action);
         actions.delete(key);
       }
       publish();

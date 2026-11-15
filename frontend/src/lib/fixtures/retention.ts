@@ -22,7 +22,7 @@ export function openRetention({ now, initial, active, healthy, impactFor, collec
   impactFor: (days: number, time: number) => Impact;
   collectExpired: (settings: Settings, time: number) => { id: string; files: number }[];
   purge: (owners: ReadonlyMap<string, number>) => void;
-  invalidate: (owners?: string[]) => void;
+  invalidate: (owners?: string[], operation?: Operation) => void;
   manualCleanup: boolean;
 }) {
   const previews = new Map<string, { value: RetentionPreview; signature: string }>();
@@ -105,7 +105,7 @@ export function openRetention({ now, initial, active, healthy, impactFor, collec
     sweep(time);
     const response = remember(body, mutation(body.action_id, "Committed", { ...emptyResult, settings, deletion }));
     previews.delete(body.preview_id);
-    invalidate();
+    invalidate(undefined, { ...response.data, request_id: null });
     return response;
   }
 
@@ -141,7 +141,7 @@ export function openRetention({ now, initial, active, healthy, impactFor, collec
       holdSave = false;
       pending = body;
       const response = remember(body, mutation(body.action_id, "Pending", emptyResult));
-      invalidate();
+      invalidate(undefined, { ...response.data, request_id: null });
       return response;
     }
     return save(body, time);
@@ -149,6 +149,15 @@ export function openRetention({ now, initial, active, healthy, impactFor, collec
 
   return {
     preview, apply, sweep, finishCleanup,
+    restart() {
+      previews.clear();
+      completions.clear();
+      reportedFailures.clear();
+      if (pending) receipts.delete(pending.action_id);
+      pending = undefined;
+      holdSave = false;
+      lostResponse = undefined;
+    },
     read: () => ({ settings, deletion }),
     nextCleanup: () => cleanupDue,
     isSavePending: () => pending !== undefined,
@@ -175,7 +184,7 @@ export function openRetention({ now, initial, active, healthy, impactFor, collec
         if (control === "Lose response") lostResponse = body.action_id;
         return;
       }
-      invalidate();
+      invalidate(undefined, { ...receipts.get(body.action_id)!.response.data, request_id: null });
     },
     takeLostResponse(id: string) {
       if (lostResponse !== id) return false;

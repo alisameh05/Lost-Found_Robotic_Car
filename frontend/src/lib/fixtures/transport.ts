@@ -20,7 +20,7 @@ import { expiredObject, healthFor, leaseId, paused, sampleObject, sampleSession,
 import { readScenario, type ScenarioId } from "./scenarios";
 import { expiryFor, openRetention, unavailableStorage } from "./retention";
 import { fixtureOk as ok, fixtureError as error } from "./responses";
-import { openSocketTickets } from "./socket-tickets";
+import { openSocketTickets, runtimeToken } from "./socket-tickets";
 import { openFixtureWorkspace, type FrameMode } from "./workspace";
 import { committedSearch, openSearchSaves, type SearchDelivery } from "./search-saves";
 import { capturePng } from "./capture-png";
@@ -46,7 +46,7 @@ const conflict = error(409, "REVISION_CONFLICT", "Sample revision has changed.")
 type OrdinaryAction = Extract<SessionAction, { action: "pause" | "resume" | "stop" }>;
 type ReviewAction = Extract<SessionAction, { action: "confirm" | "reject" }>;
 type AcknowledgeAction = Extract<SessionAction, { action: "acknowledge" }>;
-type CandidateObservation = "visible" | "exit" | "uncertain" | "unprepared" | "mismatched" | "stale" | "corrupt-media" | "missing-media";
+type CandidateObservation = "visible" | "exit" | "uncertain" | "unprepared" | "mismatched" | "stale" | "corrupt-media" | "missing-media" | "deferred";
 type SearchInput = "neutral" | "invalid" | "forward" | "backward" | "left" | "right";
 const searchBusy = error(503, "CAPACITY_REACHED", "A sample search action is still saving.");
 const evidenceUnavailable = error(503, "MEDIA_UNAVAILABLE", "The captured evidence is unavailable.");
@@ -71,22 +71,29 @@ export function createFixtureTransport({
     return latestTime;
   }
   const scene = readScenario(scenario);
-  const { bootstrap } = scene;
+  let { bootstrap } = scene;
   let { snapshot } = scene;
+  let bootLifetime = new AbortController();
+  let starting = false;
+  let startupTimer: ReturnType<typeof setTimeout> | undefined;
   const clients = new Set([bootstrap.client_id]);
   let { objects, sessions, matches } = scene;
   const captures = new Map<string, { bytes: Uint8Array; readFault?: "corrupt-media" | "missing-media" }>();
   const endedFailureOwners = new Map<string, { sessionId: string; objectId: string }>();
   let suppressedSession: string | undefined;
   let preparingEvidence: Session | undefined;
+  let deliverCapture: (() => void) | undefined;
+  let holdSearchResponse = false;
+  let deliverSearchResponse: (() => void) | undefined;
   let snapshotError = scene.snapshotError;
   const lifetime = new AbortController();
   const pages = fixturePages();
   const retentionListeners = new Set<(owners?: readonly string[]) => void>();
   let retentionTimer: ReturnType<typeof setTimeout> | undefined;
   const healthy = () => scene.health.storage_integrity === "Healthy";
-  const searchSaves = openSearchSaves(() => workspace.publish());
-  const proximity = openFixtureProximity(snapshot.proximity, now, monotonic, () => workspace.publishProximity());
+  const searchSaves = openSearchSaves((operation) =>
+    workspace.publishSearchSave(operation?.result?.session ?? snapshot.active_session, operation));
+  let proximity = openFixtureProximity(snapshot.proximity, now, monotonic, () => workspace.publishProximity());
   const emergencyOperations = new Map<string, Operation>();
   const emergencyReceipts = new Map<string, { fingerprint: string; response: ReturnType<typeof emergencyResponse> }>();
   let emergencyDelivery: SearchDelivery | undefined;
@@ -95,7 +102,7 @@ export function createFixtureTransport({
   let neutralObserved = false;
   let dropRelease = false;
   const registrations = openRegistrations({
-    now, signal: lifetime.signal, getSnapshot: () => ({ ...snapshot, retention: { ...snapshot.retention, ...retention.read() } }), healthy: healthy(),
+    now, bootSignal: signalFor, getSnapshot: () => ({ ...snapshot, retention: { ...snapshot.retention, ...retention.read() } }), healthy: healthy(),
     isExcluded: (id): boolean => retention.excluded(id),
     clockHealthy: () => { now(); return !clockReversed; },
     normalize: normalizeRegistration, recovery: scenario === "registration-recovery", scripted: scriptedRegistration,
@@ -169,29 +176,32 @@ export function createFixtureTransport({
   };
   const profile = compatibleProfile(snapshot.qualification_profile) ? snapshot.qualification_profile : null;
   const tickets = openSocketTickets(monotonic, now);
-  const workspace = openFixtureWorkspace({
-    boot: bootstrap.backend_boot_id, profile, now, monotonic, read: snapshotRead, frameMode: scene.frameMode,
-    available: (source) => snapshot.readiness.components.some(({ component, status }) =>
-      component === (source === "robot" ? "RobotVideo" : "Webcam") && status === "Ready"),
-    setLease(lease, cause) {
-      resetInput();
-      snapshot = { ...snapshot, lease, runtime: { ...snapshot.runtime, control_generation: lease.control_generation } };
-      if (lease.state === "Owned") return;
-      if (cause) {
-        const failure = pauseForFailure(cause);
-        if (failure) persistFailurePause(failure);
-      } else if (snapshot.runtime.effective_session_state === "Searching") {
-        pauseEffectively();
-        const session = snapshot.active_session;
-        if (session && session.state !== "Ended" && !storageBlocked()) installSession({ ...session, state: "Paused", revision: session.revision + 1,
-          pause_causes: [{ cause: "ManualPause", failure_id: null }] });
-      }
-    },
-    restoreWorkspace: () => restoreFailures((cause) => (workspaceFailures.has(cause) || (cause === "EmergencyStop" &&
-      snapshot.failures.filter((failure) => failure.cause === cause && !failure.restored).every((failure) =>
-        snapshot.active_session?.pause_causes.some(({ failure_id }) => failure_id === failure.failure_id)))) &&
-      (cause !== "RobotVideoUnavailable" || pathReady("RobotVideo"))),
-  });
+  let workspace = createWorkspace(scene.frameMode);
+  function createWorkspace(frameMode?: FrameMode) {
+    return openFixtureWorkspace({
+      boot: bootstrap.backend_boot_id, profile, now, monotonic, read: snapshotRead, frameMode,
+      available: (source) => snapshot.readiness.components.some(({ component, status }) =>
+        component === (source === "robot" ? "RobotVideo" : "Webcam") && status === "Ready"),
+      setLease(lease, cause) {
+        resetInput();
+        snapshot = { ...snapshot, lease, runtime: { ...snapshot.runtime, control_generation: lease.control_generation } };
+        if (lease.state === "Owned") return;
+        if (cause) {
+          const failure = pauseForFailure(cause);
+          if (failure) persistFailurePause(failure);
+        } else if (snapshot.runtime.effective_session_state === "Searching") {
+          pauseEffectively();
+          const session = snapshot.active_session;
+          if (session && session.state !== "Ended" && !storageBlocked()) installSession({ ...session, state: "Paused", revision: session.revision + 1,
+            pause_causes: [{ cause: "ManualPause", failure_id: null }] });
+        }
+      },
+      restoreWorkspace: () => restoreFailures((cause) => (workspaceFailures.has(cause) || (cause === "EmergencyStop" &&
+        snapshot.failures.filter((failure) => failure.cause === cause && !failure.restored).every((failure) =>
+          snapshot.active_session?.pause_causes.some(({ failure_id }) => failure_id === failure.failure_id)))) &&
+        (cause !== "RobotVideoUnavailable" || pathReady("RobotVideo"))),
+    });
+  }
   let failList = scene.recordsRecovery;
   let failDetail = scene.recordsRecovery;
   let expireContinuation = scene.recordsRecovery;
@@ -203,7 +213,7 @@ export function createFixtureTransport({
   let invalidateMatchCursor = scene.historyRecovery;
 
   function signalFor(signal?: AbortSignal) {
-    return signal ? AbortSignal.any([signal, lifetime.signal]) : lifetime.signal;
+    return AbortSignal.any(signal ? [signal, lifetime.signal, bootLifetime.signal] : [lifetime.signal, bootLifetime.signal]);
   }
 
   function authorize({ context }: ProtectedRequest, clientRequired = true) {
@@ -211,12 +221,14 @@ export function createFixtureTransport({
       (!clientRequired || clients.has(context.client_id));
   }
 
-  async function respond<T>(request: ProtectedRequest, makeResult: () => ReadResult<T> | Promise<ReadResult<T>>, clientRequired = true) {
+  async function respond<T>(request: ProtectedRequest, makeResult: () => ReadResult<T> | Promise<ReadResult<T>>, clientRequired = true,
+    diagnostic = false) {
     const signal = signalFor(request.signal);
     signal.throwIfAborted();
     await Promise.resolve();
     signal.throwIfAborted();
     if (!authorize(request, clientRequired)) return error(403, "CAPABILITY_INVALID", "Invalid sample request context.");
+    if (starting && !diagnostic) return error(503, "NOT_READY", "Sample service is reconciling saved records.");
     retention.sweep();
     const result = await makeResult();
     scheduleRetention();
@@ -231,9 +243,10 @@ export function createFixtureTransport({
     return session?.object_id === id && (session.state === "Searching" || session.state === "Paused");
   }
 
-  function invalidate(owners?: string[]) {
+  function invalidate(owners?: string[], operation?: Operation) {
     for (const owner of owners ?? []) searchSaves.purge(owner);
-    workspace.publish();
+    if (operation) workspace.publishRetention(operation);
+    else workspace.publish();
     for (const owner of owners ?? []) workspace.publishRemoval(owner);
     for (const listener of retentionListeners) listener(owners);
   }
@@ -351,6 +364,7 @@ export function createFixtureTransport({
   }
 
   function observePath(path: RequiredPath, ready: boolean) {
+    const generation = snapshot.runtime.control_generation;
     const components = structuredClone(snapshot.readiness.components);
     const component = components.find(({ component }) => component === path);
     if (!component) return;
@@ -379,7 +393,8 @@ export function createFixtureTransport({
       else if (wasSearching && previouslyReady) advanceGeneration();
       if (failure) persistFailurePause(failure);
     }
-    workspace.publish();
+    if (generation !== snapshot.runtime.control_generation) workspace.publish();
+    else workspace.publishRecovery(snapshot.active_session, path === "Storage" && !ready);
   }
 
   function acknowledge(body: AcknowledgeAction, client: string) {
@@ -587,6 +602,7 @@ export function createFixtureTransport({
   }
 
   async function observeCandidate(observation: CandidateObservation) {
+    const boot = bootLifetime.signal;
     workspace.checkDeadline();
     const active = snapshot.active_session;
     if (!active) return;
@@ -614,7 +630,10 @@ export function createFixtureTransport({
     advanceGeneration();
     const generation = snapshot.runtime.control_generation;
     workspace.publish();
+    if (observation === "deferred") await new Promise<void>((resolve) => { deliverCapture = resolve; });
+    if (boot.aborted) return;
     const bytes = await capturePng(capture.bytes, metadata).catch(() => undefined);
+    if (boot.aborted) return;
     if (preparingEvidence === paused) preparingEvidence = undefined;
     if (lifetime.signal.aborted) return;
     workspace.checkDeadline();
@@ -641,7 +660,7 @@ export function createFixtureTransport({
     matches = [...matches, match];
     saveSession(session);
     snapshot = review;
-    workspace.publish("snapshot", match);
+    workspace.publishCandidate(session, match);
   }
 
   function retentionImpact(days: number, time: number) {
@@ -660,8 +679,17 @@ export function createFixtureTransport({
 
   const handlers: { [Route in Endpoint]: (input: FixtureRequest) => ReadResult<HttpResponses[Route]> | Promise<ReadResult<HttpResponses[Route]>> } = {
     "GET /health": () => {
-      const initialization = retention.read().deletion.status === "Failed" ? "Failed" : scene.health.initialization;
-      return ok(healthFor({ ...snapshot, readiness: readinessRead() }, initialization), initialization === "Ready" ? 200 : 503);
+      const initialization = starting ? "Starting" : retention.read().deletion.status === "Failed" ? "Failed" : scene.health.initialization;
+      const readiness = readinessRead();
+      if (starting) {
+        for (const component of readiness.components) {
+          if (component.component === "Backend" || component.component === "Storage") {
+            component.status = "Initializing";
+            component.cause_codes = ["NOT_READY"];
+          }
+        }
+      }
+      return ok(healthFor({ ...snapshot, readiness }, initialization), initialization === "Ready" ? 200 : 503);
     },
     "GET /snapshot": ({ context }) => {
       const error = snapshotError;
@@ -845,7 +873,7 @@ export function createFixtureTransport({
     if (!active) return;
     const ended: Session = { ...active, state: "Ended", end_reason, ended_at_ms: endedAt, revision: active.revision + 1, pause_causes: [] };
     const candidate = snapshot.pending_candidate;
-    const match: Match | null = end_reason === "Stopped" && candidate
+    const match: Match | null = end_reason !== "Confirmed" && candidate
       ? { ...candidate, disposition: "NotReviewed", reviewed_at_ms: null } : null;
     if (match) matches = matches.map((item) => item.id === match.id ? match : item);
     suppressedSession = undefined;
@@ -873,6 +901,56 @@ export function createFixtureTransport({
     return { session: ended, match };
   }
 
+  function restart() {
+    if (starting || lifetime.signal.aborted) return;
+    starting = true;
+    const backend_boot_id = crypto.randomUUID();
+    const client_id = crypto.randomUUID();
+    bootstrap = { ...bootstrap, backend_boot_id, client_id, capability: runtimeToken() };
+    clients.clear();
+    clients.add(client_id);
+    tickets.clear();
+    pages.clear();
+    workspace.dispose();
+    bootLifetime.abort();
+    bootLifetime = new AbortController();
+    workspace = createWorkspace();
+    proximity.dispose();
+    proximity = openFixtureProximity({ state: "Unknown", warning_latched: false, distance_mm: null,
+      source_epoch: null, sample_seq: null, observed_at_ms: null }, now, monotonic, () => workspace.publishProximity());
+    searchSaves.restart();
+    registrations.restart();
+    retention.restart();
+    emergencyReceipts.clear();
+    emergencyOperations.clear();
+    pendingEmergency = undefined;
+    emergencyDelivery = undefined;
+    dropRelease = false;
+    holdSearchResponse = false;
+    preparingEvidence = undefined;
+    snapshot = { ...snapshot, backend_boot_id, operations: [] };
+    endFixtureSearch("Interrupted");
+    resetInput();
+    snapshot = { ...snapshot, failures: [], readiness: scene.snapshot.readiness,
+      lease: { state: "Unowned", owner_client_id: null, can_acquire: false, control_generation: 1 },
+      runtime: { effective_session_state: null, motion_permission: "Disarmed", persistence_pending: false, control_generation: 1 } };
+    for (const listener of retentionListeners) listener();
+    startupTimer = setTimeout(() => {
+      starting = false;
+      deliverHeldObservations();
+      retention.sweep();
+      scheduleRetention();
+      for (const listener of retentionListeners) listener();
+    }, 250);
+  }
+
+  function deliverHeldObservations() {
+    deliverCapture?.();
+    deliverSearchResponse?.();
+    deliverCapture = undefined;
+    deliverSearchResponse = undefined;
+  }
+
   return {
     controls: {
       clockChanged() { retention.sweep(); scheduleRetention(); invalidate(); },
@@ -888,7 +966,10 @@ export function createFixtureTransport({
       },
       changeFrames(mode: FrameMode) { workspace.changeFrames(mode); },
       disconnectEvents() { workspace.disconnectEvents(bootstrap.client_id); },
+      injectGap() { workspace.injectGap(bootstrap.client_id); },
+      restart,
       scriptSearch(delivery: SearchDelivery) { searchSaves.script(delivery); },
+      holdNextSearchResponse() { if (!deliverSearchResponse) holdSearchResponse = true; },
       observeCandidate,
       observePath,
       observeProximity: proximity.observe,
@@ -947,8 +1028,11 @@ export function createFixtureTransport({
         if (!route.startsWith("GET ") && route !== "POST /websocket-tickets") {
           observeMutation?.(route, "body" in request ? request.body : undefined);
         }
-        return handlers[route](request);
-      }, route !== "POST /emergency-stop");
+        const response = handlers[route](request);
+        if (route !== "POST /sessions/{id}/actions" || !holdSearchResponse) return response;
+        holdSearchResponse = false;
+        return new Promise<void>((resolve) => { deliverSearchResponse = resolve; }).then(() => response);
+      }, route !== "POST /emergency-stop", route === "GET /health" || route === "POST /emergency-stop");
     },
     get<Path extends ProtectedPath>(path: Path, request: ProtectedRequest & { id?: string }): Promise<ReadResult<HttpResponses[`GET ${Path}`]>> {
       return respond(request, () => handlers[`GET ${path}`](request));
@@ -957,11 +1041,12 @@ export function createFixtureTransport({
     emergency: (body: EmergencyStopRequest, request: ProtectedRequest) => respond(request, () => {
       observeMutation?.("POST /emergency-stop", body);
       return handlers["POST /emergency-stop"]({ ...request, body });
-    }, false),
+    }, false, true),
     connectEvents(request: ProtectedRequest, offer: SocketOffer, observer: SocketObserver<EventEnvelope>) {
       const signal = signalFor(request.signal);
       if (signal.aborted) return { kind: "unavailable" } as const;
       if (!authorize(request)) return error(403, "TICKET_INVALID", "The channel ticket is invalid.");
+      if (starting) return error(503, "NOT_READY", "Sample service is reconciling saved records.");
       if (!profile) return error(503, "NOT_READY", "Sample profile is unavailable.");
       const redemption = tickets.redeem(request.context, "events", offer);
       if (redemption.kind !== "ok") return redemption;
@@ -973,6 +1058,7 @@ export function createFixtureTransport({
       const signal = signalFor(request.signal);
       if (signal.aborted) return { kind: "unavailable" } as const;
       if (!authorize(request)) return error(403, "TICKET_INVALID", "The channel ticket is invalid.");
+      if (starting) return error(503, "NOT_READY", "Sample service is reconciling saved records.");
       if (!profile) return error(503, "NOT_READY", "Sample profile is unavailable.");
       const redemption = tickets.redeem(request.context, source === "robot" ? "robot-video" : "webcam-video", offer);
       return redemption.kind !== "ok" ? redemption : ok(workspace.connectVideo(request.context.client_id, source, observer, signal));
@@ -1008,6 +1094,9 @@ export function createFixtureTransport({
     dispose() {
       proximity.dispose();
       workspace.dispose();
+      clearTimeout(startupTimer);
+      deliverHeldObservations();
+      bootLifetime.abort();
       tickets.clear();
       lifetime.abort();
       clearTimeout(retentionTimer);

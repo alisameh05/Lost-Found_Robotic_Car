@@ -14,9 +14,14 @@ export type WorkspaceView = {
   controlling: boolean;
   usable: boolean;
   acquiring: boolean;
+  resynchronizing?: boolean;
   retryAcquisition?: boolean;
   message?: string;
 };
+
+export function reconnectDelay(backoff: number) {
+  return Math.min(5_000, Math.round(backoff * (1 + Math.random() * 0.2)));
+}
 
 function readChannel<Socket extends ReadSocket>({
   transport, context, channel, connect, lost,
@@ -46,7 +51,7 @@ function readChannel<Socket extends ReadSocket>({
     disconnect();
     lost();
     if (disposed) return;
-    timer = setTimeout(open, Math.min(5_000, Math.round(backoff * (0.8 + Math.random() * 0.4))));
+    timer = setTimeout(open, reconnectDelay(backoff));
     backoff = Math.min(5_000, backoff * 2);
   }
 
@@ -99,8 +104,10 @@ export function openWorkspace({
   webcam.setAttribute("aria-label", "Fixture laptop webcam view");
   let view: WorkspaceView = { eventsLive: false, previewLive: false, webcamLive: false, controlling: false, usable: false, acquiring: false };
   let state: Snapshot | undefined;
+  let previousState: Snapshot | undefined;
   let disposed = false;
   let lease: { secret: string; generation: number; session: string | null; sequence: number } | undefined;
+  let offeredLease: { lease: NonNullable<typeof lease>; watermark: number } | undefined;
   let acquisition: LeaseAcquire | undefined;
   let intent = 0;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
@@ -129,10 +136,12 @@ export function openWorkspace({
   }
 
   function sendRelease(current: NonNullable<typeof lease>): Promise<ReadResult<LeaseResponse>> {
+    const channel = events.current();
     const body: LeaseRelease = { request_id: crypto.randomUUID(), client_id: context.client_id, client_lease_id: current.secret,
       session_id: current.session, control_generation: current.generation };
     return transport.request("POST /control-lease/release", { body, context }).then<ReadResult<LeaseResponse>>((result) => {
-      if (result.kind === "ok" && (!conforms("LeaseResponse", result.data) || result.data.request_id !== body.request_id)) {
+      if (disposed || !channel || events.current() !== channel ||
+          (result.kind === "ok" && (!conforms("LeaseResponse", result.data) || result.data.request_id !== body.request_id))) {
         return { kind: "unavailable" };
       }
       return result;
@@ -142,6 +151,7 @@ export function openWorkspace({
   function clearControl(message?: string) {
     intent++;
     acquisition = undefined;
+    offeredLease = undefined;
     start = undefined;
     handoffSession = undefined;
     waitingForWorkspace = false;
@@ -188,12 +198,29 @@ export function openWorkspace({
       clearControl("Control was released. Acquire control again when available.");
     }
     snapshot(next, removedOwner);
+    if (offeredLease && next.event_seq >= offeredLease.watermark) {
+      const offered = offeredLease.lease;
+      offeredLease = undefined;
+      if (matchesAuthority(next, offered) && view.previewLive && usable()) installLease(offered);
+      else {
+        if (matchesAuthority(next, offered)) void sendRelease(offered);
+        clearControl();
+      }
+    }
+  }
+
+  function installLease(current: NonNullable<typeof lease>) {
+    lease = current;
+    report({ controlling: true, acquiring: false });
+    heartbeatTimer = setInterval(heartbeat, profile.heartbeat_interval_ms);
+    heartbeat();
   }
 
   function invalidate() {
+    previousState = state ?? previousState;
     state = undefined;
-    release("Control was released when search readiness disconnected.");
-    report({ eventsLive: false });
+    clearControl();
+    report({ eventsLive: false, resynchronizing: true, message: "Search events disconnected. Resynchronizing with the service." });
     robotVideo.reset();
     webcamVideo?.reset();
     recover();
@@ -205,15 +232,16 @@ export function openWorkspace({
       closed,
       message(event) {
         if (disposed || request.signal?.aborted) return;
-        const next = projectWorkspaceEvent(state, event, context.backend_boot_id);
+        const next = projectWorkspaceEvent(state ?? previousState, event, context.backend_boot_id, !state);
         if (!next || !matchesProfile(next)) {
           events.reconnect();
           return;
         }
         if (next === state) return;
+        previousState = undefined;
         events.healthy();
-        report({ eventsLive: true });
         apply(next, event.type === "object_removed" ? event.payload.object_id : undefined);
+        report({ eventsLive: true, resynchronizing: false, ...(view.resynchronizing && { message: undefined }) });
       },
     }),
   });
@@ -365,7 +393,7 @@ export function openWorkspace({
             result.data.client_lease_id && validSnapshot(result.data.snapshot, context.backend_boot_id) && matchesProfile(result.data.snapshot)) {
           const response = result.data;
           const acquired = { secret: result.data.client_lease_id, generation: response.control_generation, session: body.session_id, sequence: 0 };
-          const fresh = state && state.event_seq > response.snapshot.event_seq ? state : response.snapshot;
+          const fresh = state && state.event_seq >= response.snapshot.event_seq ? state : response.snapshot;
           if (!matchesAuthority(fresh, acquired)) {
             if (attempt === intent) acquisition = undefined;
             return;
@@ -376,11 +404,8 @@ export function openWorkspace({
             return;
           }
           acquisition = undefined;
-          lease = acquired;
-          apply(fresh);
-          report({ controlling: true });
-          heartbeatTimer = setInterval(heartbeat, profile.heartbeat_interval_ms);
-          heartbeat();
+          if (state && state.event_seq >= response.snapshot.event_seq) installLease(acquired);
+          else offeredLease = { lease: acquired, watermark: response.snapshot.event_seq };
         } else if (attempt === intent && result.kind !== "unavailable") {
           acquisition = undefined;
           report({ message: "Control could not be acquired. Check the current ownership and try again." });
@@ -390,7 +415,7 @@ export function openWorkspace({
       } catch {
         if (attempt === intent) report({ retryAcquisition: true, message: "Acquisition was unconfirmed. Select Acquire control to retry." });
       } finally {
-        if (attempt === intent) report({ acquiring: false });
+        if (attempt === intent && !offeredLease) report({ acquiring: false });
       }
     },
     release,

@@ -36,6 +36,9 @@ export function InputControls({ mode, disabled }: { mode: ControlMode; disabled:
       <Button onClick={() => fixture.search.changeFrames("frozen")}>Freeze robot frames</Button>
       <Button onClick={() => fixture.search.changeFrames("live")}>Send fresh frames</Button>
       <Button onClick={fixture.search.disconnectEvents}>Disconnect search events</Button>
+      <Button onClick={fixture.search.injectGap}>Inject event sequence gap</Button>
+      <Button onClick={fixture.search.restart}>Restart fixture service</Button>
+      <Button onClick={fixture.search.holdNextSearchResponse}>Hold next search action response until restart</Button>
       <Button onClick={fixture.search.dropNextRelease}>Drop next lease release</Button>
     </div>
     <div className="control-row" aria-label="Fixture recovery observations">
@@ -60,6 +63,7 @@ export function InputControls({ mode, disabled }: { mode: ControlMode; disabled:
       <Button onClick={() => fixture.search.observeCandidate("uncertain")}>Mark sample continuity uncertain</Button>
       <Button onClick={() => fixture.search.observeCandidate("exit")}>Observe sample candidate exit</Button>
       <Button disabled={disabled} onClick={() => fixture.search.observeCandidate("unprepared")}>Try unprepared sample candidate</Button>
+      <Button disabled={disabled} onClick={() => fixture.search.observeCandidate("deferred")}>Hold sample evidence preparation</Button>
       <Button disabled={disabled} onClick={() => fixture.search.observeCandidate("missing-media")}>Show sample with missing evidence</Button>
       <Button disabled={disabled} onClick={() => fixture.search.observeCandidate("corrupt-media")}>Show sample with corrupt evidence</Button>
     </div>

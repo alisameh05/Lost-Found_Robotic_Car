@@ -21,9 +21,9 @@ function reject(status: number, code: ApiError["code"], message: string, path?: 
     ...(path ? { field_errors: [{ path, code: status === 413 ? "OUT_OF_RANGE" : "INVALID_VALUE", message }] } : {}) } };
 }
 
-export function openRegistrations({ now, signal, getSnapshot, healthy, isExcluded, clockHealthy, normalize = normalizeReference, recovery, scripted }: {
+export function openRegistrations({ now, bootSignal, getSnapshot, healthy, isExcluded, clockHealthy, normalize = normalizeReference, recovery, scripted }: {
   now: () => number;
-  signal: AbortSignal;
+  bootSignal: () => AbortSignal;
   getSnapshot: () => Snapshot;
   healthy: boolean;
   isExcluded: (owner: string) => boolean;
@@ -51,6 +51,7 @@ export function openRegistrations({ now, signal, getSnapshot, healthy, isExclude
   }
 
   async function submit({ body, actionCreatedAtMs }: RegistrationRequest): Promise<ReadResult<MutationResponse>> {
+    const signal = bootSignal();
     if (!body || typeof body !== "object") return reject(422, "VALIDATION_FAILED", "Registration details are required.");
     const { reference_image: image, ...fields } = body;
     if (typeof fields.name !== "string") return reject(422, "VALIDATION_FAILED", "Enter an object name.", "/name");
@@ -109,7 +110,7 @@ export function openRegistrations({ now, signal, getSnapshot, healthy, isExclude
     completions.delete(action_id);
     entries.set(action_id, entry);
     function rejectPreparation(result: ReadResult<never>) {
-      entries.delete(action_id);
+      if (entries.get(action_id) === entry) entries.delete(action_id);
       preparation.resolve(result);
       signal.throwIfAborted();
       return result;
@@ -190,6 +191,10 @@ export function openRegistrations({ now, signal, getSnapshot, healthy, isExclude
       const pending = [...entries].filter(([, entry]) => !entry.preparation && entry.receipt.data.persistence === "Pending");
       const visible = [...pending.map(([id]) => id), ...completions];
       return visible.map((id) => ({ ...entries.get(id)!.receipt.data, request_id: null }));
+    },
+    restart() {
+      for (const [id, entry] of entries) if (entry.receipt.data.persistence === "Pending") entries.delete(id);
+      completions.clear();
     },
     clear() { entries.clear(); records.clear(); completions.clear(); },
   };

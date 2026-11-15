@@ -13,12 +13,12 @@ export function useObjectRecord(id: string | undefined) {
   const params = useMemo(() => ({ id: id ?? "" }), [id]);
   const { result, snapshotAtRead, retry } = useProtectedRead("GET /objects/{id}", params, id !== undefined);
   const runtime = useRuntime()?.connection?.runtime;
-  const { snapshot, removedOwners } = useRuntimeView();
+  const { snapshot, recordSnapshot, removedOwners } = useRuntimeView();
   const record = result?.kind === "ok" && result.data.id === id ? result.data : undefined;
   const { expires_at_ms: expiresAt, retention_grace: grace } = record ?? {};
   const activeOwner = Boolean(id && snapshot?.active_session?.object_id === id);
   // A fresh detail read can report grace before the snapshot catches up.
-  const canUseGrace = activeOwner || (grace && snapshot === snapshotAtRead);
+  const canUseGrace = activeOwner || (grace && recordSnapshot === snapshotAtRead);
   const now = runtime?.serverTime();
   const expired = !canUseGrace && expiresAt !== undefined && now !== undefined && now >= expiresAt;
   const removed = Boolean(record && id && removedOwners?.has(id));

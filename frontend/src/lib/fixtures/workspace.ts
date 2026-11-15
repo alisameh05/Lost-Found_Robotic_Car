@@ -12,7 +12,7 @@ import designFrames from "./workspace-frames.json";
 export type FrameMode = "live" | "empty" | "corrupt" | "frozen" | "disconnected";
 type Source = FrameMetadata["source"];
 type Frame = { metadata: FrameMetadata; captured: number; payload: Uint8Array };
-type EventConnection = { enqueue(event: EventEnvelope): void; close(): void };
+type EventConnection = { enqueue(event: EventEnvelope, deferClose?: boolean): void; closeOnOverflow(): void; close(): void };
 type VideoConnection = { close(): void; latest?: Frame; issued: Map<string, Frame> };
 type Owner = {
   client: string; secret: string; sequence: number; deadline: number;
@@ -43,6 +43,7 @@ export function openFixtureWorkspace({
   let previousOwner = false;
   let owner: Owner | undefined;
   let watermark = 1;
+  let skipNextFor: string | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   // Local design camera illustrations from generated-3.png and generated-4.png.
   function cameraFrame(source: Source) {
@@ -56,20 +57,42 @@ export function openFixtureWorkspace({
   const frames = { robot: cameraFrame("robot"), webcam: cameraFrame("webcam") };
   const modeBySource = { robot: frameMode, webcam: "live" } satisfies Record<Source, FrameMode> as Record<Source, FrameMode>;
 
-  function emit(project: (state: Snapshot, envelope: EventEnvelope) => EventEnvelope) {
-    watermark++;
-    for (const [client, connection] of events) {
+  function emit(project: (state: Snapshot, envelope: ReturnType<typeof snapshotEvent>) => EventEnvelope) {
+    const sequence = ++watermark;
+    const skip = skipNextFor;
+    skipNextFor = undefined;
+    // Queue overflow can revoke an owner and publish a nested update. Finish this
+    // broadcast before closing the affected connections so spectators stay ordered.
+    const deliveries = [...events].filter(([client]) => client !== skip).map(([client, connection]) => {
       const state = read(client);
-      connection.enqueue(project(state, { ...snapshotEvent(state), occurred_at_ms: now() }));
-    }
+      return { connection, event: project(state, { ...snapshotEvent(state), event_seq: sequence, occurred_at_ms: now() }) };
+    });
+    for (const { connection, event } of deliveries) connection.enqueue(event, true);
+    for (const { connection } of deliveries) connection.closeOnOverflow();
   }
 
-  function publish(kind: "snapshot" | "readiness_changed" = "snapshot", candidate?: Match) {
+  function publishProximity() {
+    emit((state, envelope) => ({ ...envelope, type: "proximity_warning_changed", payload: { proximity: state.proximity } }));
+  }
+
+  function publish(kind: "snapshot" | "readiness_changed" = "snapshot") {
     emit((state, envelope) => kind === "snapshot"
-      ? { ...envelope, type: "snapshot", payload: candidate ? { ...state, pending_candidate: null } : state }
+      ? envelope
       : { ...envelope, type: kind, payload: { readiness: state.readiness, runtime: state.runtime } });
-    if (candidate) emit((state, envelope) => ({ ...envelope, type: "candidate_pending",
-      payload: { match: candidate, control_generation: state.runtime.control_generation } }));
+  }
+
+  function publishSession(session: NonNullable<Snapshot["active_session"]>, operation: Snapshot["operations"][number] | null = null) {
+    emit((state, envelope) => ({ ...envelope, type: "session_changed",
+      session_id: session.id, session_revision: session.revision,
+      payload: { session, runtime: state.runtime, operation } }));
+  }
+
+  function publishStorageFault() {
+    emit((state, envelope) => ({ ...envelope, type: "storage_fault", payload: {
+      code: "STORAGE_UNAVAILABLE", message: "Sample storage is unavailable.",
+      operation: null, blocked_capabilities: ["Register", "Start", "Resume", "Review", "RetentionChange"],
+      deletion: state.retention.deletion, runtime: state.runtime,
+    } }));
   }
 
   function frameFresh(frame: Frame, time: number) {
@@ -102,14 +125,16 @@ export function openFixtureWorkspace({
     const queue: { event: EventEnvelope; size: number }[] = [];
     let queuedBytes = 0;
     let closed = false;
+    let overflow = false;
     let scheduled = false;
     const connection: EventConnection = {
-      enqueue(event) {
-        if (closed || !profile) return;
+      enqueue(event, deferClose = false) {
+        if (closed || overflow || !profile) return;
         const size = eventShift.encode(JSON.stringify(event)).byteLength;
         if (size > profile.max_event_message_bytes || queue.length >= qualification.event_queue_messages ||
             queuedBytes + size > qualification.event_queue_bytes) {
-          connection.close();
+          overflow = true;
+          if (!deferClose) connection.close();
           return;
         }
         queue.push({ event: structuredClone(event), size });
@@ -125,6 +150,7 @@ export function openFixtureWorkspace({
           }
         });
       },
+      closeOnOverflow() { if (overflow) connection.close(); },
       close() {
         if (closed) return;
         closed = true;
@@ -139,7 +165,7 @@ export function openFixtureWorkspace({
     };
     events.set(client, connection);
     signal.addEventListener("abort", connection.close, { once: true });
-    connection.enqueue(snapshotEvent(read(client)));
+    connection.enqueue({ ...snapshotEvent(read(client)), occurred_at_ms: now() });
     return { protocol: "laf.v1", close: connection.close, heartbeat: (body) => !closed && heartbeat(client, body) };
   }
 
@@ -260,8 +286,33 @@ export function openFixtureWorkspace({
 
   return {
     publish,
-    publishProximity: () => emit((state, envelope) => ({ ...envelope, type: "proximity_warning_changed",
-      payload: { proximity: state.proximity } })),
+    publishSearchSave(session: Snapshot["active_session"], operation?: Snapshot["operations"][number]) {
+      // The checkpoint supplies object and lease changes which SessionChanged
+      // cannot carry. A new Start also needs its receipt for lease handoff.
+      publish();
+      if (session && operation) publishSession(session, operation);
+    },
+    publishCandidate(session: NonNullable<Snapshot["active_session"]>, match: Match) {
+      publishSession(session);
+      emit((state, envelope) => ({ ...envelope, type: "candidate_pending",
+        payload: { match, control_generation: state.runtime.control_generation } }));
+    },
+    publishRecovery(session: Snapshot["active_session"], storageFault: boolean) {
+      if (session) publishSession(session);
+      emit((state, envelope) => ({ ...envelope, type: "recovery_changed",
+        payload: { failures: state.failures, runtime: state.runtime } }));
+      if (storageFault) publishStorageFault();
+      publish("readiness_changed");
+    },
+    publishRetention(operation: Snapshot["operations"][number] | null) {
+      emit((state, envelope) => ({ ...envelope, type: "retention_changed", payload: { operation, retention: state.retention } }));
+    },
+    publishProximity,
+    injectGap(client: string) {
+      skipNextFor = client;
+      publishProximity();
+      publishProximity();
+    },
     publishRemoval: (object_id: string) => emit((_state, envelope) => ({
       ...envelope, type: "object_removed", payload: { object_id, reason: "Expired" },
     })),

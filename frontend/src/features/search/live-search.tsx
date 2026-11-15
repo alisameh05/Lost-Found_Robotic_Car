@@ -22,23 +22,27 @@ import { duration, searchMode } from "./session-facts";
 import styles from "./session.module.css";
 
 export function LiveSearchScreen({ sessionId }: { sessionId: string }) {
-  const { snapshot, searchActions, removedOwners } = useRuntimeView();
+  const { health, snapshot, searchActions, removedOwners, workspace } = useRuntimeView();
   const router = useRouter();
   const stop = searchActions?.[searchActionKey("stop", sessionId)];
   const confirm = searchActions?.[searchActionKey("confirm", sessionId)];
   const terminal = confirm?.stage === "committed" ? confirm : stop?.stage === "committed" ? stop : undefined;
   useEffect(() => {
-    if (terminal?.session?.id === sessionId) router.replace(`${sessionHref(sessionId)}/result`);
-  }, [router, sessionId, terminal]);
+    if (!workspace?.resynchronizing && terminal?.session?.id === sessionId) router.replace(`${sessionHref(sessionId)}/result`);
+  }, [router, sessionId, terminal, workspace?.resynchronizing]);
   const active = snapshot?.active_session?.id === sessionId && snapshot.active_object && !removedOwners?.has(snapshot.active_object.id);
   const read = useRuntimeRead("/sessions/{id}", sessionId, !active);
   const refresh = useRefreshRuntime();
 
   if (active && snapshot) return <Workspace sessionId={sessionId} snapshot={snapshot} />;
   const absent = recordAbsence(read);
+  const unknown = (["pause", "resume", "stop", "confirm", "reject", "acknowledge"] as const)
+    .map((kind) => searchActions?.[searchActionKey(kind, sessionId)]).find((action) => action?.stage === "interrupted");
   return <div className={styles.page}>
     <PageHeader title="Live Search Workspace" />
-    {terminal && !terminal.session ? <Notice title="Record removed after expiry">
+    {unknown && <ActionFeedback label="Search action" feedback={unknown} />}
+    {health?.initialization === "Starting" ? <Notice title="Initializing services">Checking the service and saved search records.</Notice>
+      : terminal && !terminal.session ? <Notice title="Record removed after expiry">
       The search ended and the expired record is no longer available.
     </Notice> : absent ? <RecordAbsent status={absent} title="Session" />
       : !read ? <LoadingState label="Loading search session" />
@@ -78,7 +82,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const state = effective.effective_session_state;
   const ready = owner && workspace.previewLive && workspace.usable && connected;
   const blocked = !connected || !owner || unresolved(stop);
-  const candidate = pendingReview(snapshot, snapshot.pending_candidate) ? snapshot.pending_candidate : null;
+  const candidate = connected && pendingReview(snapshot, snapshot.pending_candidate) ? snapshot.pending_candidate : null;
   const failures = snapshot.failures.filter((failure) => failure.session_id === sessionId);
   const stopSearch = () => { void runtime?.submitSearch({ kind: "stop", sessionId }); };
 
@@ -191,7 +195,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
         <p>{searchMode(mode)} · Target and mode locked</p>
       </div>
       <div className={styles.actions}>
-        <StatusBadge tone={state === "Searching" ? "success" : "warning"}>{state ?? "Unknown"}</StatusBadge>
+        <StatusBadge tone={connected && state === "Searching" ? "success" : "warning"}>{connected ? state ?? "Unknown" : "Disconnected"}</StatusBadge>
         <span aria-label="Elapsed time">{duration(elapsed)}</span>
         {session.state === "Searching" || unresolved(resume)
           ? <Button disabled={blocked || unresolved(pause)} onClick={() => { void runtime?.submitSearch({ kind: "pause", sessionId }); }}>Pause</Button>
@@ -270,7 +274,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
           <h2>Control ownership</h2>
           <p>{owner ? "This workspace holds control." : "Spectator · Read-only"}</p>
           {!workspace?.usable && <p>Control unavailable while the workspace is hidden, unfocused, or unable to display robot video.</p>}
-          {workspace?.message && <p>{workspace.message}</p>}
+          {workspace?.message && <p role="status">{workspace.message}</p>}
           {!owner && <Button disabled={!canAcquire} pending={workspace?.acquiring}
             onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
           {!owner && canAcquire && <p>Acquiring control consents to taking over the available lease.</p>}
@@ -280,9 +284,9 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
       </aside>
     </div>
     <div className={styles.feedback}>
-      <ActionFeedback label="Pausing search" feedback={pause} retry={() => { void runtime?.retrySearch("pause", sessionId); }} />
-      <ActionFeedback label="Resuming search" feedback={resume} retry={() => { void runtime?.retrySearch("resume", sessionId); }} />
-      <ActionFeedback label="Stopping search" feedback={stop} retry={() => { void runtime?.retrySearch("stop", sessionId); }} />
+      <ActionFeedback label="Pausing search" feedback={pause} retry={connected ? () => { void runtime?.retrySearch("pause", sessionId); } : undefined} />
+      <ActionFeedback label="Resuming search" feedback={resume} retry={connected ? () => { void runtime?.retrySearch("resume", sessionId); } : undefined} />
+      <ActionFeedback label="Stopping search" feedback={stop} retry={connected ? () => { void runtime?.retrySearch("stop", sessionId); } : undefined} />
     </div>
     <InputControls mode={mode} disabled={!searching || !ready ||
       !readiness.components.some(({ component, status }) => component === "DisplayedRobotVideo" && status === "Ready")} />

@@ -106,11 +106,12 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
   enabled = true, waitForRuntime = false) {
   const runtime = useRuntime()?.connection?.runtime;
   const refresh = useRefreshRuntime();
-  const { snapshot, connected, failedRead, loading } = useRuntimeView();
+  const { authority, recordSnapshot: snapshot, connected, failedRead, loading } = useRuntimeView();
   const ready = connected && (!waitForRuntime || snapshot !== undefined || !loading);
   const [attempt, setAttempt] = useState(0);
   const [read, setRead] = useState<{
-    runtime: RuntimeProjection; load: typeof load; attempt: number; result: ReadResult<T>; snapshot: RuntimeView["snapshot"];
+    runtime: RuntimeProjection; load: typeof load; attempt: number; result: ReadResult<T>;
+    snapshot: RuntimeView["snapshot"]; authority: RuntimeView["authority"];
   }>();
 
   useEffect(() => {
@@ -118,13 +119,15 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
     const currentRuntime = runtime;
     const lifetime = new AbortController();
     function publish(result: ReadResult<T>) {
-      if (!lifetime.signal.aborted) setRead({ runtime: currentRuntime, load, attempt, result, snapshot });
+      if (!lifetime.signal.aborted) setRead({ runtime: currentRuntime, load, attempt, result, snapshot, authority });
     }
-    void load(currentRuntime, lifetime.signal).then(publish).catch(() => publish({ kind: "unavailable" }));
+    void load(currentRuntime, lifetime.signal).then(publish).catch((error: unknown) => {
+      if (!(error instanceof DOMException && error.name === "AbortError")) publish({ kind: "unavailable" });
+    });
     return () => lifetime.abort();
-  }, [runtime, load, attempt, snapshot, ready, enabled]);
+  }, [runtime, load, attempt, snapshot, authority, ready, enabled]);
 
-  const current = enabled && read?.runtime === runtime && read?.load === load && read.attempt === attempt;
+  const current = enabled && read?.runtime === runtime && read?.load === load && read.attempt === attempt && read.authority === authority;
   const retry = useCallback(() => {
     if (connected) setAttempt((previous) => previous + 1);
     else refresh();
