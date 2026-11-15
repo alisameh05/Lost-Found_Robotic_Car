@@ -40,6 +40,7 @@ test("follows the active identity supplied by the fixture across previews", asyn
   await expect(page.getByRole("heading", { name: "Search Workspace" })).toBeVisible();
   await expect(page.getByText("Committed session · Searching")).toBeVisible();
   await page.getByRole("link", { name: "Dashboard" }).click();
+  await page.getByRole("button", { name: "Leave read-only view" }).click();
   await emergencyRequests(page, 0);
   await scenario.selectOption("paused");
   await expect(active).toHaveAttribute("href", "/sessions/sample-search/live");
@@ -50,6 +51,7 @@ test("follows the active identity supplied by the fixture across previews", asyn
   await expect(page.getByRole("heading", { name: "Search Workspace" })).toBeVisible();
   await expect(page.getByText("Committed session · Paused")).toBeVisible();
   await page.getByRole("link", { name: "Dashboard" }).click();
+  await page.getByRole("button", { name: "Leave Paused" }).click();
   await emergencyRequests(page, 0);
   await scenario.selectOption("ended");
   await expect(active).toHaveCount(0);
@@ -121,6 +123,7 @@ for (const [scenario, input, panel, result] of [
     await expect(page.getByText("Committed session · Paused")).toBeVisible();
     await expect(page.getByText(fixtureLabel, { exact: true })).toBeVisible();
     await page.getByRole("link", { name: "Dashboard" }).click();
+    await page.getByRole("button", { name: "Leave Paused" }).click();
     await emergencyRequests(page, 0);
   });
 }

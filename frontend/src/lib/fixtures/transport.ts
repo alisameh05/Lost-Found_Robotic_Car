@@ -21,6 +21,7 @@ import { expiryFor, openRetention, unavailableStorage } from "./retention";
 import { fixtureOk as ok, fixtureError as error } from "./responses";
 import { openSocketTickets } from "./socket-tickets";
 import { openFixtureWorkspace, type FrameMode } from "./workspace";
+import { committedSearch, openSearchSaves, type SearchDelivery } from "./search-saves";
 
 type FixtureOptions = {
   scenario?: ScenarioId;
@@ -39,6 +40,9 @@ const missing = error(404, "NOT_FOUND", "Sample record not found.");
 const expired = error(410, "EXPIRED", "Sample record expired.");
 const invalid = error(422, "VALIDATION_FAILED", "A sample request field is invalid.");
 const conflict = error(409, "REVISION_CONFLICT", "Sample revision has changed.");
+type OrdinaryAction = Extract<SessionAction, { action: "pause" | "resume" | "stop" }>;
+type SearchInput = "neutral" | "invalid" | "forward" | "backward" | "left" | "right";
+const searchBusy = error(503, "CAPACITY_REACHED", "A sample search action is still saving.");
 
 export function createFixtureTransport({
   scenario = "idle", now: fixtureNow, monotonic = () => performance.now(), startSpecimen = false,
@@ -65,6 +69,10 @@ export function createFixtureTransport({
   const retentionListeners = new Set<(owners?: readonly string[]) => void>();
   let retentionTimer: ReturnType<typeof setTimeout> | undefined;
   const healthy = () => scene.health.storage_integrity === "Healthy";
+  const searchSaves = openSearchSaves(() => workspace.publish());
+  let sampleInput: SearchInput | undefined;
+  let neutralObserved = false;
+  let dropRelease = false;
   const registrations = openRegistrations({
     now, signal: lifetime.signal, getSnapshot: () => ({ ...snapshot, retention: { ...snapshot.retention, ...retention.read() } }), healthy: healthy(),
     isExcluded: (id): boolean => retention.excluded(id),
@@ -77,6 +85,7 @@ export function createFixtureTransport({
       !isActiveOwner(object.id) && expiryFor(object.registered_at_ms, settings.retention_days) <= time)
       .map(({ id }) => ({ id, files: 1 + matches.filter((match) => match.object_id === id).length })),
     purge(owners) {
+      for (const owner of owners.keys()) searchSaves.purge(owner);
       objects = objects.filter(({ id }) => !owners.has(id));
       sessions = sessions.filter(({ object_id }) => !owners.has(object_id));
       matches = matches.filter(({ object_id }) => !owners.has(object_id));
@@ -104,16 +113,22 @@ export function createFixtureTransport({
         observation.cause_codes = displayed ? [] : ["NOT_READY"];
       }
     }
-    const sharedReady = !!profile && hasLiveOwner && displayed && !snapshot.active_session && !storageBlocked() &&
+    const sharedReady = !!profile && hasLiveOwner && displayed && !storageBlocked() &&
       components.every(({ component, status }) => component === "Webcam" || component === "Controller" || status === "Ready");
+    const selectedReady = (mode: StartRequest["control_mode"]) =>
+      components.some(({ component, status }) => component === (mode === "Gestures" ? "Webcam" : "Controller") && status === "Ready");
+    const active = snapshot.active_session;
     return { components, can_start: {
-      Gestures: sharedReady && components.some(({ component, status }) => component === "Webcam" && status === "Ready"),
-      Controller: sharedReady && components.some(({ component, status }) => component === "Controller" && status === "Ready"),
-    }, can_resume: readiness.can_resume };
+      Gestures: sharedReady && !active && !searchSaves.pending() && selectedReady("Gestures"),
+      Controller: sharedReady && !active && !searchSaves.pending() && selectedReady("Controller"),
+    }, can_resume: sharedReady && active?.state === "Paused" && snapshot.runtime.effective_session_state === "Paused" &&
+      !searchSaves.pending() && !snapshot.runtime.persistence_pending && !snapshot.pending_candidate &&
+      snapshot.failures.every((failure) => failure.session_id !== active.id || (failure.restored && failure.acknowledged)) &&
+      selectedReady(active.control_mode) };
   };
   const snapshotRead = (client = bootstrap.client_id): Snapshot => {
     const active_object = snapshot.active_object && projectObject(snapshot.active_object, now());
-    const operations = [...snapshot.operations, ...registrations.operations().filter(({ result }) =>
+    const operations = [...snapshot.operations, ...searchSaves.operations(), ...registrations.operations().filter(({ result }) =>
       !result?.object || !retention.excluded(result.object.id)), ...retention.operations()];
     const pending = operations.filter(({ persistence }) => persistence === "Pending");
     const completed = operations.filter(({ persistence }) => persistence !== "Pending").slice(-64);
@@ -133,13 +148,16 @@ export function createFixtureTransport({
     available: (source) => snapshot.readiness.components.some(({ component, status }) =>
       component === (source === "robot" ? "RobotVideo" : "Webcam") && status === "Ready"),
     setLease(lease, pause) {
+      sampleInput = undefined;
+      neutralObserved = false;
       const session = snapshot.active_session;
-      const pausedSession = pause && session?.state === "Searching" ? {
+      const pausedSession = pause && !storageBlocked() && session?.state === "Searching" ? {
         ...session, state: "Paused" as const, revision: session.revision + 1,
         pause_causes: [{ cause: "ManualPause" as const, failure_id: null }],
       } : session;
+      if (pausedSession && pausedSession !== session) saveSession(pausedSession);
       snapshot = { ...snapshot, lease, active_session: pausedSession, runtime: {
-        ...snapshot.runtime, effective_session_state: pausedSession?.state ?? null,
+        ...snapshot.runtime, effective_session_state: pause && session ? "Paused" : snapshot.runtime.effective_session_state,
         control_generation: lease.control_generation, motion_permission: "Disarmed",
       } };
     },
@@ -184,6 +202,7 @@ export function createFixtureTransport({
   }
 
   function invalidate(owners?: string[]) {
+    for (const owner of owners ?? []) searchSaves.purge(owner);
     workspace.publish();
     for (const listener of retentionListeners) listener(owners);
   }
@@ -239,25 +258,126 @@ export function createFixtureTransport({
     return pages.read(items, (item) => item.registered_at_ms, JSON.stringify(["objects", normalizedName, status]), pagination, now());
   }
 
-  function start(body: StartRequest) {
+  function saveSession(session: Session) {
+    sessions = sessions.some(({ id }) => id === session.id)
+      ? sessions.map((value) => value.id === session.id ? session : value) : [...sessions, session];
+  }
+
+  function resetInput() {
+    sampleInput = undefined;
+    neutralObserved = false;
+    snapshot = { ...snapshot, runtime: { ...snapshot.runtime, motion_permission: "Disarmed" } };
+  }
+
+  function advanceGeneration() {
+    const control_generation = snapshot.lease.control_generation + 1;
+    snapshot = { ...snapshot, lease: { ...snapshot.lease, control_generation },
+      runtime: { ...snapshot.runtime, control_generation } };
+    workspace.invalidateDisplayScope();
+  }
+
+  function start(body: StartRequest, client: string) {
     if (!conforms("StartRequest", body)) return invalid;
+    if (body.client_id !== client) return error(403, "CLIENT_INVALID", "Unknown sample client.");
     const object = objectRead(body.object_id);
     if (object.kind !== "ok") return object;
+    const fingerprint = JSON.stringify(["start", body.object_id, body.expected_revision, body.control_mode]);
+    const retry = searchSaves.replay(body.action_id, fingerprint);
+    if (retry) return retry;
     if (snapshot.active_session) return error(409, "ACTIVE_SESSION_EXISTS", "A sample search is already active.");
+    if (searchSaves.pending()) return searchBusy;
     if (storageBlocked()) return unavailableStorage;
     if (object.data.revision !== body.expected_revision) return conflict;
     if (object.data.status !== "Lost") return error(409, "INVALID_TRANSITION", "Sample object is already Found.");
-    if (!startSpecimen || body.client_id !== bootstrap.client_id || body.client_lease_id !== leaseId) {
-      return error(403, "LEASE_REQUIRED", "Invalid sample lease.");
-    }
-    const input = body.control_mode === "Gestures" ? "Webcam" : "Controller";
-    if (!profile || snapshot.readiness.components.some(({ component, status }) => status !== "Ready" &&
-      (component === input || (component !== "Webcam" && component !== "Controller")))) {
-      return error(503, "NOT_READY", "Sample setup is unavailable.");
-    }
-    return mutation(body.action_id, "Committed", { ...startReceipt, session: {
+    if (startSpecimen && client === bootstrap.client_id && body.client_lease_id === leaseId) return mutation(body.action_id, "Committed", { ...startReceipt, session: {
       ...startReceipt.session, object_id: object.data.id, control_mode: body.control_mode,
     } }, 201, "/api/v1/sessions/sample-new-search");
+    const owns = () => workspace.owns(client, body.client_lease_id);
+    if (!owns()) return error(403, "LEASE_REQUIRED", "The current sample lease is required.");
+    if (!readinessRead(client).can_start[body.control_mode]) return error(503, "NOT_READY", "Sample setup is unavailable.");
+    if (object.data.reference_media.availability !== "Available") return error(503, "MEDIA_UNAVAILABLE", "The sample reference is unavailable.");
+    const delivery = searchSaves.takeDelivery();
+    if (delivery === "undelivered") return { kind: "unavailable" } as const;
+    return searchSaves.admit("start", body.action_id, body.object_id, fingerprint, delivery, () => {
+      const current = objectRead(body.object_id);
+      if (current.kind !== "ok") return current;
+      if (!owns() || !readinessRead(client).can_start[body.control_mode]) {
+        return error(503, "NOT_READY", "The controlling setup became unavailable before Start was saved.");
+      }
+      if (current.data.revision !== body.expected_revision) return conflict;
+      const session: Session = { id: crypto.randomUUID(), object_id: body.object_id, control_mode: body.control_mode,
+        revision: 1, state: "Searching", started_at_ms: now(), ended_at_ms: null, end_reason: null, pause_causes: [] };
+      resetInput();
+      saveSession(session);
+      snapshot = { ...snapshot, active_object: current.data, active_session: session, pending_candidate: null, failures: [],
+        runtime: { ...snapshot.runtime, effective_session_state: "Searching", persistence_pending: false } };
+      advanceGeneration();
+      scheduleRetention();
+      return committedSearch(body.action_id, { session }, `/api/v1/sessions/${session.id}`);
+    });
+  }
+
+  function ordinaryAction(body: OrdinaryAction, client: string) {
+    if (client !== body.client_id) return error(403, "CLIENT_INVALID", "Unknown sample client.");
+    const read = sessionRead(body.session_id);
+    if (read.kind !== "ok") return read;
+    const fingerprint = JSON.stringify([body.action, body.session_id, body.expected_revision]);
+    const retry = searchSaves.replay(body.action_id, fingerprint);
+    if (retry) return retry;
+    if (!workspace.owns(client, body.client_lease_id)) return error(403, "LEASE_REQUIRED", "The current sample lease is required.");
+    const active = snapshot.active_session;
+    if (active?.id !== body.session_id) return error(409, "INVALID_TRANSITION", "Sample session is inactive.");
+    if (active.revision !== body.expected_revision) return conflict;
+    if (body.action === "resume") {
+      if (active.state !== "Paused") return error(409, "INVALID_TRANSITION", "Pause the search before resuming.");
+      if (snapshot.pending_candidate) return error(409, "PENDING_REVIEW", "Complete the pending review first.");
+      if (!readinessRead(client).can_resume) return error(409, "RECOVERY_REQUIRED", "Sample recovery or readiness is incomplete.");
+    }
+    const scripted = searchSaves.takeDelivery();
+    if (scripted === "undelivered") return { kind: "unavailable" } as const;
+    const delivery = storageBlocked() ? "fail" : scripted;
+    if (body.action !== "resume") {
+      const wasSearching = snapshot.runtime.effective_session_state === "Searching";
+      resetInput();
+      snapshot = { ...snapshot, runtime: { ...snapshot.runtime, effective_session_state: "Paused" } };
+      if (wasSearching) advanceGeneration();
+      // A safety action must prevent an older pending Resume from granting permission later.
+      if (body.action === "stop" ? searchSaves.pending() : searchSaves.pending("resume")) searchSaves.finish(false);
+    }
+    if (searchSaves.pending()) {
+      workspace.publish();
+      return searchBusy;
+    }
+    snapshot = { ...snapshot, runtime: { ...snapshot.runtime, persistence_pending: delivery === "pending" } };
+    return searchSaves.admit(body.action, body.action_id, active.object_id, fingerprint, delivery, () => {
+      const session = snapshot.active_session;
+      if (!session || session.id !== active.id || session.state === "Ended") return error(409, "INVALID_TRANSITION", "Sample session is inactive.");
+      if (storageBlocked()) return unavailableStorage;
+      if (body.action === "resume") {
+        if (!workspace.owns(client, body.client_lease_id) || !readinessRead(client).can_resume ||
+            session.revision !== body.expected_revision) return error(409, "RECOVERY_REQUIRED", "Resume conditions changed before saving.");
+        resetInput();
+        const resumed: Session = { ...session, state: "Searching", pause_causes: [], revision: session.revision + 1 };
+        saveSession(resumed);
+        snapshot = { ...snapshot, active_session: resumed,
+          runtime: { ...snapshot.runtime, effective_session_state: "Searching" } };
+        advanceGeneration();
+        return committedSearch(body.action_id, { session: resumed });
+      }
+      if (body.action === "stop") {
+        const candidate = snapshot.pending_candidate;
+        const match = candidate && { ...candidate, disposition: "NotReviewed" as const, reviewed_at_ms: null };
+        if (match) matches = matches.map((item) => item.id === match.id ? match : item);
+        const grace = snapshotRead().active_object?.retention_grace;
+        const ended = endFixtureSearch();
+        return committedSearch(body.action_id, grace ? {} : { session: ended, match });
+      }
+      const paused: Session = session.state === "Paused" ? session : { ...session, state: "Paused",
+        pause_causes: [{ cause: "ManualPause", failure_id: null }], revision: session.revision + 1 };
+      saveSession(paused);
+      snapshot = { ...snapshot, active_session: paused };
+      return committedSearch(body.action_id, { session: paused });
+    });
   }
 
   function retentionImpact(days: number, time: number) {
@@ -341,13 +461,17 @@ export function createFixtureTransport({
     },
     "GET /settings": () => ok(retention.read().settings),
     "POST /objects": (request) => registrations.submit(request as HttpRequest<"POST /objects">),
-    "POST /sessions": ({ body }) => start(body as StartRequest),
-    "POST /sessions/{id}/actions": ({ body: value, id }) => {
+    "POST /sessions": ({ body, context }) => start(body as StartRequest, context.client_id),
+    "POST /sessions/{id}/actions": ({ body: value, id, context }) => {
       const body = value as SessionAction;
       if (!conforms("SessionAction", body) || body.session_id !== id) return invalid;
+      if (body.action === "pause" || body.action === "resume" || (body.action === "stop" && !startSpecimen)) {
+        return ordinaryAction(body, context.client_id);
+      }
+      if (!startSpecimen) return error(409, "INVALID_TRANSITION", "This sample action is unavailable.");
       const session = sessionRead(id);
       if (session.kind !== "ok") return session;
-      if (storageBlocked() && body.action !== "pause" && body.action !== "stop") return unavailableStorage;
+      if (storageBlocked() && body.action !== "stop") return unavailableStorage;
       if (body.expected_revision !== session.data.revision) return conflict;
       if (snapshot.active_session?.id !== id) return error(409, "INVALID_TRANSITION", "Sample session is inactive.");
       if (snapshot.lease.state !== "Owned" || body.client_id !== bootstrap.client_id || body.client_lease_id !== leaseId) {
@@ -358,7 +482,6 @@ export function createFixtureTransport({
         if (snapshot.pending_candidate?.id !== body.candidate_id) return error(409, "OWNERSHIP_MISMATCH", "Candidate is outside the sample review.");
       }
       if (body.action === "acknowledge" && !body.failure_ids.every((id) => snapshot.failures.some((failure) => failure.failure_id === id))) return missing;
-      if (body.action === "resume" && !snapshot.readiness.can_resume) return error(409, "RECOVERY_REQUIRED", "Sample recovery is incomplete.");
       const losesGrace = snapshotRead().active_object?.retention_grace && (body.action === "stop" || body.action === "confirm");
       if (losesGrace) endFixtureSearch(body.action === "confirm" ? "Confirmed" : "Stopped");
       return mutation(body.action_id, "Committed", losesGrace ? emptyResult : reviewReceipt(body, snapshot));
@@ -377,13 +500,21 @@ export function createFixtureTransport({
       return tickets.issue(context, body.channel);
     },
     "POST /control-lease": ({ body, context }) => workspace.acquire(context.client_id, body as LeaseAcquire),
-    "POST /control-lease/release": ({ body, context }) => workspace.release(context.client_id, body as LeaseRelease),
+    "POST /control-lease/release": ({ body, context }) => {
+      if (dropRelease) { dropRelease = false; return { kind: "unavailable" }; }
+      const result = workspace.release(context.client_id, body as LeaseRelease);
+      if (result.kind === "ok" && result.data.snapshot.active_session?.state === "Searching" && storageBlocked()) {
+        return { ...unavailableStorage, error: { ...unavailableStorage.error, permission_revoked: true } };
+      }
+      return result;
+    },
     "POST /emergency-stop": ({ body }) => {
       if (scene.emergency === "network") return { kind: "unavailable" };
       const valid = conforms("EmergencyStopRequest", body);
       const session = snapshot.active_session;
       const committed = valid && scene.emergency === "Committed";
       const control_generation = snapshot.runtime.control_generation + 1;
+      resetInput();
       if (session && !emergencyFailure) {
         const previous = snapshot.failures.find((failure) => failure.failure_id === recoveryFailure.failure_id);
         emergencyFailure = { ...recoveryFailure, session_id: session.id,
@@ -417,7 +548,8 @@ export function createFixtureTransport({
     const active = snapshot.active_session;
     if (!active) return;
     const ended: Session = { ...active, state: "Ended", end_reason, ended_at_ms: now(), revision: active.revision + 1, pause_causes: [] };
-    sessions = sessions.map((session) => session.id === ended.id ? ended : session);
+    saveSession(ended);
+    resetInput();
     const control_generation = snapshot.runtime.control_generation + 1;
     workspace.clearOwnership();
     snapshot = { ...snapshot, active_object: null, active_session: null, pending_candidate: null, failures: [],
@@ -427,6 +559,7 @@ export function createFixtureTransport({
     retention.sweep();
     scheduleRetention();
     invalidate();
+    return ended;
   }
 
   return {
@@ -444,6 +577,27 @@ export function createFixtureTransport({
       },
       changeFrames(mode: FrameMode) { workspace.changeFrames(mode); },
       disconnectEvents() { workspace.disconnectEvents(bootstrap.client_id); },
+      scriptSearch(delivery: SearchDelivery) { searchSaves.script(delivery); },
+      dropNextRelease() { dropRelease = true; },
+      finishSearchSave(commit: boolean) {
+        snapshot = { ...snapshot, runtime: { ...snapshot.runtime, persistence_pending: false } };
+        searchSaves.finish(commit);
+      },
+      readInput: () => sampleInput,
+      input(mode: StartRequest["control_mode"], input: SearchInput) {
+        workspace.checkDeadline();
+        if (snapshot.active_session?.control_mode !== mode || snapshot.runtime.effective_session_state !== "Searching" ||
+            snapshot.lease.owner_client_id !== bootstrap.client_id || !workspace.observations().displayed ||
+            storageBlocked() || snapshot.pending_candidate ||
+            snapshot.failures.some(({ restored, acknowledged }) => !restored || !acknowledged)) return;
+        const held = input !== "neutral" && input !== "invalid";
+        const continuing = sampleInput === input && snapshot.runtime.motion_permission === "Armed";
+        const permission = input === "neutral" ? "Arming" : held && (neutralObserved || continuing) ? "Armed" : "Disarmed";
+        sampleInput = input;
+        neutralObserved = input === "neutral";
+        snapshot = { ...snapshot, runtime: { ...snapshot.runtime, motion_permission: permission } };
+        workspace.publish("readiness_changed");
+      },
       activateSearch(state: "Searching" | "Paused") {
         const result = objectRead(sampleObject.id);
         if (snapshot.active_session || storageBlocked() || result.kind !== "ok") return;

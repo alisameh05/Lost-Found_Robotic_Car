@@ -30,13 +30,13 @@ test.each(scenarioIds)("validates the %s fixture's bootstrap, snapshot, health a
   const scene = readScenario(scenario);
   const health = data(await transport.request("GET /health", { context: bootstrap }), scene.health.initialization === "Ready" ? 200 : 503);
   contract("Health", health);
-  expect(health.readiness).toEqual(scene.snapshot.readiness);
+  expect(health.readiness).toEqual({ ...scene.snapshot.readiness, can_resume: false });
   expect(validSnapshot(scene.snapshot, bootstrap)).toBe(true);
   const snapshotRead = await transport.snapshot({ context: bootstrap });
   if (scene.snapshotError) {
     expect(snapshotRead).toMatchObject({ kind: "api-error", status: 503, error: scene.snapshotError });
   } else {
-    expect(data(snapshotRead)).toEqual(scene.snapshot);
+    expect(data(snapshotRead)).toEqual({ ...scene.snapshot, readiness: health.readiness });
   }
 
   if (scene.recordsRecovery) {
@@ -242,7 +242,7 @@ test("keeps pending, committed and failed mutations distinct from plain validati
 });
 
 test("serializes review receipts, recovery failures, and retention outcomes", async () => {
-  const transport = createFixtureTransport({ scenario: "candidate" });
+  const transport = createFixtureTransport({ scenario: "candidate", startSpecimen: true });
   const context = data(await transport.bootstrap());
   const base = { action_id: actionId, session_id: sampleSession.id, expected_revision: 2, client_id: clientId, client_lease_id: leaseId };
   const candidate = data(await transport.snapshot({ context })).pending_candidate!;
@@ -257,7 +257,7 @@ test("serializes review receipts, recovery failures, and retention outcomes", as
     expect(result.result?.match?.disposition).toBe(disposition);
     expect(validMatch(result.result!.match!, result.result!.session!)).toBe(true);
   }
-  const recovery = createFixtureTransport({ scenario: "restored" });
+  const recovery = createFixtureTransport({ scenario: "restored", startSpecimen: true });
   const recoveryContext = data(await recovery.bootstrap());
   const restored = data(await recovery.snapshot({ context: recoveryContext }));
   const ack: SessionAction = { ...base, action: "acknowledge", expected_revision: 3, failure_ids: [restored.failures[0].failure_id] };

@@ -105,7 +105,8 @@ test("record screens use the selected adapter for empty data and active-session 
   await page.getByRole("link", { name: "Dashboard" }).click();
   await scenario.selectOption("expiry-grace");
   await page.getByRole("link", { name: "Return to Active Search" }).click();
-  await page.getByRole("link", { name: "View sample object" }).click();
+  await page.getByRole("link", { name: "View Object Details" }).click();
+  await page.getByRole("button", { name: "Leave Paused" }).click();
   await expect(page.getByRole("heading", { name: "Sample expired object" })).toBeVisible();
   await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();
   await expect(page.getByRole("img", { name: "Reference for Sample expired object", exact: true })).toBeVisible();

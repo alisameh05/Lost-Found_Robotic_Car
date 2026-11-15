@@ -2,6 +2,7 @@
 
 import { Check, Gamepad2, Hand, Minus, TriangleAlert } from "lucide-react";
 import Link from "next/link";
+import { useRouter } from "next/navigation";
 import { useEffect, useRef, useState } from "react";
 import { PageHeader } from "@/components/layout/page-header";
 import { Panel } from "@/components/layout/panel";
@@ -10,10 +11,12 @@ import { LoadingState, Notice, StatusBadge } from "@/components/ui/feedback";
 import { ModeInstructions } from "@/features/control-guide";
 import { describeDeviceReadiness, devicePaths } from "@/features/devices";
 import { ObjectStatus, objectHref, RecordAbsent, RecordReadFailure, ReferenceImage } from "@/features/objects";
-import { useObjectRecord, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
+import { searchActionKey, unresolved, useObjectRecord, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import { componentNames, type ControlMode, type Object as ObjectRecord } from "@/generated/api-v1";
 import { searchSetupBlockReason, supportHref } from "@/lib/search-setup-context";
 import styles from "./search-setup.module.css";
+import { ActionFeedback } from "./action-feedback";
+import { SearchSaveControls } from "./search-fixture-controls";
 
 const modes = [
   { value: "Gestures", label: "Gestures", detail: "Laptop webcam required.", icon: Hand },
@@ -44,8 +47,10 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   const fixture = connection?.fixture;
   const view = useRuntimeView();
   const refresh = useRefreshRuntime();
+  const router = useRouter();
   const { snapshot, health, workspace, profile } = view;
-  const canvas = useRef<HTMLCanvasElement>(null);
+  const canvas = useRef<HTMLDivElement>(null);
+  const requestedStart = useRef(false);
   useEffect(() => {
     if (canvas.current && profile) return runtime?.mountWorkspace(canvas.current);
   }, [runtime, profile]);
@@ -56,9 +61,17 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
     ? "This expired record is available for its existing search only." : searchSetupBlockReason(object, view);
   const active = snapshot?.active_session || (view.failedRead && health?.active_session_state);
   const eligible = !recordBlock && !active && referenceDisplayed === true && !!snapshot && !view.failedRead;
+  const starting = view.searchActions?.[searchActionKey("start", object.id)];
+  const busy = unresolved(starting);
+  const accepted = starting?.stage === "committed" ? starting.session : undefined;
   useEffect(() => {
-    if (!eligible && (workspace?.controlling || workspace?.acquiring)) runtime?.releaseWorkspace();
-  }, [eligible, runtime, workspace?.controlling, workspace?.acquiring]);
+    if (requestedStart.current && accepted && snapshot?.active_session?.id === accepted.id) {
+      router.replace(`/sessions/${encodeURIComponent(accepted.id)}/live`);
+    }
+  }, [accepted, router, snapshot?.active_session?.id]);
+  useEffect(() => {
+    if (!eligible && !busy && !accepted && (workspace?.controlling || workspace?.acquiring)) void runtime?.releaseWorkspace();
+  }, [eligible, busy, accepted, runtime, workspace?.controlling, workspace?.acquiring]);
 
   const readiness = view.failedRead ? health?.readiness : snapshot?.readiness ?? health?.readiness;
   const required = describeDeviceReadiness(readiness, mode);
@@ -96,13 +109,13 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
             <h2 id="robot-preview-title">Robot preview</h2>
             <StatusBadge tone={workspace?.previewLive ? "success" : "warning"}>{workspace?.previewLive ? "Live preview" : "Not live"}</StatusBadge>
           </div>
-          <canvas ref={canvas} className={styles.preview} role="img" aria-label="Fixture robot camera view" />
+          <div ref={canvas} className={styles.preview} />
           <p className={styles.muted}>{workspace?.controlling ? "This workspace holds control." : "Read-only preview."}</p>
         </Panel>
       </div>
 
       <div className={styles.column}>
-        <fieldset className={styles.modes}>
+        <fieldset className={styles.modes} disabled={busy}>
           <legend>Control mode</legend>
           {modes.map(({ value, label, detail, icon: Icon }) => <label className={styles.mode} key={value}>
             <Icon aria-hidden="true" size={24} />
@@ -154,22 +167,33 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
               ? "Waiting for the fixture to acknowledge the displayed robot frame." : "Acquire control to finish checking readiness."}
           </Notice>}
         {workspace?.message && <p>{workspace.message}</p>}
+        <ActionFeedback label="Starting search" feedback={starting?.stage === "committed" && !active ? undefined : starting} retry={() => {
+          requestedStart.current = true;
+          void runtime?.retrySearch("start", object.id);
+        }} />
       </div>
       <div className={styles.actions}>
         <Link className="button button--secondary" href={objectHref(object.id)}>Back to Object Details</Link>
         {!workspace?.controlling && <Button variant="primary" pending={workspace?.acquiring}
           disabledReason={acquisitionBlocked} onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
+        <Button variant="primary" pending={starting?.stage === "sending"} disabled={!ready || busy}
+          onClick={() => {
+            if (!ready) return;
+            requestedStart.current = true;
+            void runtime?.submitSearch({ kind: "start", object, mode });
+          }}>Start Search</Button>
       </div>
+      <SearchSaveControls />
       {snapshot && snapshot.lease.control_generation > 1 && snapshot.lease.can_acquire && !acquisitionBlocked &&
         <p className={styles.muted}>Selecting Acquire control consents to taking over available control.</p>}
     </footer>
     {fixture && <details className={styles.fixture}>
       <summary>Search setup fixture controls</summary>
       <div className="control-row">
-        <Button onClick={() => fixture.retention.changeFrames("live")}>Send fresh frames</Button>
-        <Button onClick={() => fixture.retention.changeFrames("frozen")}>Freeze robot frames</Button>
-        <Button onClick={() => fixture.retention.changeFrames("disconnected")}>Disconnect robot video</Button>
-        <Button onClick={fixture.retention.disconnectEvents}>Disconnect search events</Button>
+        <Button onClick={() => fixture.search.changeFrames("live")}>Send fresh frames</Button>
+        <Button onClick={() => fixture.search.changeFrames("frozen")}>Freeze robot frames</Button>
+        <Button onClick={() => fixture.search.changeFrames("disconnected")}>Disconnect robot video</Button>
+        <Button onClick={fixture.search.disconnectEvents}>Disconnect search events</Button>
       </div>
     </details>}
   </>;

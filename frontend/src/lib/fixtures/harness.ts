@@ -28,9 +28,11 @@ export function createScenarioHarness() {
           ? { body: structuredClone(body) } : {}) }];
         for (const notify of observers) notify();
       } });
+      const { changeFrames, disconnectEvents, scriptSearch, finishSearchSave, dropNextRelease, readInput, input, ...retention } = transport.controls;
       return {
         transport,
-        retention: transport.controls,
+        retention,
+        search: { changeFrames, disconnectEvents, script: scriptSearch, settle: finishSearchSave, dropNextRelease, readInput, input },
         advanceTime(ms: number) { offset += ms; transport.controls.clockChanged(); },
         async submitSample(label: string, outcome: "Committed" | "Failed", signal: AbortSignal) {
           const bootstrap = await transport.bootstrap(signal);

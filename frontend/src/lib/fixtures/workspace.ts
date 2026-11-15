@@ -3,10 +3,11 @@ import type {
 } from "@/generated/api-v1";
 import { conforms } from "../fixture-contracts";
 import type { EventSocket, ReadSocket, SocketObserver } from "../transport";
-import { imageHeight, imageWidth, sampleImage, sampleMediaAsset, sampleMediaBytes } from "./images";
+import { imageHeight, imageWidth, sampleImage } from "./images";
 import { fixtureError as error, fixtureOk as ok } from "./responses";
 import { qualification, encodeFrame, snapshotEvent } from "./vectors";
 import { runtimeToken } from "./socket-tickets";
+import designFrames from "./workspace-frames.json";
 
 export type FrameMode = "live" | "empty" | "corrupt" | "frozen" | "disconnected";
 type Source = FrameMetadata["source"];
@@ -42,12 +43,16 @@ export function openFixtureWorkspace({
   let owner: Owner | undefined;
   let watermark = 1;
   let timer: ReturnType<typeof setTimeout> | undefined;
-  const asset = sampleMediaAsset("sample-bottle-reference")!;
-  const robotAsset = profile && asset.width <= profile.max_frame_width && asset.height <= profile.max_frame_height &&
-    asset.width * asset.height <= profile.max_frame_pixels && asset.byte_length + profile.max_header_bytes + 4 <= profile.max_frame_bytes
-    ? asset : undefined;
-  const robotJpeg = robotAsset ? sampleMediaBytes("sample-bottle-reference", "image/jpeg") : sampleImage("image/jpeg");
-  const webcamJpeg = sampleImage("image/jpeg");
+  // Local design camera illustrations from generated-3.png and generated-4.png.
+  function cameraFrame(source: Source) {
+    const asset = designFrames[source];
+    if (profile && asset.width <= profile.max_frame_width && asset.height <= profile.max_frame_height &&
+        asset.width * asset.height <= profile.max_frame_pixels && asset.byte_length + profile.max_header_bytes + 4 <= profile.max_frame_bytes) {
+      return { width: asset.width, height: asset.height, jpeg: Uint8Array.from(atob(asset.base64), (byte) => byte.charCodeAt(0)) };
+    }
+    return { width: imageWidth, height: imageHeight, jpeg: sampleImage("image/jpeg") };
+  }
+  const frames = { robot: cameraFrame("robot"), webcam: cameraFrame("webcam") };
   const modeBySource = { robot: frameMode, webcam: "live" } satisfies Record<Source, FrameMode> as Record<Source, FrameMode>;
 
   function publish(kind: "snapshot" | "readiness_changed" = "snapshot") {
@@ -157,11 +162,11 @@ export function openFixtureWorkspace({
       nextCapture = setTimeout(capture, cameraInterval);
       if (mode === "empty" || !available(source)) return;
       if (mode !== "frozen" || !connection.latest) {
-        const payload = mode === "corrupt" ? Uint8Array.of(255, 216, 0, 255, 217) : source === "robot" ? robotJpeg : webcamJpeg;
+        const { width, height, jpeg } = frames[source];
+        const payload = mode === "corrupt" ? Uint8Array.of(255, 216, 0, 255, 217) : jpeg;
         const metadata: FrameMetadata = {
           protocol_version: 1, source, stream_epoch: stream, frame_id: crypto.randomUUID(), capture_seq: ++sequence,
-          width: source === "robot" ? robotAsset?.width ?? imageWidth : imageWidth,
-          height: source === "robot" ? robotAsset?.height ?? imageHeight : imageHeight,
+          width, height,
           received_at_ms: now(), capture_age_bound_ms: 5, source_capture_us: Math.floor(monotonic() * 1_000),
           source_clock_epoch: `fixture-${source}-clock`,
         };
@@ -248,6 +253,17 @@ export function openFixtureWorkspace({
     hasEvents: () => events.size > 0,
     canAcquire: (client: string) => !!profile && events.has(client),
     observations: () => ({ workspace: !!owner?.workspace, displayed: !!owner?.acknowledged && frameFresh(owner.acknowledged, monotonic()) }),
+    owns(client: string, secret: string) {
+      checkDeadline();
+      return owner?.client === client && owner.secret === secret && events.has(client);
+    },
+    invalidateDisplayScope() {
+      if (!owner) return;
+      video.robot.get(owner.client)?.issued.clear();
+      owner.acknowledged = undefined;
+      owner.workspace = false;
+      checkDeadline();
+    },
     connectEvents,
     connectVideo,
     acquire,

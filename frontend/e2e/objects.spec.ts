@@ -135,7 +135,9 @@ test("keeps search navigation read-only and blocks setup during Searching, Pause
       .toHaveAccessibleDescription(`End the ${state} session before starting another search.`);
     await page.getByRole("region", { name: "Active search", exact: true }).getByRole("link", { name: "Return to Active Search" }).click();
     await expect(page).toHaveURL(/\/sessions\/sample-search\/live$/);
+    await expect(page.getByRole("region", { name: "Control ownership" })).toContainText("Spectator");
     await page.getByRole("link", { name: "Dashboard", exact: true }).click();
+    await page.getByRole("button", { name: state === "paused" ? "Leave Paused" : "Leave read-only view" }).click();
     await expect(page.getByText("Fixture mutation requests (0)")).toBeVisible();
   }
 

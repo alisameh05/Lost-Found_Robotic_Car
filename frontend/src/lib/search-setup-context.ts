@@ -9,7 +9,7 @@ export function searchSetupTargetBlockReason(object: ObjectRecord) {
 }
 
 export function searchSetupBlockReason(object: ObjectRecord, { snapshot, health }: { snapshot?: Snapshot; health?: Health }) {
-  const state = snapshot?.runtime.effective_session_state ?? snapshot?.active_session?.state ?? health?.active_session_state;
+  const state = snapshot ? snapshot.runtime.effective_session_state ?? snapshot.active_session?.state : health?.active_session_state;
   const storage = snapshot?.readiness.components.find(({ component }) => component === "Storage");
   if (object.status === "Found") return searchSetupTargetBlockReason(object);
   if (state === "Searching" || state === "Paused") return `End the ${state.toLowerCase()} session before starting another search.`;
