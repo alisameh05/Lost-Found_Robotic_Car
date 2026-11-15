@@ -47,6 +47,7 @@ test.each(scenarioIds)("validates the %s fixture's bootstrap, snapshot, health a
   for (const owner of listed.items) {
     expect(validObject(owner)).toBe(true);
     if (scene.historyRecovery && owner.id === sampleObject.id) {
+      expect(await transport.request("GET /objects/{id}", { id: owner.id, context: bootstrap })).toMatchObject({ kind: "ok" });
       expect(await transport.request("GET /objects/{id}/sessions", { id: owner.id, context: bootstrap }))
         .toEqual({ kind: "unavailable" });
     }

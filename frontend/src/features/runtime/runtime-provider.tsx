@@ -71,6 +71,17 @@ const RuntimeViewContext = createContext(loading);
 export const useRuntimeView = () => useContext(RuntimeViewContext);
 export const useRuntime = () => useContext(RuntimeContext);
 
+export function useRefreshRuntime() {
+  const state = useRuntime();
+  const runtime = state?.connection?.runtime;
+  const select = state?.select;
+  const scenario = state?.selection.id;
+  return useCallback(() => {
+    if (runtime) void runtime.refresh();
+    else if (scenario !== undefined) select?.(scenario);
+  }, [runtime, scenario, select]);
+}
+
 export function useRuntimeRead<Path extends ProtectedPath>(path: Path, id?: string, enabled = true) {
   const load = useCallback((runtime: RuntimeProjection, signal: AbortSignal) => runtime.get(path, id, signal), [path, id]);
   return useApplicationRead(load, enabled).result;
@@ -78,10 +89,8 @@ export function useRuntimeRead<Path extends ProtectedPath>(path: Path, id?: stri
 
 export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal: AbortSignal) => Promise<ReadResult<T>>,
   enabled = true, waitForRuntime = false) {
-  const state = useRuntime();
-  const runtime = state?.connection?.runtime;
-  const select = state?.select;
-  const scenario = state?.selection.id;
+  const runtime = useRuntime()?.connection?.runtime;
+  const refresh = useRefreshRuntime();
   const { snapshot, connected, failedRead, loading } = useRuntimeView();
   const ready = connected && (!waitForRuntime || snapshot !== undefined || !loading);
   const [attempt, setAttempt] = useState(0);
@@ -103,9 +112,8 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
   const current = enabled && read?.runtime === runtime && read?.load === load && read.attempt === attempt;
   const retry = useCallback(() => {
     if (connected) setAttempt((previous) => previous + 1);
-    else if (runtime) void runtime.refresh();
-    else if (scenario !== undefined) select?.(scenario);
-  }, [connected, runtime, scenario, select]);
+    else refresh();
+  }, [connected, refresh]);
   return {
     result: current ? read.result : connected ? undefined : failedRead,
     snapshotAtRead: current ? read.snapshot : undefined,

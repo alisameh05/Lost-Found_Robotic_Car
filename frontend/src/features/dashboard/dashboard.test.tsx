@@ -1,11 +1,11 @@
 // @vitest-environment jsdom
-import { act, cleanup, render, screen, within } from "@testing-library/react";
+import { act, cleanup, fireEvent, render, screen, waitFor, within } from "@testing-library/react";
 import userEvent from "@testing-library/user-event";
 import { afterEach, expect, test, vi } from "vitest";
 import { RuntimeProvider, useRuntime } from "@/features/runtime";
 import type { Object as ObjectRecord, Session, SessionPage } from "@/generated/api-v1";
 import type { ApplicationTransport, Endpoint, HttpRequest, ReadResult } from "@/lib/transport";
-import Dashboard from "./(operator)/page";
+import { DashboardScreen } from "./index";
 
 afterEach(cleanup);
 
@@ -60,12 +60,15 @@ function SwitchScope() {
 
 test("reads only bounded pages, cancels obsolete reads and removes a missing owner and its links", async () => {
   const deferred = Promise.withResolvers<ReadResult<SessionPage>>();
+  const pending = Promise.withResolvers<ReadResult<SessionPage>>();
   const first = transport([object("c"), object("b"), object("a")], () => deferred.promise);
-  const second = transport([object("removed"), object("current")], async (owner) => owner === "removed"
-    ? { kind: "api-error", status: 410, error: { code: "EXPIRED", message: "Expired", retryable: false } }
-    : ok({ items: [stoppedSession("current-session", owner)], next_cursor: "more-sessions" }));
+  const second = transport([object("removed"), object("current"), object("pending")], async (owner) => {
+    if (owner === "pending") return pending.promise;
+    if (owner === "removed") return { kind: "api-error", status: 410, error: { code: "EXPIRED", message: "Expired", retryable: false } };
+    return ok({ items: [stoppedSession("current-session", owner)], next_cursor: "more-sessions" });
+  });
   const openTransport = async (id: string) => ({ transport: id === "idle" ? first.adapter : second.adapter });
-  render(<RuntimeProvider openTransport={openTransport}><SwitchScope /><Dashboard /></RuntimeProvider>);
+  render(<RuntimeProvider openTransport={openTransport}><SwitchScope /><DashboardScreen /></RuntimeProvider>);
 
   const objects = screen.getByRole("region", { name: "Recent objects" });
   const searches = screen.getByRole("region", { name: "Recent searches" });
@@ -90,4 +93,21 @@ test("reads only bounded pages, cancels obsolete reads and removes a missing own
   expect(within(objects).queryByRole("link", { name: /Object removed|Object c\b/ })).toBeNull();
   expect(within(searches).queryByRole("link", { name: /Object c\b/ })).toBeNull();
   expect(within(searches).getByRole("status").textContent).toContain("Recent searches incomplete");
+  await act(async () => pending.resolve(ok({ items: [], next_cursor: null })));
+});
+
+test("uses current reported grace and revalidates an expired grace owner on wake", async () => {
+  const owners = [{ ...object("grace"), expires_at_ms: serverTime - 1, retention_grace: true }];
+  const fixture = transport(owners, async (owner) => ok({ items: [stoppedSession("grace-session", owner)], next_cursor: null }));
+  const openTransport = async () => ({ transport: fixture.adapter });
+  render(<RuntimeProvider openTransport={openTransport}><DashboardScreen /></RuntimeProvider>);
+
+  const objects = screen.getByRole("region", { name: "Recent objects" });
+  const searches = screen.getByRole("region", { name: "Recent searches" });
+  await within(searches).findByRole("link", { name: /Object grace/ });
+  expect(within(objects).getByRole("link", { name: /Object grace/ })).toBeTruthy();
+  owners.length = 0;
+  fireEvent.focus(window);
+  await waitFor(() => expect(within(objects).queryByRole("link", { name: /Object grace/ })).toBeNull());
+  expect(within(searches).queryByRole("link", { name: /Object grace/ })).toBeNull();
 });

@@ -74,6 +74,7 @@ export function createFixtureTransport({
   let failDetail = scene.recordsRecovery;
   let expireContinuation = scene.recordsRecovery;
   let failHistory = scene.historyRecovery;
+  let walletDetailsRead = false;
   let failDashboardHistory = scene.dashboardRecovery;
   let failMatches = scene.historyRecovery;
   let expireSessionCursor = scene.historyRecovery;
@@ -188,7 +189,9 @@ export function createFixtureTransport({
         failDetail = false;
         return { kind: "unavailable" };
       }
-      return objectRead(id);
+      const result = objectRead(id);
+      if (id === sampleObject.id && result.kind === "ok") walletDetailsRead = true;
+      return result;
     },
     "GET /objects/{id}/sessions": ({ id, query }) => {
       const parent = objectRead(id);
@@ -197,8 +200,8 @@ export function createFixtureTransport({
         failDashboardHistory = false;
         return { kind: "unavailable" };
       }
-      // The short Dashboard page must not consume the Object Details recovery script.
-      if (id === sampleObject.id && failHistory && (query?.limit === undefined || query.limit === 5)) {
+      // Arm the history failure after reading the wallet details.
+      if (id === sampleObject.id && failHistory && walletDetailsRead) {
         failHistory = false;
         return { kind: "unavailable" };
       }

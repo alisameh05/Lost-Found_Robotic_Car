@@ -7,7 +7,7 @@ import { Button } from "@/components/ui/button";
 import { LoadingState, Notice, StatusBadge } from "@/components/ui/feedback";
 import { devicePaths, deviceReadinessView, modeLabels, ReadinessNotice } from "@/features/devices";
 import { objectHref, ObjectStatus, RecordTime, RegisterLink, sessionHref, SessionSummary } from "@/features/objects";
-import { DashboardFixtureControls, useRuntime, useRuntimeView, type RuntimeView } from "@/features/runtime";
+import { DashboardFixtureControls, useRefreshRuntime, useRuntimeView, type RuntimeView } from "@/features/runtime";
 import type { ComponentName } from "@/generated/api-v1";
 import { useRecentRecords } from "./recent-records";
 import styles from "./dashboard.module.css";
@@ -17,14 +17,9 @@ type RecentRecords = ReturnType<typeof useRecentRecords>;
 
 export function DashboardScreen() {
   const view = useRuntimeView();
-  const state = useRuntime();
+  const refresh = useRefreshRuntime();
   const readiness = deviceReadinessView(view);
   const recent = useRecentRecords();
-
-  function refresh() {
-    if (state?.connection) void state.connection.runtime.refresh();
-    else if (state) state.select(state.selection.id);
-  }
 
   return <>
     <PageHeader title="Dashboard" description="Your objects, searches and device readiness." actions={<RegisterLink />} />
@@ -33,7 +28,7 @@ export function DashboardScreen() {
         <SearchStatus view={view} readiness={readiness} retry={refresh} />
         <RecentObjects recent={recent} disconnected={view.disconnected} />
         <DeviceReadiness view={view} readiness={readiness} refresh={refresh} />
-        <RecentSearches recent={recent} />
+        <RecentSearches recent={recent} disconnected={view.disconnected} />
       </div>
     </div>
     <DashboardFixtureControls />
@@ -155,20 +150,22 @@ function RecentObjects({ recent: { objectPage, objects, retry }, disconnected }:
   </section>;
 }
 
-function RecentSearches({ recent: { objectPage, sessions, incomplete, retry } }: { recent: RecentRecords }) {
+function RecentSearches({ recent: { objectPage, sessions, loadingSessions, incomplete, retry }, disconnected }: {
+  recent: RecentRecords; disconnected?: boolean;
+}) {
   return <section className={styles.searches} aria-labelledby="dashboard-sessions">
     <h2 id="dashboard-sessions">Recent searches</h2>
     <p className={styles.muted}>Sessions for recent objects · Up to 3, newest starts first</p>
     {!objectPage ? <LoadingState label="Loading recent searches" />
       : objectPage.kind !== "ok" ? <Notice title="Recent searches unavailable" tone="warning" role="status">
-        Retry recent objects to retrieve their searches.
+        {disconnected ? "Search records require a connection to the local application." : "Retry recent objects to retrieve their searches."}
       </Notice> : incomplete ? <div className="feedback-stack">
         <Notice title="Recent searches incomplete" tone="warning" role="status">Some sessions for recent objects could not be retrieved.</Notice>
         <Button onClick={retry}>Retry recent searches</Button>
-      </div> : objectPage.data.items.length === 0 || sessions?.length === 0 ? <Notice title="No sessions for recent objects" role="status" />
-      : !sessions ? <LoadingState label="Loading recent searches" />
+      </div> : loadingSessions ? <LoadingState label="Loading recent searches" />
+      : sessions.length === 0 ? <Notice title="No sessions for recent objects" role="status" />
       : null}
-    {!!sessions?.length && <ul className={styles.rows} aria-label="Recent session records">
+    {sessions.length > 0 && <ul className={styles.rows} aria-label="Recent session records">
       {sessions.map(({ session, owner }) => <li key={session.id}>
         <Link href={sessionHref(session.id)} className={styles.sessionRow}>
           <History size={19} aria-hidden="true" />

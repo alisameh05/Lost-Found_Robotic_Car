@@ -81,7 +81,8 @@ test("disconnected mode hides the harness even when requested", async ({ page })
     if (response.request().resourceType() === "script") scripts.push(response.text());
   });
   await page.goto("http://127.0.0.1:3101/");
-  await expect(page.getByRole("heading", { name: "Application data unavailable" })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Recent objects" }).getByRole("status")).toContainText("Recent objects unavailable");
   await expect(page.getByLabel("Fixture scenario")).toHaveCount(0);
   await expect(page.getByRole("heading", { name: "Sample media preview" })).toHaveCount(0);
   await expect(page.getByRole("region", { name: "Shared control specimens" })).toHaveCount(0);

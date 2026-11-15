@@ -1,14 +1,19 @@
 "use client";
 
-import { useCallback, useEffect } from "react";
-import { recordAbsence, useApplicationRead, useProtectedRead, useRuntime, useRuntimeView, type RuntimeProjection } from "@/features/runtime";
-import type { Object as ObjectRecord, Session } from "@/generated/api-v1";
+import { useEffect, useMemo } from "react";
+import { recordAbsence, useProtectedRead, useRuntime, useRuntimeView } from "@/features/runtime";
+import type { Object as ObjectRecord } from "@/generated/api-v1";
 
 const objectLimit = 3;
 const sessionLimit = 3;
 const objectQuery = { query: { limit: objectLimit } };
-const noObjects: readonly ObjectRecord[] = [];
 const largestTimeout = 2_147_483_647;
+
+function useRecentSessionPage(owner?: ObjectRecord) {
+  const id = owner?.id;
+  const params = useMemo(() => ({ id: id ?? "", query: { limit: sessionLimit } }), [id]);
+  return useProtectedRead("GET /objects/{id}/sessions", params, !!owner).result;
+}
 
 export function useRecentRecords() {
   const runtime = useRuntime()?.connection?.runtime;
@@ -16,43 +21,40 @@ export function useRecentRecords() {
   const catalogue = useProtectedRead("GET /objects", objectQuery);
   // Suppress the previous scope while its replacement is being read.
   const objectPage = catalogue.result?.kind === "ok" && catalogue.snapshotAtRead !== snapshot ? undefined : catalogue.result;
-  const recentObjects = objectPage?.kind === "ok" ? objectPage.data.items : noObjects;
+  const recentObjects = objectPage?.kind === "ok" ? objectPage.data.items.slice(0, objectLimit) : [];
   const activeOwner = failedRead ? undefined : snapshot?.active_session?.object_id;
-  const readSessions = useCallback(async (runtime: RuntimeProjection, signal: AbortSignal) => {
-    const pages = await Promise.allSettled(recentObjects.map(({ id }) =>
-      runtime.read("GET /objects/{id}/sessions", { id, query: { limit: sessionLimit } }, signal)));
-    const absent = new Set<string>();
-    const sessions: Session[] = [];
-    let incomplete = false;
-    pages.forEach((page, index) => {
-      const owner = recentObjects[index].id;
-      if (page.status === "fulfilled" && page.value.kind === "ok") {
-        const owned = page.value.data.items.filter(({ object_id }) => object_id === owner);
-        sessions.push(...owned);
-        incomplete ||= owned.length !== page.value.data.items.length;
-      } else {
-        incomplete = true;
-        if (page.status === "fulfilled" && recordAbsence(page.value)) absent.add(owner);
-      }
-    });
-    sessions.sort((left, right) => right.started_at_ms - left.started_at_ms ||
-      (left.id === right.id ? 0 : left.id > right.id ? -1 : 1));
-    return { kind: "ok", status: 200, data: { sessions, incomplete, absent } } as const;
-  }, [recentObjects]);
-  const history = useApplicationRead(readSessions, recentObjects.length > 0, true);
-  const historyData = history.result?.kind === "ok" ? history.result.data : undefined;
+  // The catalogue page has three slots. Each owner settles and invalidates independently.
+  const [first, second, third] = recentObjects;
+  const histories = [useRecentSessionPage(first), useRecentSessionPage(second), useRecentSessionPage(third)];
+  const owners = recentObjects.map((owner, index) => ({ owner, history: histories[index] }));
 
   const now = runtime?.serverTime();
-  const hasGrace = (object: ObjectRecord) => activeOwner === object.id ||
-    (!snapshot && object.retention_grace);
-  const visible = recentObjects.filter((object) => !historyData?.absent.has(object.id) &&
-    (now === undefined || object.expires_at_ms > now || hasGrace(object)));
-  const sessionRows = historyData?.sessions.flatMap((session) => {
-    const owner = visible.find(({ id }) => id === session.object_id);
-    return owner ? [{ session, owner }] : [];
-  }).slice(0, sessionLimit);
-  const deadline = Math.min(...visible.filter((item) => !hasGrace(item)).map((item) => item.expires_at_ms));
+  const hasGrace = (object: ObjectRecord) => object.retention_grace || activeOwner === object.id;
+  const visible = owners.filter(({ owner, history }) => !recordAbsence(history) &&
+    (now === undefined || owner.expires_at_ms > now || hasGrace(owner)));
+  const sessions = visible.flatMap(({ owner, history }) => history?.kind === "ok"
+    ? history.data.items.filter(({ object_id }) => object_id === owner.id).map((session) => ({ session, owner }))
+    : []);
+  sessions.sort(({ session: left }, { session: right }) => right.started_at_ms - left.started_at_ms ||
+    (left.id === right.id ? 0 : left.id > right.id ? -1 : 1));
+  const deadline = Math.min(...visible.filter(({ owner }) => !hasGrace(owner)).map(({ owner }) => owner.expires_at_ms));
   const { retry } = catalogue;
+
+  useEffect(() => {
+    if (!runtime || !recentObjects.length) return;
+    const currentRuntime = runtime;
+    function onWake() {
+      if (document.visibilityState === "visible" && !currentRuntime.getView().loading) {
+        void currentRuntime.refresh({ readBootstrap: true });
+      }
+    }
+    window.addEventListener("focus", onWake);
+    document.addEventListener("visibilitychange", onWake);
+    return () => {
+      window.removeEventListener("focus", onWake);
+      document.removeEventListener("visibilitychange", onWake);
+    };
+  }, [recentObjects.length, runtime]);
 
   useEffect(() => {
     if (!runtime || !Number.isFinite(deadline)) return;
@@ -62,23 +64,19 @@ export function useRecentRecords() {
       if (remaining <= 0) retry();
       else timer = setTimeout(schedule, Math.min(remaining, largestTimeout));
     }
-    function onFocus() {
-      clearTimeout(timer);
-      schedule();
-    }
     schedule();
-    window.addEventListener("focus", onFocus);
     return () => {
       clearTimeout(timer);
-      window.removeEventListener("focus", onFocus);
     };
   }, [deadline, retry, runtime]);
 
   return {
     objectPage,
-    objects: visible,
-    sessions: sessionRows,
-    incomplete: historyData?.incomplete || (objectPage?.kind === "ok" && recentObjects.length !== visible.length),
+    objects: visible.map(({ owner }) => owner),
+    sessions: sessions.slice(0, sessionLimit),
+    loadingSessions: visible.some(({ history }) => !history),
+    incomplete: recentObjects.length !== visible.length || visible.some(({ owner, history }) => history &&
+      (history.kind !== "ok" || history.data.items.some(({ object_id }) => object_id !== owner.id))),
     retry,
   };
 }
