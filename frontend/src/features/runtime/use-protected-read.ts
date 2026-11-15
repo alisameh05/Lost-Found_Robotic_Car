@@ -2,7 +2,7 @@
 
 import { useCallback, useState } from "react";
 import type { HttpResponses, Token } from "@/generated/api-v1";
-import type { ReadEndpoint, ReadParams } from "@/lib/transport";
+import { isInvalidCursor, type ReadEndpoint, type ReadParams } from "@/lib/transport";
 import type { RuntimeProjection } from "./projection";
 import { useApplicationRead, useRuntime } from "./runtime-provider";
 
@@ -33,8 +33,7 @@ export function useCursorPage<Route extends PageRoute>(route: Route, scope: Read
   const load = useCallback((runtime: RuntimeProjection, signal: AbortSignal) =>
     runtime.read(route, { ...scope, query: { ...scope.query, cursor } }, signal), [route, scope, cursor]);
   const { result, retry } = useApplicationRead(load, enabled, true);
-  const restart = cursor !== undefined && result?.kind === "api-error" &&
-    (result.error.code === "CURSOR_INVALID" || result.error.code === "CURSOR_EXPIRED");
+  const restart = cursor !== undefined && isInvalidCursor(result);
 
   if (!sameScope || restart) setNavigation({ scope, runtime, cursors: firstPage });
   const next = result?.kind === "ok" ? result.data.next_cursor : null;

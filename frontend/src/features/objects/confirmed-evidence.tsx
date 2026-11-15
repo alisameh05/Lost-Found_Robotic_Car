@@ -4,9 +4,10 @@ import { useCallback } from "react";
 import { LoadingState, Notice } from "@/components/ui/feedback";
 import { useApplicationRead, type RuntimeProjection } from "@/features/runtime";
 import type { Match, Session, Token } from "@/generated/api-v1";
-import type { ReadResult } from "@/lib/transport";
+import { isInvalidCursor, type ReadResult } from "@/lib/transport";
 import { CapturedEvidence } from "./captured-evidence";
 import { RecordReadFailure } from "./record-ui";
+import { historyPageSize } from "./session-history";
 import styles from "./records.module.css";
 
 function found<T>(data: T): ReadResult<T> {
@@ -25,8 +26,7 @@ async function findInPages<T>(
     signal.throwIfAborted();
     const page = await read(cursor);
     if (page.kind !== "ok") {
-      if (!restarted && cursor && page.kind === "api-error" &&
-          (page.error.code === "CURSOR_EXPIRED" || page.error.code === "CURSOR_INVALID")) {
+      if (!restarted && cursor && isInvalidCursor(page)) {
         restarted = true;
         cursor = undefined;
         visited.clear();
@@ -43,23 +43,23 @@ async function findInPages<T>(
   } while (true);
 }
 
-export function ConfirmedEvidence({ objectId, foundAt }: { objectId: string; foundAt: number }) {
+export function ConfirmedEvidence({ objectId }: { objectId: string }) {
   const load = useCallback(async (runtime: RuntimeProjection, signal: AbortSignal): Promise<ReadResult<Match | null>> => {
     const session = await findInPages<Session>(
-      (cursor) => runtime.read("GET /objects/{id}/sessions", { id: objectId, query: { cursor } }, signal),
-      (item) => item.object_id === objectId && item.end_reason === "Confirmed" && item.ended_at_ms === foundAt,
+      (cursor) => runtime.read("GET /objects/{id}/sessions", { id: objectId, query: { limit: historyPageSize, cursor } }, signal),
+      (item) => item.object_id === objectId && item.end_reason === "Confirmed",
       signal,
     );
     if (session.kind !== "ok") return session;
     if (!session.data) return found(null);
     const sessionId = session.data.id;
     return findInPages<Match>(
-      (cursor) => runtime.read("GET /sessions/{id}/matches", { id: sessionId, query: { cursor } }, signal),
+      (cursor) => runtime.read("GET /sessions/{id}/matches", { id: sessionId, query: { limit: historyPageSize, cursor } }, signal),
       (item) => item.session_id === sessionId && item.object_id === objectId &&
-        item.disposition === "Confirmed" && item.reviewed_at_ms === foundAt,
+        item.disposition === "Confirmed",
       signal,
     );
-  }, [objectId, foundAt]);
+  }, [objectId]);
   const { result, retry } = useApplicationRead(load, true, true);
   return <section className={styles.confirmedEvidence} aria-label="Confirmed evidence">
     <h3>Confirmed evidence</h3>

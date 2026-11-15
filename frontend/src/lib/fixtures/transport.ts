@@ -1,5 +1,5 @@
 import type {
-  EmergencyStopRequest, Error as ApiError, EventEnvelope, FrameMetadata, HttpResponses,
+  EmergencyStopRequest, Error as ApiError, EventEnvelope, FrameMetadata, HttpResponses, Object as LostObject,
   RetentionChange, RetentionPreviewRequest,
   SessionAction, StartRequest, TicketRequest,
 } from "@/generated/api-v1";
@@ -55,7 +55,14 @@ export function createFixtureTransport({
     now, signal: lifetime.signal, getSnapshot: () => snapshot, healthy: scene.health.storage_integrity === "Healthy",
     normalize: normalizeRegistration, recovery: scenario === "registration-recovery", scripted: scriptedRegistration,
   });
-  const snapshotRead = () => ({ ...snapshot, operations: [...snapshot.operations, ...registrations.operations()] });
+  const snapshotRead = () => {
+    const active_object = snapshot.active_object && withRecordGrace(snapshot.active_object, now());
+    return {
+      ...snapshot, active_object,
+      retention: { ...snapshot.retention, active_object_grace: active_object?.retention_grace ?? false },
+      operations: [...snapshot.operations, ...registrations.operations()],
+    };
+  };
   const previews = new Map<string, { value: ReturnType<typeof sampleRetentionPreview>; owners: string }>();
   const retentionReceipts = new Map<string, { fingerprint: string; response: ReturnType<typeof mutation> }>();
   let previewSequence = 0;
@@ -90,10 +97,15 @@ export function createFixtureTransport({
     return structuredClone(result);
   }
 
+  function withRecordGrace(object: LostObject, time: number): LostObject {
+    const retention_grace = object.expires_at_ms <= time && snapshot.active_session?.object_id === object.id;
+    return retention_grace === object.retention_grace ? object : { ...object, retention_grace };
+  }
+
   function eligibleObjects() {
     const time = now();
-    return [...scene.objects.filter((object) => object.expires_at_ms > time ||
-        (object.retention_grace && snapshot.active_session?.object_id === object.id)),
+    const samples = scene.objects.map((object) => withRecordGrace(object, time));
+    return [...samples.filter((object) => object.expires_at_ms > time || object.retention_grace),
       ...registrations.records().map(({ object }) => object)];
   }
 
@@ -221,7 +233,7 @@ export function createFixtureTransport({
       }
       if (body.action === "acknowledge" && !body.failure_ids.every((id) => snapshot.failures.some((failure) => failure.failure_id === id))) return missing;
       if (body.action === "resume" && !snapshot.readiness.can_resume) return error(409, "RECOVERY_REQUIRED", "Sample recovery is incomplete.");
-      const losesGrace = snapshot.active_object?.retention_grace && (body.action === "stop" || body.action === "confirm");
+      const losesGrace = snapshotRead().active_object?.retention_grace && (body.action === "stop" || body.action === "confirm");
       return mutation(body.action_id, "Committed", losesGrace ? emptyResult : reviewReceipt(body, snapshot));
     },
     "POST /settings/retention-preview": ({ body: value }) => {

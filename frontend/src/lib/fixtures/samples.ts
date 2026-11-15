@@ -115,7 +115,7 @@ export const paused: Extract<Session, { state: "Paused" }> = {
 };
 
 const rejectedAt = sampleTime - 100_000;
-export const rejected: Match = {
+export const rejected: Extract<Match, { disposition: "Rejected" }> = {
   id: "sample-rejected", session_id: sampleSession.id, object_id: sampleObject.id,
   captured_at_ms: rejectedAt, frame_id: "sample-rejected-frame", stream_epoch: "fixture-robot-stream",
   box: sampleSwatchRect, disposition: "Rejected", reviewed_at_ms: rejectedAt + 1000,
@@ -126,7 +126,7 @@ export const notReviewed: Match = {
   disposition: "NotReviewed", reviewed_at_ms: null,
   evidence_media: { ...missingMedia, role: "Evidence", content_type: "image/png" },
 };
-export const confirmed: Match = {
+export const confirmed: Extract<Match, { disposition: "Confirmed" }> = {
   ...rejected, id: "sample-confirmed", session_id: foundSession.id, object_id: foundObject.id,
   captured_at_ms: sampleTime - 181_000, frame_id: "sample-confirmed-frame",
   disposition: "Confirmed", reviewed_at_ms: foundObject.found_at_ms,

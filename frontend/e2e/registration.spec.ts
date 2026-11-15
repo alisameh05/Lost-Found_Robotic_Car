@@ -234,7 +234,7 @@ for (const scenario of ["searching", "paused"]) {
     await page.getByRole("button", { name: "Found", exact: true }).click();
     await page.getByRole("link", { name: "View details for Headphones" }).click();
     await expect(page).toHaveURL(/sample-headphones$/);
-    await expect(page.getByText("Found", { exact: true })).toBeVisible();
+    await expect(page.getByRole("main").locator("header").getByText("Found", { exact: true })).toBeVisible();
   });
 }
 

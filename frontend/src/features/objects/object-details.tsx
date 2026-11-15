@@ -8,13 +8,13 @@ import { useRuntimeView } from "@/features/runtime";
 import type { Object as ObjectRecord } from "@/generated/api-v1";
 import { ConfirmedEvidence } from "./confirmed-evidence";
 import { ObjectStatus, RecordAbsent, recordAbsence, RecordReadFailure, RecordTime, ReferenceImage, RegisterLink, StartSearch, useObjectRecord } from "./record-ui";
-import { ObjectSessionHistory, useObjectSessions } from "./session-history";
+import { historyPageSize, ObjectSessionHistory, useObjectSessions } from "./session-history";
 import styles from "./records.module.css";
 
 export function ObjectDetailsScreen({ objectId }: { objectId: string }) {
   const { result, retry, object, absence } = useObjectRecord(objectId);
   const { disconnected } = useRuntimeView();
-  const history = useObjectSessions(objectId, 5, Boolean(object));
+  const history = useObjectSessions(objectId, historyPageSize, Boolean(object));
   const missing = absence ?? recordAbsence(history.result);
   if (disconnected) return <DataUnavailable />;
   return <div className={styles.recordLayout}>
@@ -50,7 +50,7 @@ function RecordDetails({ object, history }: { object: ObjectRecord; history: Ret
         This record remains available while its active search continues.
       </Notice>}
       <StartSearch object={object} />
-      {object.status === "Found" && <ConfirmedEvidence objectId={object.id} foundAt={object.found_at_ms} />}
+      {object.status === "Found" && <ConfirmedEvidence objectId={object.id} />}
     </section>
   </div>;
 }

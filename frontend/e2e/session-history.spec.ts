@@ -1,4 +1,4 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Locator, type Page } from "@playwright/test";
 
 test.use({ baseURL: "http://127.0.0.1:3100" });
 
@@ -17,7 +17,17 @@ async function trackRevocations(page: Page) {
     URL.revokeObjectURL = (url) => { revoked.add(String(url)); revoke(url); };
   });
   return (url: string) => page.evaluate((value) =>
-    (window as Window & { revokedEvidenceUrls: Set<string> }).revokedEvidenceUrls.has(value), url);
+    (window as Window & { revokedEvidenceUrls?: Set<string> }).revokedEvidenceUrls?.has(value) ?? false, url);
+}
+
+const walletEvidenceSha256 = "905e9dec4db0ff9d1546d0ee3ea9e93575f314114ca0f486fc854c782b776a03";
+
+function evidenceDigest(frame: Locator) {
+  return frame.evaluate(async (node: HTMLImageElement) => {
+    const bytes = await (await fetch(node.src)).arrayBuffer();
+    const hash = await crypto.subtle.digest("SHA-256", bytes);
+    return new Uint8Array(hash).toHex();
+  });
 }
 
 test("opens a stopped search from the owning object and shows saved review facts", async ({ page }) => {
@@ -97,6 +107,7 @@ test("loads the exact Found frame and keeps its saved box aligned during inspect
   const image = evidence.getByRole("img", { name: "Captured evidence", exact: true });
   await expect(image).toHaveAttribute("src", /^blob:/);
   await expect.poll(() => image.evaluate((node: HTMLImageElement) => [node.naturalWidth, node.naturalHeight])).toEqual([480, 262]);
+  expect(await evidenceDigest(image)).toBe(walletEvidenceSha256);
   await page.screenshot({ path: testInfo.outputPath("object-details-1440.png") });
   await history.getByRole("button", { name: "Next" }).click();
   await expect(history.getByRole("status")).toContainText("Page 2");
@@ -109,12 +120,7 @@ test("loads the exact Found frame and keeps its saved box aligned during inspect
   await expect.poll(() => revoked(objectUrl)).toBe(true);
   const captures = page.getByRole("region", { name: "Captured matches" });
   const frame = captures.getByRole("img", { name: "Captured evidence", exact: true });
-  const digest = await frame.evaluate(async (node: HTMLImageElement) => {
-    const bytes = await (await fetch(node.src)).arrayBuffer();
-    const hash = await crypto.subtle.digest("SHA-256", bytes);
-    return new Uint8Array(hash).toHex();
-  });
-  expect(digest).toBe("905e9dec4db0ff9d1546d0ee3ea9e93575f314114ca0f486fc854c782b776a03");
+  expect(await evidenceDigest(frame)).toBe(walletEvidenceSha256);
   async function checkBox() {
     return frame.evaluate((node) => {
       const image = node.getBoundingClientRect();
@@ -157,16 +163,31 @@ test("loads the exact Found frame and keeps its saved box aligned during inspect
   expect(external).toEqual([]);
 });
 
-test("shows confirmed facts without media and distinguishes expired and missing session links", async ({ page }) => {
+test("finds the confirmation across both page boundaries even when the media is missing", async ({ page }) => {
   await page.goto("/");
   await page.getByLabel("Fixture scenario").selectOption("missing-confirmation-media");
   await page.getByRole("link", { name: "Objects / History", exact: true }).click();
   await page.getByRole("link", { name: "View details for Headphones" }).click();
+  const sessions = page.getByRole("region", { name: "Search sessions" });
+  await expect(sessions.getByRole("listitem")).toHaveCount(5);
+  await expect(sessions.getByText("Found", { exact: true })).toHaveCount(0);
+  await expect(sessions.getByRole("link").first()).toHaveAttribute("href", "/sessions/sample-tied-session-4");
   const evidence = page.getByRole("region", { name: "Confirmed evidence" });
   await expect(evidence.getByText("Media missing", { exact: true })).toBeVisible();
   await expect(evidence.getByText("Confirmed", { exact: true })).toBeVisible();
-  await expect(evidence.locator("time").last()).toHaveAttribute("datetime", "2026-11-13T11:57:00.000Z");
+  await expect(evidence.locator("time").last()).toHaveAttribute("datetime", "2026-11-13T11:56:59.998Z");
   await expect(evidence.getByRole("img")).toHaveCount(0);
+  await sessions.getByRole("button", { name: "Next" }).click();
+  await sessions.getByRole("listitem").filter({ hasText: "Found" }).getByRole("link").click();
+  const captures = page.getByRole("region", { name: "Captured matches" });
+  await expect(captures.getByRole("article")).toHaveCount(5);
+  await expect(captures.getByText("Confirmed", { exact: true })).toHaveCount(0);
+  await captures.getByRole("button", { name: "Next" }).click();
+  await expect(captures.getByText("Confirmed", { exact: true })).toBeVisible();
+  await expect(captures.getByText("Media missing", { exact: true })).toBeVisible();
+});
+
+test("distinguishes expired and missing direct session links", async ({ page }) => {
   await page.goto("/sessions/sample-expired-search");
   await expect(page.getByText("Session expired", { exact: true })).toBeVisible();
   await page.goto("/sessions/sample-purged-search");
@@ -189,6 +210,8 @@ test("revokes an open inspection when the owner expires", async ({ page }) => {
 });
 
 test("keeps grace evidence and keyboard Emergency Stop available during active inspection", async ({ page }) => {
+  const revoked = await trackRevocations(page);
+  await page.clock.install();
   await page.goto("/");
   await page.getByLabel("Fixture scenario").selectOption("expiry-grace");
   const workspace = page.getByRole("complementary").getByRole("link", { name: "Return to Active Search" });
@@ -215,5 +238,14 @@ test("keeps grace evidence and keyboard Emergency Stop available during active i
   await page.getByRole("link", { name: "Back to Session Details" }).click();
   const pending = page.getByRole("article").filter({ hasText: "Pending" });
   await expect(pending.locator("time")).toHaveCount(1);
-  await expect(pending.getByRole("img", { name: "Captured evidence" })).toBeVisible();
+  const pendingFrame = pending.getByRole("img", { name: "Captured evidence" });
+  await expect(pendingFrame).toHaveAttribute("src", /^blob:/);
+  const pendingUrl = (await pendingFrame.getAttribute("src"))!;
+  await pending.getByRole("button", { name: "Inspect evidence" }).click();
+  await expect(page.getByText("Active-session grace", { exact: true })).toHaveCount(0);
+  await page.clock.fastForward(8 * 86_400_000);
+  await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();
+  await expect(pendingFrame).toHaveAttribute("src", pendingUrl);
+  await expect(pending.getByRole("region", { name: "Enlarged captured evidence" })).toBeVisible();
+  expect(await revoked(pendingUrl)).toBe(false);
 });

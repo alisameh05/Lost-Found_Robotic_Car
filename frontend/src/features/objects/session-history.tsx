@@ -11,6 +11,7 @@ import styles from "./records.module.css";
 
 export const sessionHref = (id: string) => `/sessions/${encodeURIComponent(id)}`;
 export const modeLabel = (mode: ControlMode) => mode === "Gestures" ? "Gestures" : "PS4";
+export const historyPageSize = 5;
 
 export function useObjectSessions(objectId: string, limit?: number, enabled = true) {
   const scope = useMemo(() => ({ id: objectId, query: { limit } }), [objectId, limit]);

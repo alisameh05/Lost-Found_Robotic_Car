@@ -55,6 +55,16 @@ const graceMatch: Match = {
   ...rejected, id: "sample-grace-match", session_id: graceSession.id, object_id: graceObject.id,
   frame_id: "sample-grace-frame", evidence_media: { ...rejected.evidence_media, id: "sample-grace-evidence" },
 };
+// Equal millisecond timestamps exercise the descending ASCII tie-breaker on both history routes.
+const confirmationTieSessions = Array.from({ length: 5 }, (_, index): Session => ({
+  ...foundSession, id: `sample-tied-session-${index}`, end_reason: "Stopped", ended_at_ms: foundSession.started_at_ms,
+}));
+const confirmationTieMatches = Array.from({ length: 5 }, (_, index): Match => ({
+  ...rejected, id: `sample-tied-match-${index}`, frame_id: `sample-tied-frame-${index}`,
+  session_id: foundSession.id, object_id: foundObject.id,
+  captured_at_ms: confirmed.captured_at_ms, reviewed_at_ms: confirmed.captured_at_ms,
+  evidence_media: { ...rejected.evidence_media, id: `sample-tied-evidence-${index}`, created_at_ms: confirmed.captured_at_ms },
+}));
 const candidateSession: typeof paused = { ...paused, pause_causes: [{ cause: "CandidateReview", failure_id: null }] };
 const recoverySession: typeof paused = {
   ...paused, revision: 3, pause_causes: [{ cause: "RecoveryRequired", failure_id: recoveryFailure.failure_id }],
@@ -96,7 +106,11 @@ const scenarios = {
     matches: [...history, walletConfirmed],
   }),
   "missing-confirmation-media": withSnapshot(snapshot, {
-    matches: [notReviewed, rejected, { ...confirmed, evidence_media: { ...confirmed.evidence_media, availability: "Missing" } }],
+    sessions: [...initial.sessions, ...confirmationTieSessions],
+    matches: [
+      ...history.filter(({ id }) => id !== confirmed.id), ...confirmationTieMatches,
+      { ...confirmed, reviewed_at_ms: foundSession.ended_at_ms - 2, evidence_media: { ...confirmed.evidence_media, availability: "Missing" } },
+    ],
   }),
   "controller-ready": withSnapshot({ ...owned, readiness: readiness(controllerReady, fixtureProfile, null, true) }),
   "gestures-ready": withSnapshot({ ...owned, readiness: readiness(gesturesReady, fixtureProfile, null, true) }),

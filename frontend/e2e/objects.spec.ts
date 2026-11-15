@@ -86,7 +86,7 @@ test("recovers failed list and detail reads and restarts an expired cursor with 
 
 test("shows Found metadata, protected reference failures, and distinct expired and missing records", async ({ page }) => {
   await page.goto("/objects/sample-headphones");
-  await expect(page.getByText("Found", { exact: true })).toBeVisible();
+  await expect(page.getByRole("main").locator("header").getByText("Found", { exact: true })).toBeVisible();
   const reference = page.getByRole("region", { name: "Object reference and selected target" });
   const record = page.getByRole("region", { name: "Object record" });
   await expect(record.getByText("Confirmed", { exact: true }).first()).toBeVisible();

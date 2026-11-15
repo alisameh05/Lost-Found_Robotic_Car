@@ -9,7 +9,7 @@ import { useCursorPage, useProtectedRead, useRuntimeView } from "@/features/runt
 import type { Match, Session } from "@/generated/api-v1";
 import { CapturedEvidence, dispositionLabel } from "./captured-evidence";
 import { objectHref, RecordAbsent, recordAbsence, RecordReadFailure, RecordTime, ReferenceImage, useObjectRecord } from "./record-ui";
-import { HistoryPager, modeLabel, sessionHref } from "./session-history";
+import { HistoryPager, historyPageSize, modeLabel, sessionHref } from "./session-history";
 import styles from "./records.module.css";
 
 const sessionOutcomes = { Confirmed: "Confirmed and ended", Stopped: "Search stopped", Interrupted: "Search interrupted" };
@@ -20,7 +20,7 @@ export function SessionDetailsScreen({ sessionId }: { sessionId: string }) {
   const { disconnected, snapshot } = useRuntimeView();
   const session = result?.kind === "ok" && result.data.id === sessionId ? result.data : undefined;
   const owner = useObjectRecord(session?.object_id);
-  const matchScope = useMemo(() => ({ id: sessionId, query: { limit: 5 } }), [sessionId]);
+  const matchScope = useMemo(() => ({ id: sessionId, query: { limit: historyPageSize } }), [sessionId]);
   const paging = useCursorPage("GET /sessions/{id}/matches", matchScope, Boolean(owner.object));
   const missing = recordAbsence(result) ?? owner.absence ?? recordAbsence(paging.result);
   const matches = session && paging.result?.kind === "ok" ? paging.result.data.items.filter((match) =>
