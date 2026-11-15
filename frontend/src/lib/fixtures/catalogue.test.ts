@@ -46,10 +46,18 @@ test.each(scenarioIds)("validates the %s fixture's bootstrap, snapshot, health a
   contract("ObjectPage", listed);
   for (const owner of listed.items) {
     expect(validObject(owner)).toBe(true);
+    if (scene.historyRecovery && owner.id === sampleObject.id) {
+      expect(await transport.request("GET /objects/{id}/sessions", { id: owner.id, context: bootstrap }))
+        .toEqual({ kind: "unavailable" });
+    }
     const sessions = data(await transport.request("GET /objects/{id}/sessions", { id: owner.id, context: bootstrap }));
     contract("SessionPage", sessions);
     for (const session of sessions.items) {
       expect(validSession(session, owner)).toBe(true);
+      if (scene.historyRecovery && session.id === sampleSession.id) {
+        expect(await transport.request("GET /sessions/{id}/matches", { id: session.id, context: bootstrap }))
+          .toEqual({ kind: "unavailable" });
+      }
       const matches = data(await transport.request("GET /sessions/{id}/matches", { id: session.id, context: bootstrap }));
       contract("MatchPage", matches);
       for (const match of matches.items) expect(validMatch(match, session)).toBe(true);

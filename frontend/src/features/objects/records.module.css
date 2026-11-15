@@ -121,6 +121,63 @@
 .reference :global(.protected-crop) { max-width: calc(12rem * var(--crop-ratio)); }
 .recordSummary dl { display: grid; gap: var(--space-3); margin: 0; }
 .recordSummary dd { margin: var(--space-1) 0 0; }
+.historyColumn, .captureSection {
+  display: grid;
+  gap: var(--space-6);
+  min-width: 0;
+}
+.history h2, .captureSection h2, .activity h2, .confirmedEvidence h3, .sessionMetadata h2 {
+  margin: 0 0 var(--space-3);
+}
+.historyRows, .activity ol {
+  margin: 0;
+  padding: 0;
+  list-style: none;
+}
+.historyRows {
+  border: 1px solid var(--border);
+  border-radius: var(--radius-panel);
+}
+.historyRows li, .sessionFacts, .sessionSummary {
+  display: flex;
+  flex-wrap: wrap;
+  align-items: center;
+  gap: var(--space-3);
+}
+.historyRows li {
+  justify-content: space-between;
+  padding: var(--space-3);
+}
+.historyRows li + li { border-top: 1px solid var(--border); }
+.sessionSummary { flex: 1 1 min(26rem, 100%); justify-content: space-between; }
+.sessionTimes { display: grid; gap: var(--space-1); }
+.sessionFacts, .captureTimes, .activity time { color: var(--muted); font-size: .875rem; }
+.captureSection { gap: var(--space-2); }
+.captureGrid {
+  display: grid;
+  grid-template-columns: repeat(2, minmax(0, 1fr));
+  align-items: start;
+  gap: var(--space-4);
+}
+.captureGrid > :only-child { grid-column: 1 / -1; }
+.confirmedEvidence, .capture, .referenceTarget { width: 100%; min-width: 0; }
+.capture figure, .referenceTarget figure { margin-block: 0 var(--space-2); }
+.referenceTarget :global(.protected-crop) { max-width: calc(14rem * var(--crop-ratio)); }
+.captureTimes {
+  display: grid;
+  gap: var(--space-1);
+  margin-block: var(--space-2) 0;
+}
+.captureTimes div { display: flex; flex-wrap: wrap; gap: var(--space-1) var(--space-2); }
+.captureTimes dd { margin: 0; color: var(--ink); }
+.sessionMetadata :global(.notice) { margin-top: var(--space-3); }
+.activity ol { display: grid; gap: var(--space-3); }
+.activity li {
+  display: grid;
+  gap: var(--space-1);
+  padding: var(--space-2) var(--space-3);
+  border-inline-start: 2px solid var(--teal);
+}
 .detailActions {
   justify-content: end;
   margin-top: var(--space-8);
@@ -139,7 +196,7 @@
 /* Main content loses width to the shared sidebar, especially with enlarged text. */
 .recordLayout { container-type: inline-size; }
 @container (max-width: 36rem) {
-  .library, .details { grid-template-columns: minmax(0, 1fr); }
+  .library, .details, .captureGrid { grid-template-columns: minmax(0, 1fr); }
 }
 @container (max-width: 21rem) {
   .reference { grid-template-columns: minmax(0, 1fr); }

@@ -1,5 +1,6 @@
 import type { Media } from "@/generated/api-v1";
 import referenceImages from "./reference-images.json";
+import walletEvidence from "./wallet-evidence.json";
 
 // Original synthetic 32 × 24 RGB swatch, encoded as JPEG and PNG with System.Drawing.
 // Keep bytes inside the fixture adapter so the preview uses the protected-media path.
@@ -9,14 +10,16 @@ const png = "iVBORw0KGgoAAAANSUhEUgAAACAAAAAYCAYAAACbU/80AAAAAXNSR0IArs4c6QAAAAR
 export const imageWidth = 32;
 export const imageHeight = 24;
 
-// Local design references derived from pen design/generated-1.png and generated.png.
-export function sampleReference(id: string) {
+// Local design references come from pen design/generated-1.png and generated.png.
+// The synthetic wallet capture comes from pen design/generated-3.png.
+export function sampleMediaAsset(id: string) {
   if (id === "sample-wallet-reference" || id === "sample-bottle-reference") return referenceImages[id];
+  if (id === "sample-wallet-confirmed-evidence") return walletEvidence;
 }
 
 export function sampleMediaBytes(id: string, contentType: Media["content_type"]) {
-  const reference = sampleReference(id);
-  return reference ? decode(reference.base64) : sampleImage(contentType);
+  const asset = sampleMediaAsset(id);
+  return asset ? decode(asset.base64) : sampleImage(contentType);
 }
 
 export function sampleImage(contentType: Media["content_type"]) {

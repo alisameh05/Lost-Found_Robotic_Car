@@ -27,7 +27,9 @@ test.describe("fixture preview", () => {
         if (navigation === "refresh") await page.reload();
         await expect(page.getByRole("heading", { level: 1, name: title })).toBeVisible();
         await expect(page.getByText(fixtureLabel, { exact: true })).toBeVisible();
-        if (!["Objects / History", "Object Details", "Register Object"].includes(title)) {
+        if (title === "Session Details") {
+          await expect(page.getByRole("region", { name: "Session record" })).toBeVisible();
+        } else if (!["Objects / History", "Object Details", "Register Object"].includes(title)) {
           await expect(page.getByText("Phase 01 preview", { exact: true })).toBeVisible();
         }
         await expect(page.getByRole("navigation", { name: "Main navigation" }).getByRole("link", { name: section, exact: true }))

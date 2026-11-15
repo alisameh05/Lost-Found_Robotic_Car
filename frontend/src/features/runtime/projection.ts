@@ -106,7 +106,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     },
     refresh,
     emergency,
-    submissionTime() {
+    serverTime() {
       if (clock && !lifetime.signal.aborted) return clock.server + Math.floor(performance.now() - clock.received);
     },
     async register(action: RegistrationAction, signal: AbortSignal) {

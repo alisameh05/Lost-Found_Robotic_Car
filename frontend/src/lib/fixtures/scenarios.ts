@@ -1,7 +1,9 @@
 import type { BootstrapResponse, Error as ApiError, Health, Match, Object as LostObject, Session, Snapshot } from "@/generated/api-v1";
 import {
-  bootstrapFacts, clear, expiredObject, fixtureProfile, foundObject, foundSession, healthFor, libraryRecords, notReviewed, paused,
-  pending, readiness, recoveryFailure, rejected, sampleObject, sampleSession, searching, snapshot, warning, confirmed,
+  bootstrapFacts, clear, confirmed, earlierWalletMatches, earlierWalletSessions, expiredObject, expiredSession,
+  fixtureProfile, foundObject, foundSession, foundWallet, healthFor, interruptedSession, libraryRecords, notReviewed, paused,
+  pending, readiness, recoveryFailure, rejected, sampleObject, sampleSession, searching, snapshot, walletConfirmed,
+  walletConfirmedSession, warning,
 } from "./samples";
 
 type Scenario = {
@@ -13,13 +15,14 @@ type Scenario = {
   matches: readonly Match[];
   snapshotError?: ApiError;
   recordsRecovery?: boolean;
+  historyRecovery?: boolean;
   emergency: "Committed" | "Pending" | "Failed" | "network";
 };
 
 const history = [notReviewed, rejected, confirmed];
 const initial: Scenario = {
   bootstrap: bootstrapFacts, snapshot, health: healthFor(snapshot, "Ready"), objects: libraryRecords,
-  sessions: [sampleSession, foundSession], matches: history, emergency: "Committed",
+  sessions: [sampleSession, interruptedSession, foundSession, expiredSession], matches: history, emergency: "Committed",
 };
 
 function withSnapshot(state: Snapshot, overrides: Partial<Scenario> = {}, initialization: Health["initialization"] = "Ready"): Scenario {
@@ -48,6 +51,20 @@ const searchingState = active(searching);
 const pausedState = active(paused);
 const graceObject = { ...expiredObject, retention_grace: true };
 const graceSession = { ...paused, id: "sample-grace-search", object_id: graceObject.id };
+const graceMatch: Match = {
+  ...rejected, id: "sample-grace-match", session_id: graceSession.id, object_id: graceObject.id,
+  frame_id: "sample-grace-frame", evidence_media: { ...rejected.evidence_media, id: "sample-grace-evidence" },
+};
+// Equal millisecond timestamps exercise the descending ASCII tie-breaker on both history routes.
+const confirmationTieSessions = Array.from({ length: 5 }, (_, index): Session => ({
+  ...foundSession, id: `sample-tied-session-${index}`, end_reason: "Stopped", ended_at_ms: foundSession.started_at_ms,
+}));
+const confirmationTieMatches = Array.from({ length: 5 }, (_, index): Match => ({
+  ...rejected, id: `sample-tied-match-${index}`, frame_id: `sample-tied-frame-${index}`,
+  session_id: foundSession.id, object_id: foundObject.id,
+  captured_at_ms: confirmed.captured_at_ms, reviewed_at_ms: confirmed.captured_at_ms,
+  evidence_media: { ...rejected.evidence_media, id: `sample-tied-evidence-${index}`, created_at_ms: confirmed.captured_at_ms },
+}));
 const candidateSession: typeof paused = { ...paused, pause_causes: [{ cause: "CandidateReview", failure_id: null }] };
 const recoverySession: typeof paused = {
   ...paused, revision: 3, pause_causes: [{ cause: "RecoveryRequired", failure_id: recoveryFailure.failure_id }],
@@ -79,6 +96,22 @@ const scenarios = {
       ? { ...record, reference_media: { ...record.reference_media, availability: "Available" } }
       : record),
   }),
+  "history-recovery": withSnapshot(snapshot, {
+    historyRecovery: true, sessions: [...initial.sessions, ...earlierWalletSessions],
+    matches: [...history, ...earlierWalletMatches],
+  }),
+  "found-evidence": withSnapshot(snapshot, {
+    objects: libraryRecords.map((object) => object.id === foundWallet.id ? foundWallet : object),
+    sessions: [walletConfirmedSession, ...initial.sessions, ...earlierWalletSessions],
+    matches: [...history, walletConfirmed],
+  }),
+  "missing-confirmation-media": withSnapshot(snapshot, {
+    sessions: [...initial.sessions, ...confirmationTieSessions],
+    matches: [
+      ...history.filter(({ id }) => id !== confirmed.id), ...confirmationTieMatches,
+      { ...confirmed, reviewed_at_ms: foundSession.ended_at_ms - 2, evidence_media: { ...confirmed.evidence_media, availability: "Missing" } },
+    ],
+  }),
   "controller-ready": withSnapshot({ ...owned, readiness: readiness(controllerReady, fixtureProfile, null, true) }),
   "gestures-ready": withSnapshot({ ...owned, readiness: readiness(gesturesReady, fixtureProfile, null, true) }),
   candidate: withSnapshot({ ...active(candidateSession), pending_candidate: pending }, {
@@ -101,7 +134,10 @@ const scenarios = {
   "expiry-grace": withSnapshot(active(graceSession, {
     active_object: graceObject,
     retention: { ...snapshot.retention, active_object_expires_at_ms: graceObject.expires_at_ms, active_object_grace: true },
-  }), { objects: [sampleObject, foundObject, graceObject], sessions: [graceSession, sampleSession, foundSession] }),
+  }), {
+    objects: [sampleObject, foundObject, graceObject], sessions: [graceSession, ...initial.sessions],
+    matches: [...history, graceMatch],
+  }),
   "deletion-failed": withSnapshot({
     ...snapshot,
     readiness: readiness(Object.fromEntries(snapshot.readiness.components.map(({ component, status }) =>

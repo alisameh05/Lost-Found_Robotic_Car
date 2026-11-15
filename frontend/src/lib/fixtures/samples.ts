@@ -3,7 +3,7 @@ import {
   type Failure, type FrontendProfile, type Health, type Match, type Media, type Object as LostObject,
   type Proximity, type Rect, type Session, type Settings, type Snapshot,
 } from "@/generated/api-v1";
-import { imageHeight, imageWidth, sampleImage, sampleReference } from "./images";
+import { imageHeight, imageWidth, sampleImage, sampleMediaAsset } from "./images";
 
 export const sampleTime = Date.UTC(2026, 10, 13, 12);
 export const day = 86_400_000;
@@ -38,10 +38,10 @@ export const bootstrapFacts: BootstrapResponse = {
 
 function media(id: string, role: Media["role"], availability: Media["availability"], created_at_ms: number): Media {
   const content_type = role === "Reference" ? "image/jpeg" : "image/png";
-  const reference = sampleReference(id);
+  const asset = sampleMediaAsset(id);
   return { id, role, availability, created_at_ms, content_type,
-    width: reference?.width ?? imageWidth, height: reference?.height ?? imageHeight,
-    byte_length: reference?.byte_length ?? sampleImage(content_type).byteLength };
+    width: asset?.width ?? imageWidth, height: asset?.height ?? imageHeight,
+    byte_length: asset?.byte_length ?? sampleImage(content_type).byteLength };
 }
 
 export const sampleSwatchRect: Rect = { x: 7, y: 5, width: 18, height: 14 };
@@ -99,6 +99,14 @@ export const foundSession: Extract<Session, { state: "Ended" }> = {
   ...sampleSession, id: "sample-confirmed-search", object_id: foundObject.id, end_reason: "Confirmed",
   started_at_ms: sampleTime - 240_000, ended_at_ms: foundObject.found_at_ms,
 };
+export const interruptedSession: typeof sampleSession = {
+  ...sampleSession, id: "sample-interrupted-search", control_mode: "Gestures", end_reason: "Interrupted",
+  started_at_ms: sampleTime - 300_000, ended_at_ms: sampleTime - 270_000,
+};
+export const expiredSession: typeof sampleSession = {
+  ...sampleSession, id: "sample-expired-search", object_id: expiredObject.id,
+  started_at_ms: expiredObject.registered_at_ms + 60_000, ended_at_ms: expiredObject.registered_at_ms + 120_000,
+};
 export const searching: Extract<Session, { state: "Searching" }> = {
   ...sampleSession, state: "Searching", ended_at_ms: null, end_reason: null, revision: 1, pause_causes: [],
 };
@@ -107,7 +115,7 @@ export const paused: Extract<Session, { state: "Paused" }> = {
 };
 
 const rejectedAt = sampleTime - 100_000;
-export const rejected: Match = {
+export const rejected: Extract<Match, { disposition: "Rejected" }> = {
   id: "sample-rejected", session_id: sampleSession.id, object_id: sampleObject.id,
   captured_at_ms: rejectedAt, frame_id: "sample-rejected-frame", stream_epoch: "fixture-robot-stream",
   box: sampleSwatchRect, disposition: "Rejected", reviewed_at_ms: rejectedAt + 1000,
@@ -118,7 +126,7 @@ export const notReviewed: Match = {
   disposition: "NotReviewed", reviewed_at_ms: null,
   evidence_media: { ...missingMedia, role: "Evidence", content_type: "image/png" },
 };
-export const confirmed: Match = {
+export const confirmed: Extract<Match, { disposition: "Confirmed" }> = {
   ...rejected, id: "sample-confirmed", session_id: foundSession.id, object_id: foundObject.id,
   captured_at_ms: sampleTime - 181_000, frame_id: "sample-confirmed-frame",
   disposition: "Confirmed", reviewed_at_ms: foundObject.found_at_ms,
@@ -128,6 +136,37 @@ export const pending: Match = {
   ...notReviewed, id: "sample-candidate", frame_id: "sample-candidate-frame", disposition: "Pending",
   evidence_media: { ...media("sample-pending-evidence", "Evidence", "Available", notReviewed.captured_at_ms), role: "Evidence", content_type: "image/png" },
 };
+
+export const walletConfirmationTime = sampleTime - 15_000;
+export const foundWallet = {
+  ...sampleObject, status: "Found", found_at_ms: walletConfirmationTime, revision: 2,
+} satisfies LostObject;
+export const walletConfirmedSession: typeof sampleSession = {
+  ...sampleSession, id: "sample-wallet-confirmed-search", end_reason: "Confirmed", control_mode: "Gestures",
+  started_at_ms: sampleTime - 50_000, ended_at_ms: walletConfirmationTime,
+};
+const walletCaptureTime = sampleTime - 20_000;
+export const walletConfirmed: Match = {
+  ...confirmed, id: "sample-wallet-confirmed", session_id: walletConfirmedSession.id, object_id: foundWallet.id,
+  captured_at_ms: walletCaptureTime, reviewed_at_ms: walletConfirmationTime, frame_id: "sample-wallet-confirmed-frame",
+  box: { x: 303, y: 204, width: 84, height: 38 },
+  evidence_media: { ...media("sample-wallet-confirmed-evidence", "Evidence", "Available", walletCaptureTime),
+    role: "Evidence", content_type: "image/png" },
+};
+
+export const earlierWalletSessions = Array.from({ length: 5 }, (_, index): Session => ({
+  ...sampleSession, id: `sample-earlier-search-${index}`,
+  started_at_ms: sampleTime - 900_000 + index * 90_000, ended_at_ms: sampleTime - 870_000 + index * 90_000,
+}));
+export const earlierWalletMatches = Array.from({ length: 5 }, (_, index): Match => {
+  const capturedAt = sampleTime - 118_000 + index * 3_000;
+  return {
+    ...rejected, id: `sample-earlier-match-${index}`, frame_id: `sample-earlier-frame-${index}`,
+    captured_at_ms: capturedAt, reviewed_at_ms: capturedAt + 1_000,
+    evidence_media: { ...media(`sample-earlier-evidence-${index}`, "Evidence", index === 3 ? "Corrupt" : "Available", capturedAt),
+      role: "Evidence", content_type: "image/png" },
+  };
+});
 
 const sharedComponents: ComponentName[] = [
   "Backend", "Storage", "Command", "RobotVideo", "DisplayedRobotVideo", "AI", "Workspace", "QualificationProfile",

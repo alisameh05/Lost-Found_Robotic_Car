@@ -1,6 +1,6 @@
-import { SessionScreen } from "@/features/search";
+import { SessionDetailsScreen } from "@/features/objects";
 
 export default async function Page({ params }: PageProps<"/sessions/[sessionId]">) {
   const { sessionId } = await params;
-  return <SessionScreen sessionId={sessionId} view="details" />;
+  return <SessionDetailsScreen sessionId={sessionId} />;
 }

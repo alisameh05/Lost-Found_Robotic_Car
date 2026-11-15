@@ -115,7 +115,7 @@ export function useRegistration(runtime?: RuntimeProjection) {
         dispatch(failedAction);
         return;
       }
-      const actionCreatedAtMs = runtime.submissionTime();
+      const actionCreatedAtMs = runtime.serverTime();
       if (actionCreatedAtMs === undefined) return;
       const action = { actionCreatedAtMs, body: { ...fields, action_id: crypto.randomUUID() } };
       unresolved.set(runtime, action);

@@ -15,6 +15,11 @@ export type ProtectedPath = {
   [Route in Endpoint]: Route extends `${infer Method} ${infer Path}` ? Method extends "GET" ? Path : never : never;
 }[Endpoint];
 export type PageQuery = { cursor?: Token; limit?: number };
+export function isInvalidCursor(result?: ReadResult<unknown>) {
+  return result?.kind === "api-error" &&
+    (result.error.code === "CURSOR_INVALID" || result.error.code === "CURSOR_EXPIRED");
+}
+
 export type ObjectQuery = PageQuery & { name?: string; status?: LostObject["status"] };
 export type ProtectedRequest = { context: ClientContext; signal?: AbortSignal };
 type RouteParams<Route> = Route extends `${string}{id}${string}` ? { id: string } : { id?: never };

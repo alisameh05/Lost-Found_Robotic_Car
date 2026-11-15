@@ -32,6 +32,8 @@ export function RuntimeProvider({ openTransport, harnessEnabled = false, childre
   const [current, setCurrent] = useState<Connection>();
   const [harness, setHarness] = useState<Harness>();
   const [failed, setFailed] = useState<number>();
+  const select = useCallback((id: string) =>
+    setSelection((previous) => ({ id, generation: previous.generation + 1 })), []);
 
   useEffect(() => {
     if (!openTransport) return;
@@ -59,10 +61,7 @@ export function RuntimeProvider({ openTransport, harnessEnabled = false, childre
   );
 
   return (
-    <RuntimeContext value={{
-      connection, harnessEnabled, harness, selection,
-      select: (id) => setSelection((previous) => ({ id, generation: previous.generation + 1 })),
-    }}>
+    <RuntimeContext value={{ connection, harnessEnabled, harness, selection, select }}>
       <RuntimeViewContext value={view}>{children}</RuntimeViewContext>
     </RuntimeContext>
   );
@@ -81,11 +80,13 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
   enabled = true, waitForRuntime = false) {
   const state = useRuntime();
   const runtime = state?.connection?.runtime;
+  const select = state?.select;
+  const scenario = state?.selection.id;
   const { snapshot, connected, failedRead, loading } = useRuntimeView();
   const ready = connected && (!waitForRuntime || snapshot !== undefined || !loading);
   const [attempt, setAttempt] = useState(0);
   const [read, setRead] = useState<{
-    runtime: RuntimeProjection; load: typeof load; attempt: number; result: ReadResult<T>;
+    runtime: RuntimeProjection; load: typeof load; attempt: number; result: ReadResult<T>; snapshot: RuntimeView["snapshot"];
   }>();
 
   useEffect(() => {
@@ -93,19 +94,21 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
     const currentRuntime = runtime;
     const lifetime = new AbortController();
     function publish(result: ReadResult<T>) {
-      if (!lifetime.signal.aborted) setRead({ runtime: currentRuntime, load, attempt, result });
+      if (!lifetime.signal.aborted) setRead({ runtime: currentRuntime, load, attempt, result, snapshot });
     }
     void load(currentRuntime, lifetime.signal).then(publish).catch(() => publish({ kind: "unavailable" }));
     return () => lifetime.abort();
   }, [runtime, load, attempt, snapshot, ready, enabled]);
 
   const current = enabled && read?.runtime === runtime && read?.load === load && read.attempt === attempt;
+  const retry = useCallback(() => {
+    if (connected) setAttempt((previous) => previous + 1);
+    else if (runtime) void runtime.refresh();
+    else if (scenario !== undefined) select?.(scenario);
+  }, [connected, runtime, scenario, select]);
   return {
     result: current ? read.result : connected ? undefined : failedRead,
-    retry: () => {
-      if (connected) setAttempt((previous) => previous + 1);
-      else if (runtime) void runtime.refresh();
-      else if (state) state.select(state.selection.id);
-    },
+    snapshotAtRead: current ? read.snapshot : undefined,
+    retry,
   };
 }
