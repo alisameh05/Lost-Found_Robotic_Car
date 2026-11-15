@@ -20,9 +20,8 @@ export function mutation(
 
 export function emergencyResponse(
   body: EmergencyStopRequest, snapshot: Snapshot, failure_id: EmergencyStopResponse["failure_id"],
-  outcome: EmergencyStopResponse["persistence"] | "network",
-): ReadResult<EmergencyStopResponse> {
-  if (outcome === "network") return { kind: "unavailable" };
+  outcome: EmergencyStopResponse["persistence"],
+): Extract<ReadResult<EmergencyStopResponse>, { kind: "ok" }> {
   const session_id = snapshot.active_session?.id ?? null;
   const base = {
     request_id: body.request_id, backend_boot_id: snapshot.backend_boot_id, permission_revoked: true,

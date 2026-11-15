@@ -1,5 +1,5 @@
 import type { EmergencyStopRequest, EmergencyStopResponse, FrontendProfile, Health, RetentionChange, RetentionPreviewRequest, Snapshot } from "@/generated/api-v1";
-import { compatibleProfile } from "@/lib/fixture-contracts";
+import { compatibleProfile, conforms } from "@/lib/fixture-contracts";
 import { pendingReview } from "@/lib/match-evidence";
 import type { ApplicationTransport, HttpRequest, ProtectedPath, ProtectedRequest, ReadEndpoint, ReadParams, ReadResult } from "@/lib/transport";
 import { openWorkspace, type WorkspaceView } from "./workspace";
@@ -52,13 +52,27 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     if (!snapshot || response.backend_boot_id !== snapshot.backend_boot_id ||
         response.session_id === null || response.session_id !== snapshot.active_session?.id) return snapshot;
     return { ...snapshot, runtime: { ...snapshot.runtime, effective_session_state: "Paused", motion_permission: "Disarmed",
-      persistence_pending: response.persistence === "Pending" } } satisfies Snapshot;
+      persistence_pending: snapshot.runtime.persistence_pending || response.persistence === "Pending" } } satisfies Snapshot;
   }
 
   function update(changes: Partial<RuntimeView>) {
     if (lifetime.signal.aborted) return;
     view = { ...view, ...changes };
     for (const notify of subscribers) notify();
+  }
+
+  function reconcileEmergency(snapshot: Snapshot) {
+    const feedback = view.emergency;
+    if (feedback?.kind !== "result" || feedback.response.persistence !== "Pending" ||
+        feedback.response.backend_boot_id !== snapshot.backend_boot_id) return;
+    const response = feedback.response;
+    const receipt = snapshot.operations.find(({ request_id }) => request_id === response.request_id);
+    if (receipt?.persistence === "Failed") {
+      update({ emergency: { kind: "result", status: 503, response: { ...response, persistence: "Failed", error: receipt.error } } });
+    } else if (receipt?.persistence === "Committed" && receipt.result.session?.id === response.session_id &&
+        receipt.result.session.pause_causes.some(({ failure_id }) => failure_id === response.failure_id)) {
+      update({ emergency: { kind: "result", status: 200, response: { ...response, persistence: "Committed", error: null } } });
+    }
   }
 
   async function refresh({ readBootstrap = false } = {}) {
@@ -90,11 +104,14 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
           workspace?.dispose();
           workspace = undefined;
         }
-        if (!sameAuthority) searchActions.clear();
+        if (!sameAuthority) {
+          searchActions.clear();
+          uncertainRequest = undefined;
+        }
         context = bootstrap.data;
         clock = { server: bootstrap.data.server_time_ms, received: bootstrapStarted };
         update({ connected: true, profile: sameProfile ? view.profile : profile,
-          ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, removedOwners: undefined }) });
+          ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, removedOwners: undefined, emergency: undefined }) });
       }
       const request = { context, signal };
       const unavailable = () => ({ kind: "unavailable" } as const);
@@ -104,7 +121,10 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       ]);
       if (signal.aborted) return;
       const eventsLive = view.workspace?.eventsLive;
-      if (status.kind === "ok") searchActions.reconcile(status.data, request.context);
+      if (status.kind === "ok") {
+        searchActions.reconcile(status.data, request.context);
+        reconcileEmergency(status.data);
+      }
       update({
         snapshot: eventsLive ? view.snapshot : status.kind === "ok" ? status.data : view.snapshot,
         failedRead: status.kind === "ok" || eventsLive ? undefined : status,
@@ -119,16 +139,21 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
   async function emergency() {
     if (!context || lifetime.signal.aborted || view.emergency?.kind === "sending") return;
     const request = { context, signal: lifetime.signal };
+    const generation = view.snapshot?.runtime.control_generation;
     const body = uncertainRequest ?? { request_id: crypto.randomUUID() };
     uncertainRequest = body;
     update({ emergency: { kind: "sending" } });
     try {
       const result = await transport.emergency(body, request);
-      if (result.kind === "ok" && result.data.request_id === body.request_id &&
+      if (context?.backend_boot_id !== request.context.backend_boot_id) return;
+      if (result.kind === "ok" && conforms("EmergencyStopResponse", result.data) && result.data.request_id === body.request_id &&
           result.data.backend_boot_id === request.context.backend_boot_id) {
         uncertainRequest = undefined;
-        workspace?.release("Control was released by Emergency Stop.");
-        update({ emergency: { kind: "result", status: result.status, response: result.data }, snapshot: acknowledgedSnapshot(result.data) });
+        const unchanged = view.snapshot?.runtime.control_generation === generation;
+        if (unchanged) workspace?.clearControl("Control was released by Emergency Stop.");
+        update({ emergency: { kind: "result", status: result.status, response: result.data },
+          ...(unchanged && { snapshot: acknowledgedSnapshot(result.data) }) });
+        if (view.snapshot) reconcileEmergency(view.snapshot);
         void refresh();
       } else if (result.kind === "api-error") {
         uncertainRequest = undefined;
@@ -176,6 +201,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
             ...(removedOwner && { removedOwners: new Set([...view.removedOwners ?? [], removedOwner]) }) });
           if (removedOwner) searchActions.purge([removedOwner]);
           if (context) searchActions.reconcile(next, context);
+          reconcileEmergency(next);
         },
         recover: () => {
           update({ snapshot: undefined, failedRead: { kind: "unavailable" } });
@@ -222,6 +248,12 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       if (active?.id !== id || (intent.kind === "resume" && (!state.readiness.can_resume ||
           !view.workspace.previewLive || !view.workspace.usable))) return;
       const body = { ...scope, action_id: crypto.randomUUID(), session_id: id, expected_revision: active.revision };
+      if (intent.kind === "acknowledge") {
+        const action = { ...body, action: intent.kind, failure_ids: intent.failureIds };
+        if (!conforms("SessionAction", action) || !intent.failureIds.every((id) =>
+          state.failures.some((failure) => failure.session_id === active.id && failure.failure_id === id))) return;
+        return searchActions.submit(key, action, context, active.object_id);
+      }
       if (intent.kind === "confirm" || intent.kind === "reject") {
         const candidate = state.pending_candidate;
         if (!pendingReview(state, candidate) || candidate.id !== intent.candidateId ||

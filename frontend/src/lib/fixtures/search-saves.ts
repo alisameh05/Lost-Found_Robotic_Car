@@ -5,7 +5,7 @@ import { fixtureError } from "./responses";
 
 type Response = ReadResult<MutationResponse>;
 export type SearchDelivery = "commit" | "pending" | "fail" | "lose-response" | "undelivered";
-type SearchAction = "start" | "pause" | "resume" | "stop" | "confirm" | "reject";
+type SearchAction = "start" | "pause" | "resume" | "stop" | "confirm" | "reject" | "acknowledge";
 
 export function openSearchSaves(publish: () => void) {
   const receipts = new Map<string, {

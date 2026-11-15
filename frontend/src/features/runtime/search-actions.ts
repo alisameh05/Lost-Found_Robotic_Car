@@ -4,6 +4,7 @@ import type { ApplicationTransport, ClientContext, ReadResult } from "@/lib/tran
 
 export type SearchIntent = { kind: "start"; object: ObjectRecord; mode: ControlMode }
   | { kind: "pause" | "resume" | "stop"; sessionId: string }
+  | { kind: "acknowledge"; sessionId: string; failureIds: [string, ...string[]] }
   | { kind: "confirm" | "reject"; sessionId: string; candidateId: string };
 
 export type SearchFeedback = ({ stage: "sending" | "pending" | "unknown" }
@@ -11,7 +12,7 @@ export type SearchFeedback = ({ stage: "sending" | "pending" | "unknown" }
   | { stage: "failed"; message: string; retryable: boolean }
   | { stage: "committed"; session: Session | null }) & { candidateId?: string };
 
-type ActionBody = StartRequest | Exclude<SessionAction, { action: "acknowledge" }>;
+type ActionBody = StartRequest | SessionAction;
 type Action = { context: ClientContext; body: ActionBody; objectId: string; feedback: SearchFeedback; timer?: ReturnType<typeof setTimeout> };
 
 export const searchActionKey = (kind: SearchIntent["kind"], id: string) => `${kind}:${id}`;
@@ -56,6 +57,7 @@ export function openSearchActions({
           session.pause_causes.some(({ cause }) => cause === "ReviewRejected");
     }
     if (body.action === "stop") return session.end_reason === "Stopped";
+    if (body.action === "acknowledge") return session.state !== "Ended";
     return session.state === (body.action === "pause" ? "Paused" : "Searching");
   }
 

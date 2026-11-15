@@ -240,7 +240,7 @@ export function openWorkspace({
       changed(live) {
         if (live) connection.healthy();
         if (source === "webcam") { report({ webcamLive: live }); return; }
-        if (!live && !waitingForWorkspace && !awaitingDraw) release("Control was released when the robot preview stopped updating.");
+        if (!live && !waitingForWorkspace && !awaitingDraw) reportIneligible("Control was released when the robot preview stopped updating.", view.usable);
         report({ previewLive: live });
       },
       epochChanged() { connection.reconnect(); },
@@ -273,7 +273,7 @@ export function openWorkspace({
     checkSurface();
     const frame = robotVideo.displayed();
     if (current !== lease) return;
-    if (!frame) { release("Control was released when the robot preview stopped updating."); return; }
+    if (!frame) { reportIneligible("Control was released when the robot preview stopped updating.", view.usable); return; }
     const accepted = events.current()?.heartbeat({
       type: "workspace_heartbeat", protocol_version: 1, backend_boot_id: context.backend_boot_id,
       client_id: context.client_id, client_lease_id: current.secret, session_id: current.session,
@@ -281,27 +281,31 @@ export function openWorkspace({
       workspace_visible: document.visibilityState === "visible", workspace_focused: document.hasFocus(),
       workspace_operational: view.usable, displayed_robot_frame: frame,
     });
-    if (!accepted) release("The display heartbeat was rejected. Acquire control again when available.");
+    if (!accepted) clearControl("The display heartbeat was rejected. Acquire control again when available.");
   }
 
   function checkSurface() {
     // Only the disconnected canvas is expected during handoff. Document loss still revokes immediately.
     if (waitingForWorkspace && navigator.onLine && document.visibilityState === "visible" && document.hasFocus()) return;
     const operational = usable();
-    if (!operational && (lease || acquisition)) release("Control was released when the workspace became unavailable.");
+    if (!operational && (lease || acquisition)) reportIneligible("Control was released when the workspace became unavailable.", false);
     report({ usable: operational });
   }
 
-  function lostFocus() {
-    // Report an ineligible owner even if the separate release request is lost.
+  function reportIneligible(message: string, operational: boolean, focused = document.hasFocus()) {
+    // If this observation cannot arrive, the fixture independently expires the lease or displayed frame.
     if (lease) events.current()?.heartbeat({
       type: "workspace_heartbeat", protocol_version: 1, backend_boot_id: context.backend_boot_id,
       client_id: context.client_id, client_lease_id: lease.secret, session_id: lease.session,
       control_generation: lease.generation, heartbeat_seq: ++lease.sequence,
-      workspace_visible: document.visibilityState === "visible", workspace_focused: false,
-      workspace_operational: false, displayed_robot_frame: null,
+      workspace_visible: document.visibilityState === "visible", workspace_focused: focused,
+      workspace_operational: operational, displayed_robot_frame: null,
     });
-    release("Control was released when the workspace lost focus.");
+    clearControl(message);
+  }
+
+  function lostFocus() {
+    reportIneligible("Control was released when the workspace lost focus.", false, false);
     report({ usable: false });
   }
 
@@ -325,6 +329,7 @@ export function openWorkspace({
 
   return {
     resynchronize: events.reconnect,
+    clearControl,
     mount(robotHost: HTMLElement, webcamHost?: HTMLElement, sessionId?: string) {
       robotHost.append(robot);
       if (webcamHost) {

@@ -1,5 +1,5 @@
 import type {
-  EmergencyStopRequest, EventEnvelope, FrameMetadata, HttpResponses, LeaseAcquire, LeaseRelease, Match, Object as LostObject, Session,
+  EmergencyStopRequest, EmergencyStopResponse, EventEnvelope, Failure, FailureCause, FrameMetadata, HttpResponses, LeaseAcquire, LeaseRelease, Match, Object as LostObject, Operation, Session,
   RetentionChange, RetentionPreviewRequest,
   SessionAction, Snapshot, StartRequest, TicketRequest,
 } from "@/generated/api-v1";
@@ -14,9 +14,9 @@ import { sampleMediaBytes } from "./images";
 import type { normalizeReference } from "../reference-image";
 import { openRegistrations } from "./registration";
 import { caseFold } from "./casefold";
-import { emergencyResponse, emptyResult, mutation, reviewReceipt, startReceipt } from "./mutations";
+import { emergencyResponse, emptyResult, mutation, reviewReceipt, startReceipt, storageError } from "./mutations";
 import { fixturePages } from "./pages";
-import { expiredObject, healthFor, leaseId, paused, recoveryFailure, sampleObject, sampleSession, sampleTime, searching } from "./samples";
+import { expiredObject, healthFor, leaseId, paused, sampleObject, sampleSession, sampleTime, searching } from "./samples";
 import { readScenario, type ScenarioId } from "./scenarios";
 import { expiryFor, openRetention, unavailableStorage } from "./retention";
 import { fixtureOk as ok, fixtureError as error } from "./responses";
@@ -24,6 +24,7 @@ import { openSocketTickets } from "./socket-tickets";
 import { openFixtureWorkspace, type FrameMode } from "./workspace";
 import { committedSearch, openSearchSaves, type SearchDelivery } from "./search-saves";
 import { capturePng } from "./capture-png";
+import { openFixtureProximity } from "./proximity";
 
 type FixtureOptions = {
   scenario?: ScenarioId;
@@ -44,10 +45,16 @@ const invalid = error(422, "VALIDATION_FAILED", "A sample request field is inval
 const conflict = error(409, "REVISION_CONFLICT", "Sample revision has changed.");
 type OrdinaryAction = Extract<SessionAction, { action: "pause" | "resume" | "stop" }>;
 type ReviewAction = Extract<SessionAction, { action: "confirm" | "reject" }>;
+type AcknowledgeAction = Extract<SessionAction, { action: "acknowledge" }>;
 type CandidateObservation = "visible" | "exit" | "uncertain" | "unprepared" | "mismatched" | "stale" | "corrupt-media" | "missing-media";
 type SearchInput = "neutral" | "invalid" | "forward" | "backward" | "left" | "right";
 const searchBusy = error(503, "CAPACITY_REACHED", "A sample search action is still saving.");
 const evidenceUnavailable = error(503, "MEDIA_UNAVAILABLE", "The captured evidence is unavailable.");
+const requiredPaths = { Command: "CommandUnavailable", Webcam: "InputUnavailable", Controller: "InputUnavailable",
+  AI: "AIUnavailable", RobotVideo: "RobotVideoUnavailable", Storage: "StorageFault" } as const;
+type RequiredPath = keyof typeof requiredPaths;
+const workspaceFailures = new Set<FailureCause>(["WorkspaceDisconnected", "WorkspaceHidden", "WorkspaceUnfocused",
+  "WorkspaceUnusable", "HeartbeatExpired", "DisplayStale", "RobotVideoUnavailable"]);
 
 export function createFixtureTransport({
   scenario = "idle", now: fixtureNow, monotonic = () => performance.now(), startSpecimen = false,
@@ -69,6 +76,7 @@ export function createFixtureTransport({
   const clients = new Set([bootstrap.client_id]);
   let { objects, sessions, matches } = scene;
   const captures = new Map<string, { bytes: Uint8Array; readFault?: "corrupt-media" | "missing-media" }>();
+  const endedFailureOwners = new Map<string, { sessionId: string; objectId: string }>();
   let suppressedSession: string | undefined;
   let preparingEvidence: Session | undefined;
   let snapshotError = scene.snapshotError;
@@ -78,6 +86,11 @@ export function createFixtureTransport({
   let retentionTimer: ReturnType<typeof setTimeout> | undefined;
   const healthy = () => scene.health.storage_integrity === "Healthy";
   const searchSaves = openSearchSaves(() => workspace.publish());
+  const proximity = openFixtureProximity(snapshot.proximity, now, monotonic, () => workspace.publishProximity());
+  const emergencyOperations = new Map<string, Operation>();
+  const emergencyReceipts = new Map<string, { fingerprint: string; response: ReturnType<typeof emergencyResponse> }>();
+  let emergencyDelivery: SearchDelivery | undefined;
+  let pendingEmergency: { failure: Failure; requests: Set<string> } | undefined;
   let sampleInput: SearchInput | undefined;
   let neutralObserved = false;
   let dropRelease = false;
@@ -94,6 +107,7 @@ export function createFixtureTransport({
       .map(({ id }) => ({ id, files: 1 + matches.filter((match) => match.object_id === id).length })),
     purge(owners) {
       for (const owner of owners.keys()) searchSaves.purge(owner);
+      for (const [id, { objectId }] of endedFailureOwners) if (owners.has(objectId)) endedFailureOwners.delete(id);
       objects = objects.filter(({ id }) => !owners.has(id));
       sessions = sessions.filter(({ object_id }) => !owners.has(object_id));
       for (const match of matches) if (owners.has(match.object_id)) captures.delete(match.evidence_media.id);
@@ -102,7 +116,8 @@ export function createFixtureTransport({
     },
     invalidate, manualCleanup,
   });
-  const storageBlocked = () => !healthy() || retention.read().deletion.status === "Failed";
+  const pathReady = (path: RequiredPath) => snapshot.readiness.components.some(({ component, status }) => component === path && status === "Ready");
+  const storageBlocked = () => !healthy() || !pathReady("Storage") || retention.read().deletion.status === "Failed";
   const readinessRead = (client = bootstrap.client_id) => {
     const { readiness } = snapshot;
     const { workspace: usable, displayed } = workspace.observations();
@@ -131,19 +146,20 @@ export function createFixtureTransport({
       Gestures: sharedReady && !active && !searchSaves.pending() && selectedReady("Gestures"),
       Controller: sharedReady && !active && !searchSaves.pending() && selectedReady("Controller"),
     }, can_resume: sharedReady && active?.state === "Paused" && snapshot.runtime.effective_session_state === "Paused" &&
-      !searchSaves.pending() && !snapshot.runtime.persistence_pending && !snapshot.pending_candidate && preparingEvidence?.id !== active.id &&
+      !searchSaves.pending() && !snapshot.runtime.persistence_pending && !pendingEmergency && !snapshot.pending_candidate && preparingEvidence?.id !== active.id &&
       snapshot.failures.every((failure) => failure.session_id !== active.id || (failure.restored && failure.acknowledged)) &&
       selectedReady(active.control_mode) };
   };
   const snapshotRead = (client = bootstrap.client_id): Snapshot => {
     const active_object = snapshot.active_object && projectObject(snapshot.active_object, now());
-    const operations = [...snapshot.operations, ...searchSaves.operations(), ...registrations.operations().filter(({ result }) =>
+    const operations = [...snapshot.operations, ...searchSaves.operations(), ...emergencyOperations.values(), ...registrations.operations().filter(({ result }) =>
       !result?.object || !retention.excluded(result.object.id)), ...retention.operations()];
     const pending = operations.filter(({ persistence }) => persistence === "Pending");
     const completed = operations.filter(({ persistence }) => persistence !== "Pending").slice(-64);
     return {
       ...snapshot, event_seq: workspace.watermark(), active_object, readiness: readinessRead(client),
-      runtime: { ...snapshot.runtime, persistence_pending: snapshot.runtime.persistence_pending ||
+      failures: snapshot.failures.filter(({ restored, acknowledged }) => !restored || !acknowledged), proximity: proximity.read(),
+      runtime: { ...snapshot.runtime, persistence_pending: snapshot.runtime.persistence_pending || !!pendingEmergency ||
         (snapshot.active_session !== null && searchSaves.pending()) },
       lease: snapshot.lease.state === "Owned" ? snapshot.lease : { ...snapshot.lease, can_acquire: workspace.canAcquire(client) },
       retention: { ...retention.read(), active_object_expires_at_ms: active_object?.expires_at_ms ?? null,
@@ -151,27 +167,30 @@ export function createFixtureTransport({
       operations: [...pending, ...completed],
     };
   };
-  let emergencyFailure = snapshot.failures.find((failure) => failure.cause === "EmergencyStop" && !failure.restored);
   const profile = compatibleProfile(snapshot.qualification_profile) ? snapshot.qualification_profile : null;
   const tickets = openSocketTickets(monotonic, now);
   const workspace = openFixtureWorkspace({
     boot: bootstrap.backend_boot_id, profile, now, monotonic, read: snapshotRead, frameMode: scene.frameMode,
     available: (source) => snapshot.readiness.components.some(({ component, status }) =>
       component === (source === "robot" ? "RobotVideo" : "Webcam") && status === "Ready"),
-    setLease(lease, pause) {
-      sampleInput = undefined;
-      neutralObserved = false;
-      const session = snapshot.active_session;
-      const pausedSession = pause && !storageBlocked() && session?.state === "Searching" ? {
-        ...session, state: "Paused" as const, revision: session.revision + 1,
-        pause_causes: [{ cause: "ManualPause" as const, failure_id: null }],
-      } : session;
-      if (pausedSession && pausedSession !== session) saveSession(pausedSession);
-      snapshot = { ...snapshot, lease, active_session: pausedSession, runtime: {
-        ...snapshot.runtime, effective_session_state: pause && session ? "Paused" : snapshot.runtime.effective_session_state,
-        control_generation: lease.control_generation, motion_permission: "Disarmed",
-      } };
+    setLease(lease, cause) {
+      resetInput();
+      snapshot = { ...snapshot, lease, runtime: { ...snapshot.runtime, control_generation: lease.control_generation } };
+      if (lease.state === "Owned") return;
+      if (cause) {
+        const failure = pauseForFailure(cause);
+        if (failure) persistFailurePause(failure);
+      } else if (snapshot.runtime.effective_session_state === "Searching") {
+        pauseEffectively();
+        const session = snapshot.active_session;
+        if (session && session.state !== "Ended" && !storageBlocked()) installSession({ ...session, state: "Paused", revision: session.revision + 1,
+          pause_causes: [{ cause: "ManualPause", failure_id: null }] });
+      }
     },
+    restoreWorkspace: () => restoreFailures((cause) => (workspaceFailures.has(cause) || (cause === "EmergencyStop" &&
+      snapshot.failures.filter((failure) => failure.cause === cause && !failure.restored).every((failure) =>
+        snapshot.active_session?.pause_causes.some(({ failure_id }) => failure_id === failure.failure_id)))) &&
+      (cause !== "RobotVideoUnavailable" || pathReady("RobotVideo"))),
   });
   let failList = scene.recordsRecovery;
   let failDetail = scene.recordsRecovery;
@@ -275,6 +294,125 @@ export function createFixtureTransport({
       ? sessions.map((value) => value.id === session.id ? session : value) : [...sessions, session];
   }
 
+  function installSession(session: Session) {
+    saveSession(session);
+    snapshot = { ...snapshot, active_session: session };
+  }
+
+  function pauseEffectively() {
+    resetInput();
+    if (snapshot.active_session) snapshot = { ...snapshot, runtime: { ...snapshot.runtime, effective_session_state: "Paused" } };
+    if (searchSaves.pending("resume")) searchSaves.finish(false, "resume");
+  }
+
+  function pauseForFailure(cause: FailureCause) {
+    const session_id = snapshot.active_session?.id;
+    if (!session_id) return; // Before Start the component status is the diagnostic.
+    const current = snapshot.failures.find((failure) => failure.session_id === session_id && failure.cause === cause && !failure.restored);
+    const failure = current ?? { failure_id: crypto.randomUUID(), session_id, cause, observed_at_ms: now(),
+      restored: false, acknowledged: false };
+    if (!current) snapshot = { ...snapshot, failures: [...snapshot.failures, failure] };
+    pauseEffectively();
+    return failure;
+  }
+
+  function persistFailurePause(failure: Failure) {
+    const session = snapshot.active_session;
+    if (!session || session.state === "Ended" || failure.session_id !== session.id || storageBlocked()) return;
+    if (session.pause_causes.some(({ failure_id }) => failure_id === failure.failure_id)) return session;
+    const paused: Session = { ...session, state: "Paused", revision: session.revision + 1,
+      pause_causes: [...session.pause_causes, { cause: "RecoveryRequired", failure_id: failure.failure_id }] };
+    installSession(paused);
+    return paused;
+  }
+
+  function restoreFailures(matchesCause: (cause: FailureCause) => boolean, saveMissingPauses = false) {
+    const active = snapshot.active_session;
+    if (!active || active.state === "Ended" || storageBlocked()) return false;
+    let restored = false;
+    const failures = snapshot.failures.map((failure) => {
+      if (failure.session_id !== active.id || failure.restored || !matchesCause(failure.cause)) return failure;
+      restored = true;
+      return { ...failure, restored: true };
+    });
+    const pause_causes = [...active.pause_causes];
+    if (saveMissingPauses) {
+      for (const { cause, failure_id, session_id } of failures) {
+        if (session_id === active.id && cause !== "EmergencyStop" && !pause_causes.some((pause) => pause.failure_id === failure_id)) {
+          pause_causes.push({ cause: "RecoveryRequired", failure_id });
+        }
+      }
+    }
+    if (!restored && pause_causes.length === active.pause_causes.length) return false;
+    snapshot = { ...snapshot, failures };
+    installSession(pause_causes.length > active.pause_causes.length ? { ...active, state: "Paused", pause_causes, revision: active.revision + 1 }
+      : { ...active, revision: active.revision + 1 });
+    return true;
+  }
+
+  function observePath(path: RequiredPath, ready: boolean) {
+    const components = structuredClone(snapshot.readiness.components);
+    const component = components.find(({ component }) => component === path);
+    if (!component) return;
+    const previouslyReady = component.status === "Ready";
+    component.status = ready ? "Ready" : "Unavailable";
+    component.cause_codes = ready ? [] : [path === "Storage" ? "STORAGE_UNAVAILABLE" : "NOT_READY"];
+    snapshot = { ...snapshot, readiness: { ...snapshot.readiness, components } };
+    const cause = requiredPaths[path];
+    const mode = snapshot.active_session?.control_mode;
+    if ((path === "Webcam" && mode === "Controller") || (path === "Controller" && mode === "Gestures")) {
+      workspace.publish("readiness_changed");
+      return;
+    }
+    if (ready) {
+      if (path === "Storage") {
+        const selectedInput = mode === "Controller" ? "Controller" : "Webcam";
+        restoreFailures((failureCause) => failureCause === "StorageFault" ||
+          (failureCause === "CommandUnavailable" && pathReady("Command")) ||
+          (failureCause === "AIUnavailable" && pathReady("AI")) ||
+          (failureCause === "InputUnavailable" && pathReady(selectedInput)), true);
+      } else if (path !== "RobotVideo") restoreFailures((failureCause) => failureCause === cause);
+    } else {
+      const wasSearching = snapshot.runtime.effective_session_state === "Searching";
+      const failure = pauseForFailure(cause);
+      if (path === "RobotVideo") workspace.revokeVideo();
+      else if (wasSearching && previouslyReady) advanceGeneration();
+      if (failure) persistFailurePause(failure);
+    }
+    workspace.publish();
+  }
+
+  function acknowledge(body: AcknowledgeAction, client: string) {
+    if (client !== body.client_id) return error(403, "CLIENT_INVALID", "Unknown sample client.");
+    const read = sessionRead(body.session_id);
+    if (read.kind !== "ok") return read;
+    const fingerprint = JSON.stringify([body.action, body.session_id, body.expected_revision, [...body.failure_ids].sort()]);
+    const retry = searchSaves.replay(body.action_id, fingerprint);
+    if (retry) return retry;
+    if (!workspace.owns(client, body.client_lease_id)) return error(403, "LEASE_REQUIRED", "The current sample lease is required.");
+    const failures = body.failure_ids.map((id) => snapshot.failures.find(({ failure_id }) => failure_id === id));
+    if (body.failure_ids.some((id, index) => {
+      const owner = failures[index]?.session_id ?? endedFailureOwners.get(id)?.sessionId;
+      return owner && owner !== body.session_id;
+    })) {
+      return error(409, "OWNERSHIP_MISMATCH", "The failure belongs to a different sample session.");
+    }
+    if (failures.some((failure) => !failure)) return missing;
+    const session = snapshot.active_session;
+    if (!session || session.id !== body.session_id) return error(409, "INVALID_TRANSITION", "Sample session is inactive.");
+    if (session.revision !== body.expected_revision) return conflict;
+    if (storageBlocked()) return unavailableStorage;
+    if (searchSaves.pending()) return searchBusy;
+    return searchSaves.admit("acknowledge", body.action_id, session.object_id, fingerprint, "commit", () => {
+      if (failures.every((failure) => failure?.acknowledged)) return committedSearch(body.action_id, { session });
+      snapshot = { ...snapshot, failures: snapshot.failures.map((failure) => body.failure_ids.includes(failure.failure_id)
+        ? { ...failure, acknowledged: true } : failure) };
+      const updated = { ...session, revision: session.revision + 1 };
+      installSession(updated);
+      return committedSearch(body.action_id, { session: updated });
+    });
+  }
+
   function resetInput() {
     sampleInput = undefined;
     neutralObserved = false;
@@ -361,7 +499,6 @@ export function createFixtureTransport({
       workspace.publish();
       return searchBusy;
     }
-    snapshot = { ...snapshot, runtime: { ...snapshot.runtime, persistence_pending: delivery === "pending" } };
     return searchSaves.admit(body.action, body.action_id, active.object_id, fingerprint, delivery, () => {
       const session = snapshot.active_session;
       if (!session || session.id !== active.id || session.state === "Ended") return error(409, "INVALID_TRANSITION", "Sample session is inactive.");
@@ -424,7 +561,6 @@ export function createFixtureTransport({
         (body.action === "reject" && searchSaves.pending("stop"))) return searchBusy;
     const delivery = searchSaves.takeDelivery();
     if (delivery === "undelivered") return { kind: "unavailable" } as const;
-    if (delivery === "pending") snapshot = { ...snapshot, runtime: { ...snapshot.runtime, persistence_pending: true } };
     return searchSaves.admit(body.action, body.action_id, admission.data.active.object_id, fingerprint, delivery, () => {
       const current = check();
       if (current.kind !== "ok") return current;
@@ -597,6 +733,7 @@ export function createFixtureTransport({
         return ordinaryAction(body, context.client_id);
       }
       if (!startSpecimen && (body.action === "confirm" || body.action === "reject")) return reviewAction(body, context.client_id);
+      if (!startSpecimen && body.action === "acknowledge") return acknowledge(body, context.client_id);
       if (!startSpecimen) return error(409, "INVALID_TRANSITION", "This sample action is unavailable.");
       const session = sessionRead(id);
       if (session.kind !== "ok") return session;
@@ -637,41 +774,71 @@ export function createFixtureTransport({
       }
       return result;
     },
-    "POST /emergency-stop": ({ body }) => {
-      if (scene.emergency === "network") return { kind: "unavailable" };
-      const valid = conforms("EmergencyStopRequest", body);
-      const session = snapshot.active_session;
-      const committed = valid && scene.emergency === "Committed";
-      const control_generation = snapshot.runtime.control_generation + 1;
-      resetInput();
-      if (session && !emergencyFailure) {
-        const previous = snapshot.failures.find((failure) => failure.failure_id === recoveryFailure.failure_id);
-        emergencyFailure = { ...recoveryFailure, session_id: session.id,
-          failure_id: previous ? `${recoveryFailure.failure_id}-next` : recoveryFailure.failure_id };
-      }
-      const failure = session ? emergencyFailure : undefined;
-      const alreadyRecorded = snapshot.failures.some(({ failure_id }) => failure_id === failure?.failure_id);
-      workspace.clearOwnership();
-      snapshot = {
-        ...snapshot, lease: { state: "Unowned", owner_client_id: null, control_generation, can_acquire: false },
-        runtime: {
-          effective_session_state: session ? "Paused" : null, motion_permission: "Disarmed", control_generation,
-          persistence_pending: !!session && scene.emergency === "Pending",
-        },
-        readiness: { ...snapshot.readiness, can_start: { Gestures: false, Controller: false }, can_resume: false },
-        failures: failure && !alreadyRecorded ? [...snapshot.failures, failure] : snapshot.failures,
-        active_session: committed && session && failure && !session.pause_causes.some(({ failure_id }) => failure_id === failure.failure_id) ? {
-          ...session, state: "Paused", ended_at_ms: null, end_reason: null, revision: session.revision + 1,
-          pause_causes: [...session.pause_causes, { cause: "RecoveryRequired", failure_id: failure.failure_id }],
-        } : session,
-      };
-      workspace.publish();
-      return valid ? emergencyResponse(body as EmergencyStopRequest, snapshot, failure?.failure_id ?? null, scene.emergency)
-        : { kind: "api-error", status: 422, error: {
-          code: "VALIDATION_FAILED", message: "Invalid sample emergency request.", retryable: false, permission_revoked: true,
-        } };
-    },
+    "POST /emergency-stop": ({ body, context }) => applyEmergency(body, context, "http"),
   };
+
+  function applyEmergency(body: unknown, context: ProtectedRequest["context"], source: "http" | "controller"): ReadResult<EmergencyStopResponse> {
+    const delivery = emergencyDelivery;
+    emergencyDelivery = undefined;
+    if (source === "http" && (delivery === "undelivered" || scene.emergency === "network")) return { kind: "unavailable" };
+    const control_generation = snapshot.runtime.control_generation + 1;
+    workspace.clearOwnership();
+    snapshot = {
+      ...snapshot, lease: { state: "Unowned", owner_client_id: null, control_generation, can_acquire: false },
+      runtime: { ...snapshot.runtime, control_generation, motion_permission: "Disarmed" },
+    };
+    resetInput();
+    const failure = pauseForFailure("EmergencyStop");
+    const request = conforms("EmergencyStopRequest", body) ? body as EmergencyStopRequest : undefined;
+    const fingerprint = request && JSON.stringify([context.client_id, request.client_id ?? null]);
+    const previous = request && emergencyReceipts.get(request.request_id);
+    const canRecord = emergencyReceipts.size < 8192 && (pendingEmergency?.requests.size ?? 0) < 2;
+    let outcome: EmergencyStopResponse["persistence"] = "Committed";
+    if (failure) {
+      const saved = snapshot.active_session?.pause_causes.some(({ failure_id }) => failure_id === failure.failure_id);
+      if (pendingEmergency || (!saved && (delivery === "pending" || (!delivery && scene.emergency === "Pending")))) {
+        outcome = "Pending";
+        pendingEmergency ??= { failure, requests: new Set() };
+      } else if (!saved && (delivery === "fail" || (!delivery && scene.emergency === "Failed") || !persistFailurePause(failure))) {
+        outcome = "Failed";
+      }
+    }
+    if (request && fingerprint && !previous && canRecord) {
+      const response = emergencyResponse(request, snapshot, failure?.failure_id ?? null, outcome);
+      emergencyReceipts.set(request.request_id, { fingerprint, response });
+      if (outcome === "Pending") {
+        pendingEmergency?.requests.add(request.request_id);
+        emergencyOperations.set(request.request_id, { action_id: null, request_id: request.request_id,
+          persistence: "Pending", result: null, error: null });
+      }
+    }
+    workspace.publish();
+    if (source === "http" && delivery === "lose-response") return { kind: "unavailable" };
+    if (!request) return { kind: "api-error", status: 422, error: {
+        code: "VALIDATION_FAILED", message: "Invalid sample emergency request.", retryable: false, permission_revoked: true,
+    } };
+    if (previous && previous.fingerprint !== fingerprint) return { kind: "api-error", status: 409, error: {
+      code: "REQUEST_ID_CONFLICT", message: "This sample request ID was already used.", retryable: false, permission_revoked: true,
+    } };
+    return emergencyReceipts.get(request.request_id)?.response ?? { kind: "api-error", status: 503, error: {
+      code: "CAPACITY_REACHED", message: "The emergency request receipt could not be recorded.", retryable: false, permission_revoked: true,
+    } };
+  }
+
+  function finishEmergencySave(commit: boolean, publish = true) {
+    if (!pendingEmergency) return;
+    const { failure, requests } = pendingEmergency;
+    pendingEmergency = undefined;
+    const session = commit && persistFailurePause(failure);
+    for (const request_id of requests) {
+      const receipt = emergencyReceipts.get(request_id);
+      if (receipt) receipt.response = emergencyResponse({ request_id }, snapshot, failure.failure_id, session ? "Committed" : "Failed");
+      emergencyOperations.set(request_id, session
+        ? { action_id: null, request_id, persistence: "Committed", error: null, result: { ...emptyResult, session } }
+        : { action_id: null, request_id, persistence: "Failed", error: storageError, result: null });
+    }
+    if (publish) workspace.publish();
+  }
 
   function endFixtureSearch(end_reason: Extract<Session, { state: "Ended" }>["end_reason"] = "Stopped", endedAt = now()) {
     const active = snapshot.active_session;
@@ -682,6 +849,13 @@ export function createFixtureTransport({
       ? { ...candidate, disposition: "NotReviewed", reviewed_at_ms: null } : null;
     if (match) matches = matches.map((item) => item.id === match.id ? match : item);
     suppressedSession = undefined;
+    finishEmergencySave(false, false);
+    for (const [requestId, operation] of emergencyOperations) {
+      if (operation.result?.session?.id === active.id) emergencyOperations.delete(requestId);
+    }
+    for (const { failure_id, session_id } of snapshot.failures) {
+      if (session_id === active.id) endedFailureOwners.set(failure_id, { sessionId: active.id, objectId: active.object_id });
+    }
     saveSession(ended);
     resetInput();
     const control_generation = snapshot.runtime.control_generation + 1;
@@ -716,6 +890,14 @@ export function createFixtureTransport({
       disconnectEvents() { workspace.disconnectEvents(bootstrap.client_id); },
       scriptSearch(delivery: SearchDelivery) { searchSaves.script(delivery); },
       observeCandidate,
+      observePath,
+      observeProximity: proximity.observe,
+      scriptEmergency(delivery: SearchDelivery) { emergencyDelivery = delivery; },
+      finishEmergencySave,
+      circle() {
+        if (snapshot.active_session?.control_mode !== "Controller" || !pathReady("Controller")) return;
+        applyEmergency({ request_id: crypto.randomUUID() }, bootstrap, "controller");
+      },
       dropNextRelease() { dropRelease = true; },
       finishSearchSave(commit: boolean) {
         snapshot = { ...snapshot, runtime: { ...snapshot.runtime, persistence_pending: false } };
@@ -824,6 +1006,7 @@ export function createFixtureTransport({
       });
     },
     dispose() {
+      proximity.dispose();
       workspace.dispose();
       tickets.clear();
       lifetime.abort();
@@ -832,6 +1015,9 @@ export function createFixtureTransport({
       pages.clear();
       registrations.clear();
       captures.clear();
+      endedFailureOwners.clear();
+      emergencyReceipts.clear();
+      emergencyOperations.clear();
     },
   } satisfies ApplicationTransport & { controls: object };
 }
