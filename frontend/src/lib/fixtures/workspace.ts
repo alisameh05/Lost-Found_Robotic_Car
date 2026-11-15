@@ -1,5 +1,5 @@
 import type {
-  EventEnvelope, FrameMetadata, FrontendProfile, LeaseAcquire, LeaseRelease, LeaseResponse, Match, PublicLease, Snapshot, WorkspaceHeartbeat,
+  EventEnvelope, FailureCause, FrameMetadata, FrontendProfile, LeaseAcquire, LeaseRelease, LeaseResponse, Match, PublicLease, Snapshot, WorkspaceHeartbeat,
 } from "@/generated/api-v1";
 import { conforms } from "../fixture-contracts";
 import type { EventSocket, ReadSocket, SocketObserver } from "../transport";
@@ -25,14 +25,15 @@ const invalid = () => error(422, "VALIDATION_FAILED", "Invalid sample workspace 
 const leaseRequired = () => error(403, "LEASE_REQUIRED", "The current sample lease is required.");
 
 export function openFixtureWorkspace({
-  boot, profile, now, monotonic, read, setLease, available, frameMode = "live",
+  boot, profile, now, monotonic, read, setLease, restoreWorkspace, available, frameMode = "live",
 }: {
   boot: string;
   profile: FrontendProfile | null;
   now: () => number;
   monotonic: () => number;
   read: (client: string) => Snapshot;
-  setLease: (lease: PublicLease, pause: boolean) => void;
+  setLease: (lease: PublicLease, cause?: FailureCause) => void;
+  restoreWorkspace: () => boolean;
   available: (source: Source) => boolean;
   frameMode?: FrameMode;
 }) {
@@ -75,13 +76,13 @@ export function openFixtureWorkspace({
     return !!profile && time - frame.captured < Math.min(profile.capture_age_limit_ms, profile.display_deadline_ms);
   }
 
-  function revoke() {
+  function revoke(cause?: FailureCause) {
     if (!owner) return;
     const state = read(owner.client);
     owner = undefined;
     clearTimeout(timer);
     setLease({ state: "Unowned", owner_client_id: null, can_acquire: false,
-      control_generation: state.lease.control_generation + 1 }, true);
+      control_generation: state.lease.control_generation + 1 }, cause);
     publish();
   }
 
@@ -92,7 +93,7 @@ export function openFixtureWorkspace({
       ? owner.acknowledged.captured + Math.min(profile.capture_age_limit_ms, profile.display_deadline_ms) : Infinity;
     const deadline = Math.min(owner.deadline, displayDeadline);
     clearTimeout(timer);
-    if (time >= deadline) revoke();
+    if (time >= deadline) revoke(displayDeadline <= owner.deadline ? "DisplayStale" : "HeartbeatExpired");
     else timer = setTimeout(checkDeadline, Math.ceil(deadline - time));
   }
 
@@ -131,7 +132,7 @@ export function openFixtureWorkspace({
         signal.removeEventListener("abort", connection.close);
         if (events.get(client) === connection) {
           events.delete(client);
-          if (owner?.client === client) revoke();
+          if (owner?.client === client) revoke("WorkspaceDisconnected");
         }
         observer.closed();
       },
@@ -157,7 +158,7 @@ export function openFixtureWorkspace({
         clearTimeout(nextCapture);
         signal.removeEventListener("abort", connection.close);
         if (connections.get(client) === connection) connections.delete(client);
-        if (source === "robot" && owner?.client === client) revoke();
+        if (source === "robot" && owner?.client === client) revoke("RobotVideoUnavailable");
         observer.closed();
       },
     };
@@ -198,19 +199,23 @@ export function openFixtureWorkspace({
     if (body.client_id !== client || body.backend_boot_id !== boot || body.client_lease_id !== owner.secret ||
         body.control_generation !== state.lease.control_generation || body.session_id !== (state.active_session?.id ?? null) ||
         body.heartbeat_seq <= owner.sequence || (!owner.sequence && body.heartbeat_seq !== 1)) return false;
-    if (!body.workspace_visible || !body.workspace_focused || !body.workspace_operational) { revoke(); return false; }
+    if (!body.workspace_visible || !body.workspace_focused || !body.workspace_operational) {
+      revoke(!body.workspace_visible ? "WorkspaceHidden" : !body.workspace_focused ? "WorkspaceUnfocused" : "WorkspaceUnusable");
+      return false;
+    }
     const time = monotonic();
     const indication = body.displayed_robot_frame;
     const frame = indication && video.robot.get(client)?.issued.get(indication.frame_id);
     if (indication && (!frame || indication.stream_epoch !== frame.metadata.stream_epoch || !frameFresh(frame, time) ||
       (owner.acknowledged && frame.metadata.capture_seq < owner.acknowledged.metadata.capture_seq))) return false;
-    if (!indication && owner.acknowledged) { revoke(); return false; }
+    if (!indication && owner.acknowledged) { revoke("DisplayStale"); return false; }
     const changed = !owner.workspace || (!!frame && !owner.acknowledged);
     owner.sequence = body.heartbeat_seq;
     owner.deadline = time + profile.heartbeat_deadline_ms;
     owner.workspace = true;
     if (frame) owner.acknowledged = frame;
-    if (changed) publish("readiness_changed");
+    if (frame && restoreWorkspace()) publish();
+    else if (changed) publish("readiness_changed");
     checkDeadline();
     return true;
   }
@@ -247,7 +252,7 @@ export function openFixtureWorkspace({
     const secret = runtimeToken();
     owner = { client, secret, sequence: 0, deadline: monotonic() + profile.heartbeat_deadline_ms, workspace: false };
     previousOwner = true;
-    setLease(lease, false);
+    setLease(lease);
     publish();
     checkDeadline();
     return finish(client, fingerprint, { request_id: body.request_id, client_lease_id: secret, control_generation, lease });
@@ -255,6 +260,8 @@ export function openFixtureWorkspace({
 
   return {
     publish,
+    publishProximity: () => emit((state, envelope) => ({ ...envelope, type: "proximity_warning_changed",
+      payload: { proximity: state.proximity } })),
     publishRemoval: (object_id: string) => emit((_state, envelope) => ({
       ...envelope, type: "object_removed", payload: { object_id, reason: "Expired" },
     })),
@@ -301,6 +308,7 @@ export function openFixtureWorkspace({
         lease: snapshot.lease });
     },
     changeFrames(mode: FrameMode) { modeBySource.robot = mode; },
+    revokeVideo() { revoke("RobotVideoUnavailable"); },
     disconnectEvents(client: string) { events.get(client)?.close(); },
     checkDeadline,
     clearOwnership() { clearTimeout(timer); owner = undefined; },

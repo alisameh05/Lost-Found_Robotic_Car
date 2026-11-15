@@ -5,7 +5,7 @@ import Link from "next/link";
 import { useRouter } from "next/navigation";
 import { Video, Webcam } from "lucide-react";
 import { PageHeader } from "@/components/layout/page-header";
-import { Panel } from "@/components/layout/panel";
+import { ModelessPanel, Panel } from "@/components/layout/panel";
 import { Button } from "@/components/ui/button";
 import { LoadingState, Notice, StatusBadge } from "@/components/ui/feedback";
 import { ModeInstructions } from "@/features/control-guide";
@@ -16,6 +16,7 @@ import type { Snapshot } from "@/generated/api-v1";
 import { pendingReview } from "@/lib/match-evidence";
 import { ActionFeedback } from "./action-feedback";
 import { MatchReview } from "./match-review";
+import { ProximityAdvisory, RecoveryPanel } from "./recovery-panel";
 import { InputControls } from "./search-fixture-controls";
 import { duration, searchMode } from "./session-facts";
 import styles from "./session.module.css";
@@ -58,6 +59,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const robot = useRef<HTMLDivElement>(null);
   const webcam = useRef<HTMLDivElement>(null);
   const [help, setHelp] = useState(false);
+  const [recovery, setRecovery] = useState(false);
   const [elapsed, setElapsed] = useState(0);
   const [destination, setDestination] = useState<string>();
   const [leaving, setLeaving] = useState(false);
@@ -72,10 +74,12 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const pause = searchActions?.[searchActionKey("pause", sessionId)];
   const resume = searchActions?.[searchActionKey("resume", sessionId)];
   const stop = searchActions?.[searchActionKey("stop", sessionId)];
+  const acknowledgment = searchActions?.[searchActionKey("acknowledge", sessionId)];
   const state = effective.effective_session_state;
   const ready = owner && workspace.previewLive && workspace.usable && connected;
   const blocked = !connected || !owner || unresolved(stop);
   const candidate = pendingReview(snapshot, snapshot.pending_candidate) ? snapshot.pending_candidate : null;
+  const failures = snapshot.failures.filter((failure) => failure.session_id === sessionId);
   const stopSearch = () => { void runtime?.submitSearch({ kind: "stop", sessionId }); };
 
   useEffect(() => {
@@ -149,6 +153,23 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     (lease.can_acquire || !!workspace.retryAcquisition);
   const canLeavePaused = session.state === "Paused" && state === "Paused" && !effective.persistence_pending;
   const waitingToLeave = leaving && (unresolved(pause) || canLeavePaused);
+  const unsavedEmergency = failures.some(({ cause, failure_id }) => cause === "EmergencyStop" &&
+    !session.pause_causes.some((pauseCause) => pauseCause.failure_id === failure_id));
+  const requiredUnavailable = readiness.components.filter(({ component, status }) => status !== "Ready" &&
+    component !== (gestures ? "Controller" : "Webcam"));
+  const recoveryBlockers = [
+    !owner && "Acquire available control.",
+    !connected && "Reconnect to search events.",
+    !workspace?.usable && "Return to a visible, focused workspace with a usable robot camera display.",
+    !workspace?.previewLive && "Wait for a live robot camera view.",
+    requiredUnavailable.length > 0 && `Required paths unavailable: ${requiredUnavailable.map(({ component }) => devicePaths[component].label).join(", ")}.`,
+    failures.some(({ restored }) => !restored) && "Restore the failed paths.",
+    failures.some(({ acknowledged }) => !acknowledged) && "Acknowledge each outstanding failure.",
+    effective.persistence_pending && "Wait for the pending save.",
+    session.state !== "Paused" && state === "Paused" && !effective.persistence_pending && "Save the pause before resuming.",
+    candidate && "Complete the pending match review.",
+    !candidate && snapshot.pending_candidate && "Wait for the current candidate review to become available.",
+  ].filter((item): item is string => typeof item === "string");
 
   function leavePaused() {
     if (!canLeavePaused && !owner) return;
@@ -158,8 +179,11 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   }
 
   return <div className={styles.page}>
-    <PageHeader title="Live Search Workspace" actions={<Button onClick={() => setHelp(!help)}
-      aria-expanded={help} aria-controls="live-control-help">Control Help</Button>} />
+    <PageHeader title="Live Search Workspace" actions={<>
+      <Button onClick={() => setHelp(!help)} aria-expanded={help} aria-controls={help ? "live-control-help" : undefined}>Control Help</Button>
+      {(state === "Paused" || recovery) && <Button onClick={() => setRecovery(!recovery)}
+        aria-expanded={recovery} aria-controls={recovery ? "search-recovery" : undefined}>Recovery</Button>}
+    </>} />
     <Panel className={styles.target} aria-label="Active search target">
       <div className={styles.thumbnail}><ReferenceImage object={object} thumbnail /></div>
       <div>
@@ -193,7 +217,11 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
         <Button variant="destructive" disabled={blocked} onClick={() => { void runtime?.submitSearch({ kind: "stop", sessionId }); }}>Stop Search</Button>
       </div>
     </Panel>}
-    {help && <Panel id="live-control-help"><ModeInstructions mode={mode} title="Control Help" /></Panel>}
+    {help && <ModelessPanel id="live-control-help" title="Control Help"><ModeInstructions mode={mode} heading="h3" /></ModelessPanel>}
+    {recovery && <RecoveryPanel failures={failures} blockers={recoveryBlockers} searching={searching}
+      canAcknowledge={owner && connected && readiness.components.some(({ component, status }) => component === "Storage" && status === "Ready")}
+      feedback={acknowledgment} acknowledge={(id) => { void runtime?.submitSearch({ kind: "acknowledge", sessionId, failureIds: [id] }); }}
+      retry={() => { void runtime?.retrySearch("acknowledge", sessionId); }} />}
     <div role="status" className="visually-hidden">{candidate && "Potential match. Search paused for review."}</div>
     {candidate && <MatchReview key={candidate.evidence_media.id} match={candidate} object={object}
       canAct={owner && connected} canStop={!blocked} stop={stopSearch} />}
@@ -229,22 +257,24 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
             {(["Command", "RobotVideo", gestures ? "Webcam" : "Controller", "AI"] as const).map((key) =>
               <div key={key}><dt>{devicePaths[key].label}</dt><dd>{readiness.components.find(({ component }) => component === key)?.status ?? "Unknown"}</dd></div>)}
           </dl>
-          <p>Proximity · {snapshot.proximity.state}{snapshot.proximity.warning_latched && " · Warning active"}</p>
+          <ProximityAdvisory proximity={snapshot.proximity} />
         </section>
         <section aria-label="Session activity">
           <h2>Session activity</h2>
           <p>Search accepted · <RecordTime value={session.started_at_ms} compact /></p>
           <p>Committed session · {session.state}</p>
           {effective.persistence_pending && <p>Session save pending</p>}
+          {unsavedEmergency && !effective.persistence_pending && <p>Emergency pause save failed. Retry Emergency Stop to save it.</p>}
         </section>
         <section aria-label="Control ownership">
           <h2>Control ownership</h2>
           <p>{owner ? "This workspace holds control." : "Spectator · Read-only"}</p>
+          {!workspace?.usable && <p>Control unavailable while the workspace is hidden, unfocused, or unable to display robot video.</p>}
           {workspace?.message && <p>{workspace.message}</p>}
           {!owner && <Button disabled={!canAcquire} pending={workspace?.acquiring}
             onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
           {!owner && canAcquire && <p>Acquiring control consents to taking over the available lease.</p>}
-          {snapshot.failures.some(({ restored, acknowledged }) => !restored || !acknowledged) && <p>Recovery required before Resume.</p>}
+          <p role="status">{failures.length > 0 && `Recovery required before Resume. ${failures.length} outstanding ${failures.length === 1 ? "failure" : "failures"}.`}</p>
           {!profile && <p>A compatible qualification profile is unavailable.</p>}
         </section>
       </aside>

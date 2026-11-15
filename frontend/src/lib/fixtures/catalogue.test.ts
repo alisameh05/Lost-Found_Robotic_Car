@@ -36,7 +36,8 @@ test.each(scenarioIds)("validates the %s fixture's bootstrap, snapshot, health a
   if (scene.snapshotError) {
     expect(snapshotRead).toMatchObject({ kind: "api-error", status: 503, error: scene.snapshotError });
   } else {
-    expect(data(snapshotRead)).toEqual({ ...scene.snapshot, readiness: health.readiness });
+    expect(data(snapshotRead)).toEqual({ ...scene.snapshot, readiness: health.readiness,
+      ...(scenario === "acknowledged" && { failures: [] }) });
   }
 
   if (scene.recordsRecovery) {
@@ -304,14 +305,18 @@ test("reports every scripted emergency outcome, including a 503 that acknowledge
     contract("EmergencyStopResponse", result);
     expect(result).toMatchObject({ request_id: requestId, backend_boot_id: context.backend_boot_id,
       permission_revoked: true, persistence, session_id: scenario === "idle" ? null : sampleSession.id,
-      failure_id: scenario === "idle" ? null : "fixture-emergency-failure" });
+      failure_id: scenario === "idle" ? null : expect.any(String) });
     expect(result.error).toEqual(persistence === "Failed" ? storageError : null);
     const updated = data(await transport.snapshot({ context }));
+    expect(updated.failures).toEqual(scenario === "idle" ? [] : [expect.objectContaining({
+      failure_id: result.failure_id, cause: "EmergencyStop", session_id: result.session_id,
+    })]);
     expect(updated.lease.state).toBe("Unowned");
     expect(updated.runtime.effective_session_state).toBe(scenario === "idle" ? null : "Paused");
     expect(updated.runtime.persistence_pending).toBe(persistence === "Pending");
     expect(updated.active_session?.state).toBe(scenario === "idle" ? undefined : persistence === "Committed" ? "Paused" : "Searching");
     expect(validSnapshot(updated, context)).toBe(true);
+    transport.dispose();
   }
   const network = createFixtureTransport({ scenario: "emergency-network" });
   await expect(network.emergency({ request_id: requestId }, { context: data(await network.bootstrap()) }))

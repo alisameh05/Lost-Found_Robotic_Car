@@ -4,7 +4,7 @@ import { conforms } from "../fixture-contracts";
 import { parseFrameEnvelope } from "../frame-display";
 import { socketOffer, type ClientContext, type ReadResult } from "../transport";
 import { createFixtureTransport } from "./transport";
-import { sampleTime } from "./samples";
+import { foundSession, sampleTime } from "./samples";
 
 function data<T>(result: ReadResult<T>) {
   if (result.kind !== "ok") throw new Error(`Expected fixture success, received ${result.kind}`);
@@ -206,6 +206,88 @@ test("scopes Start and subsequent actions to one live lease and expires an aband
   await vi.advanceTimersByTimeAsync(profile.heartbeat_deadline_ms + 1);
   expect(await snapshot()).toMatchObject({ active_session: { id: session.id, state: "Paused" },
     lease: { state: "Unowned" }, runtime: { effective_session_state: "Paused", motion_permission: "Disarmed" } });
+  const [failure] = (await snapshot()).failures;
+  expect(failure).toMatchObject({ session_id: session.id, cause: "DisplayStale", restored: false, acknowledged: false });
+  expect(eventSocket.heartbeat({ ...current, control_generation: resumeGeneration, heartbeat_seq: 5, displayed_robot_frame: frame })).toBe(false);
+  expect((await snapshot()).runtime.control_generation).toBeGreaterThan(resumeGeneration);
+  const takeover = data(await transport.request("POST /control-lease", { context,
+    body: { client_id: context.client_id, request_id: crypto.randomUUID(), session_id: session.id, takeover: true } }));
+  await vi.advanceTimersByTimeAsync(profile.heartbeat_deadline_ms + 1);
+  expect((await snapshot()).failures).toEqual(expect.arrayContaining([
+    expect.objectContaining({ cause: "HeartbeatExpired", session_id: session.id }),
+  ]));
+  expect((await snapshot()).runtime.control_generation).toBeGreaterThan(takeover.control_generation);
+});
+
+test("acknowledges only owned failure IDs and distinguishes recurrence from an outstanding observation", async () => {
+  const transport = createFixtureTransport();
+  onTestFinished(() => transport.dispose());
+  const context = data(await transport.bootstrap());
+  data(transport.connectEvents({ context }, await ticket(transport, context, "events"), silent));
+  const snapshot = async () => data(await transport.snapshot({ context }));
+  transport.controls.observePath("Command", false);
+  expect((await snapshot()).failures).toEqual([]);
+  transport.controls.observePath("Command", true);
+  transport.controls.activateSearch("Searching");
+  const session = (await snapshot()).active_session!;
+  const lease = data(await transport.request("POST /control-lease", { context,
+    body: { client_id: context.client_id, request_id: crypto.randomUUID(), session_id: session.id, takeover: true } }));
+  const send = (expected_revision: number, ...failure_ids: [string, ...string[]]) =>
+    transport.request("POST /sessions/{id}/actions", { context, id: session.id, body: { action: "acknowledge",
+      action_id: crypto.randomUUID(), client_id: context.client_id, client_lease_id: lease.client_lease_id!,
+      session_id: session.id, expected_revision, failure_ids } });
+  transport.controls.observePath("Command", false);
+  const [command] = (await snapshot()).failures;
+  transport.controls.observePath("Command", false);
+  expect((await snapshot()).failures).toEqual([command]);
+  const paused = (await snapshot()).active_session!;
+  expect(command.session_id).toBe(session.id);
+  await expect(send(session.revision, command.failure_id)).resolves.toMatchObject({ error: { code: "REVISION_CONFLICT" } });
+  await expect(send(paused.revision, command.failure_id, command.failure_id)).resolves.toMatchObject({ error: { code: "VALIDATION_FAILED" } });
+  await expect(send(paused.revision, "unrelated-failure")).resolves.toMatchObject({ error: { code: "NOT_FOUND" } });
+  await expect(transport.request("POST /sessions/{id}/actions", { context, id: foundSession.id, body: {
+    action: "acknowledge", action_id: crypto.randomUUID(), client_id: context.client_id, client_lease_id: lease.client_lease_id!,
+    session_id: foundSession.id, expected_revision: foundSession.revision, failure_ids: [command.failure_id],
+  } })).resolves.toMatchObject({ error: { code: "OWNERSHIP_MISMATCH" } });
+  const acknowledged = data(await send(paused.revision, command.failure_id)).result!.session!;
+  expect((await snapshot()).failures).toEqual([{ ...command, acknowledged: true }]);
+  transport.controls.observePath("Command", true);
+  expect((await snapshot()).failures).toEqual([]);
+  const restored = (await snapshot()).active_session!;
+  expect(restored.revision).toBe(acknowledged.revision + 1);
+  await expect(send(acknowledged.revision, command.failure_id)).resolves.toMatchObject({ error: { code: "REVISION_CONFLICT" } });
+  expect(data(await send(restored.revision, command.failure_id)).result!.session).toEqual(restored);
+  transport.controls.observePath("Command", false);
+  const [next] = (await snapshot()).failures;
+  expect(next).toMatchObject({ cause: "CommandUnavailable", session_id: session.id, acknowledged: false });
+  expect(next.failure_id).not.toBe(command.failure_id);
+});
+
+test("protected spectator emergency stops the active scope and an idle request creates no session", async () => {
+  const transport = createFixtureTransport();
+  onTestFinished(() => transport.dispose());
+  const context = data(await transport.bootstrap());
+  const spectator = transport.controls.addClient();
+  const emergency = { request_id: crypto.randomUUID(), client_id: spectator.client_id };
+  const read = async () => data(await transport.snapshot({ context }));
+  const stop = (body = emergency) => transport.emergency(body, { context: spectator });
+  await expect(transport.emergency(emergency, { context: { ...spectator, capability: "invalid" } })).resolves.toMatchObject({
+    error: { code: "CAPABILITY_INVALID" },
+  });
+  const idle = data(await stop());
+  expect(idle).toMatchObject({ permission_revoked: true, session_id: null, failure_id: null, persistence: "Committed" });
+  expect(await read()).toMatchObject({ active_session: null, failures: [] });
+  transport.controls.activateSearch("Searching");
+  const active = (await read()).active_session!;
+  expect(data(await stop())).toEqual(idle);
+  const [failure] = (await read()).failures;
+  const activeRequest = { ...emergency, request_id: crypto.randomUUID() };
+  transport.controls.scriptEmergency("lose-response");
+  expect(await stop(activeRequest)).toEqual({ kind: "unavailable" });
+  expect(data(await stop(activeRequest))).toMatchObject({ permission_revoked: true, session_id: active.id, failure_id: failure.failure_id });
+  await expect(stop({ ...activeRequest, client_id: context.client_id })).resolves.toMatchObject({ status: 409,
+    error: { code: "REQUEST_ID_CONFLICT", permission_revoked: true } });
+  expect(await read()).toMatchObject({ active_session: { id: active.id, state: "Paused" }, failures: [failure] });
 });
 
 test.each(["confirm", "stop"] as const)("commits only %s when the other terminal action is already pending", async (winner) => {
@@ -304,4 +386,10 @@ test.each(["confirm", "stop"] as const)("commits only %s when the other terminal
   expect(await readObject()).toMatchObject(winner === "confirm"
     ? { status: "Found", found_at_ms: session.ended_at_ms }
     : { status: "Lost", found_at_ms: null });
+  if (winner === "confirm") {
+    expect(data(await transport.emergency({ request_id: crypto.randomUUID() }, { context: spectator })))
+      .toMatchObject({ session_id: null, failure_id: null });
+    expect(await readObject()).toMatchObject({ status: "Found", found_at_ms: session.ended_at_ms });
+    expect(data(await transport.request("GET /sessions/{id}", { context, id: started.id }))).toEqual(session);
+  }
 });

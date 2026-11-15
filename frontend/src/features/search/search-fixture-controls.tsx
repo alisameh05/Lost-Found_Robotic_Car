@@ -4,6 +4,9 @@ import { Button } from "@/components/ui/button";
 import { useRuntime } from "@/features/runtime";
 import type { ControlMode } from "@/generated/api-v1";
 
+const paths = { Command: "command link", Webcam: "webcam", Controller: "controller", AI: "matching service",
+  RobotVideo: "robot camera", Storage: "storage" } as const;
+
 export function SearchSaveControls() {
   const fixture = useRuntime()?.connection?.fixture;
   if (!fixture) return null;
@@ -29,11 +32,28 @@ export function InputControls({ mode, disabled }: { mode: ControlMode; disabled:
       <Button disabled={disabled} onClick={() => fixture.search.input(mode, "invalid")}>
         {mode === "Gestures" ? "Ambiguous gesture" : "Conflicting D-pad input"}
       </Button>
-      {mode === "Controller" && <Button onClick={() => { void connection.runtime.emergency(); }}>PS4 Circle</Button>}
+      {mode === "Controller" && <Button onClick={fixture.search.circle}>PS4 Circle</Button>}
       <Button onClick={() => fixture.search.changeFrames("frozen")}>Freeze robot frames</Button>
       <Button onClick={() => fixture.search.changeFrames("live")}>Send fresh frames</Button>
       <Button onClick={fixture.search.disconnectEvents}>Disconnect search events</Button>
       <Button onClick={fixture.search.dropNextRelease}>Drop next lease release</Button>
+    </div>
+    <div className="control-row" aria-label="Fixture recovery observations">
+      {Object.entries(paths).map(([path, label]) => <span key={path} className="control-row">
+        <Button onClick={() => fixture.search.observePath(path as keyof typeof paths, false)}>Lose {label}</Button>
+        <Button onClick={() => fixture.search.observePath(path as keyof typeof paths, true)}>Restore {label}</Button>
+      </span>)}
+      <Button onClick={() => fixture.search.scriptEmergency("pending")}>Hold next emergency save</Button>
+      <Button onClick={() => fixture.search.scriptEmergency("fail")}>Fail next emergency save</Button>
+      <Button onClick={() => fixture.search.scriptEmergency("lose-response")}>Lose next emergency response</Button>
+      <Button onClick={() => fixture.search.finishEmergencySave(true)}>Commit pending emergency save</Button>
+      <Button onClick={() => fixture.search.finishEmergencySave(false)}>Fail pending emergency save</Button>
+    </div>
+    <div className="control-row" aria-label="Fixture proximity observations">
+      <Button onClick={() => fixture.search.observeProximity(150)}>Observe nearby obstacle</Button>
+      <Button onClick={() => fixture.search.observeProximity(null)}>Lose proximity sample</Button>
+      <Button onClick={() => fixture.search.observeProximity(-1)}>Send invalid proximity sample</Button>
+      <Button onClick={() => fixture.search.observeProximity(500)}>Observe clear distance</Button>
     </div>
     <div className="control-row" aria-label="Fixture candidate observations">
       <Button disabled={disabled} onClick={() => fixture.search.observeCandidate("visible")}>Show sample candidate</Button>
