@@ -19,7 +19,7 @@ const filters = ["All", "Lost", "Found"] as const;
 type Filter = (typeof filters)[number];
 
 export function ObjectLibraryScreen() {
-  const { disconnected } = useRuntimeView();
+  const { disconnected, removedOwners } = useRuntimeView();
   const [name, setName] = useState("");
   const [filter, setFilter] = useState<Filter>("All");
   const normalizedName = normalizeObjectName(name);
@@ -30,7 +30,7 @@ export function ObjectLibraryScreen() {
   const { result, page, hasPrevious, hasNext, next, previous, retry } = useCursorPage("GET /objects", scope, !tooLong);
   const filtered = Boolean(normalizedName || filter !== "All");
   const clear = () => { setName(""); setFilter("All"); };
-  const items = result?.kind === "ok" ? result.data.items : undefined;
+  const items = result?.kind === "ok" ? result.data.items.filter(({ id }) => !removedOwners?.has(id)) : undefined;
   const showPaging = !tooLong && (!result || hasPrevious || Boolean(items?.length) || hasNext);
   if (disconnected) return <DataUnavailable />;
 
@@ -48,9 +48,9 @@ export function ObjectLibraryScreen() {
       </fieldset>
     </div>
     {!tooLong && (!result ? <LoadingState label="Loading objects" />
-      : result.kind !== "ok" ? <RecordReadFailure title="Objects unavailable" retry={retry} />
+      : !items ? <RecordReadFailure title="Objects unavailable" retry={retry} />
       : <>
-        {result.data.items.length > 0 ? <RecordList key={page} records={result.data.items} />
+        {items.length > 0 ? <RecordList key={page} records={items} />
           : hasPrevious ? <Notice role="status" title="No records on this page">Use Previous to return to the preceding page.</Notice>
           : filtered ? <Panel>
             <div role="status"><h2>No matching objects</h2></div>

@@ -43,6 +43,7 @@ export type ProtectedMedia = {
 };
 
 export interface ApplicationTransport {
+  subscribeRetention?(onChange: (removedOwners?: readonly string[]) => void): () => void;
   bootstrap(signal?: AbortSignal): Promise<ReadResult<BootstrapResponse>>;
   request<Route extends Endpoint>(route: Route, request: HttpRequest<Route>): Promise<ReadResult<HttpResponses[Route]>>;
   get<Path extends ProtectedPath>(

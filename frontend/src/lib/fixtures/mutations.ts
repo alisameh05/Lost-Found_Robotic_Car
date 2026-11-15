@@ -1,6 +1,6 @@
 import type {
   EmergencyStopRequest, EmergencyStopResponse, Error as ApiError, MutationResponse, MutationResult,
-  RetentionPreview, SessionAction, Snapshot,
+  SessionAction, Snapshot,
 } from "@/generated/api-v1";
 import type { ReadResult } from "../transport";
 import { foundSession, sampleSession, sampleTime, searching } from "./samples";
@@ -31,14 +31,6 @@ export function emergencyResponse(
   return outcome === "Failed"
     ? { kind: "ok", status: 503, data: { ...base, persistence: outcome, error: storageError } }
     : { kind: "ok", status: outcome === "Pending" ? 202 : 200, data: { ...base, persistence: outcome, error: null } };
-}
-
-export function sampleRetentionPreview(
-  preview_id: string, retention_days: number, revision: number, time: number, impact: RetentionPreview["impact"],
-): RetentionPreview {
-  return {
-    preview_id, retention_days, settings_revision: revision, evaluated_at_ms: time, expires_at_ms: time + 60_000, impact,
-  };
 }
 
 // Fixed receipts for later screens to inspect. These do not advance the scenario.

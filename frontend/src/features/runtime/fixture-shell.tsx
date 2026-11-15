@@ -4,6 +4,7 @@ import type { ReactNode } from "react";
 import { createFixtureAdapter, createFixtureHarness } from "@/lib/create-transport";
 import { RuntimeProvider } from "./runtime-provider";
 import { RuntimeFrame } from "./runtime-shell";
+import { RetentionFixtureControls } from "./retention-fixture-controls";
 
 async function openFixture() {
   return { transport: await createFixtureAdapter() };
@@ -18,7 +19,7 @@ async function openScenario(id: string) {
 export function FixtureShell({ harnessEnabled, children }: { harnessEnabled: boolean; children: ReactNode }) {
   return (
     <RuntimeProvider harnessEnabled={harnessEnabled} openTransport={harnessEnabled ? openScenario : openFixture}>
-      <RuntimeFrame>{children}</RuntimeFrame>
+      <RuntimeFrame>{children}{harnessEnabled && <RetentionFixtureControls />}</RuntimeFrame>
     </RuntimeProvider>
   );
 }

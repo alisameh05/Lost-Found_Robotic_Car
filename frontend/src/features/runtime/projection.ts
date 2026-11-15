@@ -1,4 +1,4 @@
-import type { EmergencyStopRequest, EmergencyStopResponse, Health, Snapshot } from "@/generated/api-v1";
+import type { EmergencyStopRequest, EmergencyStopResponse, Health, RetentionChange, RetentionPreviewRequest, Snapshot } from "@/generated/api-v1";
 import type { ApplicationTransport, HttpRequest, ProtectedPath, ProtectedRequest, ReadEndpoint, ReadParams, ReadResult } from "@/lib/transport";
 
 type EmergencyFeedback =
@@ -14,6 +14,7 @@ type RuntimeView = {
   connected?: boolean;
   health?: Health;
   emergency?: EmergencyFeedback;
+  removedOwners?: ReadonlySet<string>;
 };
 
 export type RegistrationAction = Pick<HttpRequest<"POST /objects">, "body" | "actionCreatedAtMs">;
@@ -102,6 +103,17 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     }
   }
 
+  let refreshQueued = false;
+  const unsubscribeRetention = transport.subscribeRetention?.((owners) => {
+    if (owners?.length) {
+      // Immediately suppress data from protected reads that were already in flight.
+      update({ removedOwners: new Set([...view.removedOwners ?? [], ...owners]) });
+    }
+    if (refreshQueued) return;
+    refreshQueued = true;
+    queueMicrotask(() => { refreshQueued = false; void refresh({ readBootstrap: true }); });
+  });
+
   return {
     getView: () => view,
     subscribe(notify: () => void) {
@@ -116,6 +128,14 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     async register(action: RegistrationAction, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;
       return transport.request("POST /objects", { ...action, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+    },
+    async previewRetention(body: RetentionPreviewRequest, signal: AbortSignal) {
+      if (!context) return { kind: "unavailable" } as const;
+      return transport.request("POST /settings/retention-preview", { body, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+    },
+    async applyRetention(body: RetentionChange, signal: AbortSignal) {
+      if (!context) return { kind: "unavailable" } as const;
+      return transport.request("PUT /settings/retention", { body, context, signal: AbortSignal.any([signal, lifetime.signal]) });
     },
     async get<Path extends ProtectedPath>(path: Path, id: string | undefined, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;
@@ -133,6 +153,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     },
     dispose() {
       lifetime.abort();
+      unsubscribeRetention?.();
       subscribers.clear();
       transport.dispose();
     },

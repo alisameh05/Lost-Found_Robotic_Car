@@ -4,7 +4,7 @@ import { isValidObjectName, normalizeObjectName } from "../object-name";
 import { maxReferenceBytes, normalizeReference, ReferenceImageError, type NormalizedReference } from "../reference-image";
 import type { HttpRequest, ReadResult } from "../transport";
 import { emptyResult, mutation } from "./mutations";
-import { day } from "./samples";
+import { expiryFor } from "./retention";
 
 type RegistrationRequest = Pick<HttpRequest<"POST /objects">, "body" | "actionCreatedAtMs">;
 type Receipt = Extract<ReadResult<MutationResponse>, { kind: "ok" }>;
@@ -21,36 +21,22 @@ function reject(status: number, code: ApiError["code"], message: string, path?: 
     ...(path ? { field_errors: [{ path, code: status === 413 ? "OUT_OF_RANGE" : "INVALID_VALUE", message }] } : {}) } };
 }
 
-export function openRegistrations({ now, signal, getSnapshot, healthy, normalize = normalizeReference, recovery, scripted }: {
+export function openRegistrations({ now, signal, getSnapshot, healthy, isExcluded, clockHealthy, normalize = normalizeReference, recovery, scripted }: {
   now: () => number;
   signal: AbortSignal;
   getSnapshot: () => Snapshot;
   healthy: boolean;
+  isExcluded: (owner: string) => boolean;
+  clockHealthy: () => boolean;
   normalize?: typeof normalizeReference;
   recovery: boolean;
   scripted?: (actionId: string, signal: AbortSignal) => Promise<"Committed" | "Failed" | undefined>;
 }) {
   const entries = new Map<string, Entry>();
   const records = new Map<string, Record>();
-  const expired = new Map<string, number>();
   const completions = new Set<string>();
   let sequence = 0;
   let admitted = 0;
-
-  function prune() {
-    const time = now();
-    for (const [id, record] of records) {
-      if (record.object.expires_at_ms > time) continue;
-      expired.set(record.object.id, record.object.expires_at_ms);
-      expired.set(record.object.reference_media.id, record.object.expires_at_ms);
-      records.delete(id);
-      entries.delete(id);
-      completions.delete(id);
-    }
-    for (const [id, expiresAt] of expired) {
-      if (time - expiresAt > 60_000 || expired.size > 128) expired.delete(id);
-    }
-  }
 
   function finish(entry: Entry, receipt: Receipt) {
     entry.receipt = receipt;
@@ -88,9 +74,14 @@ export function openRegistrations({ now, signal, getSnapshot, healthy, normalize
         submitted_at_ms: actionCreatedAtMs },
       resource_id: null, scope: "Object",
     });
-    prune();
     const previous = entries.get(action_id);
     if (previous) {
+      const object = records.get(action_id)?.object;
+      const state = getSnapshot();
+      if (object && (isExcluded(object.id) || (expiryFor(object.registered_at_ms, state.retention.settings.retention_days) <= now() &&
+          state.active_session?.object_id !== object.id))) {
+        return reject(410, "EXPIRED", "Sample record expired.");
+      }
       if (previous.fingerprint !== fingerprint) return reject(409, "ACTION_ID_CONFLICT", "This action ID belongs to a different registration.");
       if (previous.preparation) return previous.preparation;
       if (previous.deliverOnRetry) {
@@ -101,6 +92,7 @@ export function openRegistrations({ now, signal, getSnapshot, healthy, normalize
       }
       if (previous.receipt.data.persistence !== "Failed" || !previous.receipt.data.error?.retryable) return previous.receipt;
     }
+    if (!clockHealthy()) return reject(503, "NOT_READY", "The sample clock must recover before registration can continue.");
     const age = now() - actionCreatedAtMs;
     if (!previous && (age < 0 || age > 600_000)) return reject(410, "ACTION_EXPIRED", "The registration request expired before admission.");
     const { retention } = getSnapshot();
@@ -142,11 +134,12 @@ export function openRegistrations({ now, signal, getSnapshot, healthy, normalize
     admitted++;
     function commit() {
       signal.throwIfAborted();
+      if (getSnapshot().retention.deletion.status === "Failed") return finish(entry, mutation(action_id, "Failed", emptyResult));
       const registered_at_ms = now();
       const id = `fixture-object-${String(++sequence).padStart(8, "0")}`;
       const object: LostObject = {
         id, name, status: "Lost", revision: 1, registered_at_ms, found_at_ms: null, roi,
-        expires_at_ms: registered_at_ms + getSnapshot().retention.settings.retention_days * day, retention_grace: false,
+        expires_at_ms: expiryFor(registered_at_ms, getSnapshot().retention.settings.retention_days), retention_grace: false,
         reference_media: {
           id: `${id}-reference`, role: "Reference", content_type: normalized.blob.type === "image/jpeg" ? "image/jpeg" : "image/png",
           width: normalized.width, height: normalized.height, byte_length: bytes.length, created_at_ms: registered_at_ms,
@@ -176,14 +169,20 @@ export function openRegistrations({ now, signal, getSnapshot, healthy, normalize
 
   return {
     submit,
-    records() { prune(); return [...records.values()]; },
-    isExpired(id?: string) { prune(); return id !== undefined && expired.has(id); },
+    records: () => [...records.values()],
+    purge(owners: ReadonlyMap<string, number>) {
+      for (const [action, { object }] of records) {
+        if (!owners.has(object.id)) continue;
+        records.delete(action);
+        entries.delete(action);
+        completions.delete(action);
+      }
+    },
     operations(): Operation[] {
-      prune();
       const pending = [...entries].filter(([, entry]) => !entry.preparation && entry.receipt.data.persistence === "Pending");
       const visible = [...pending.map(([id]) => id), ...completions];
       return visible.map((id) => ({ ...entries.get(id)!.receipt.data, request_id: null }));
     },
-    clear() { entries.clear(); records.clear(); expired.clear(); completions.clear(); },
+    clear() { entries.clear(); records.clear(); completions.clear(); },
   };
 }
