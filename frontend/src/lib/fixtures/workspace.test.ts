@@ -18,6 +18,110 @@ async function ticket(transport: ReturnType<typeof createFixtureTransport>, cont
 
 const silent = { message() {}, closed() {} };
 
+test("captures the subscription watermark before following changes and bounds slow ordered consumers", async ({ onTestFinished }) => {
+  const transport = createFixtureTransport();
+  onTestFinished(() => transport.dispose());
+  const context = data(await transport.bootstrap());
+  const spectator = transport.controls.addClient();
+  const ownerOffer = await ticket(transport, context, "events");
+  const spectatorOffer = await ticket(transport, spectator, "events");
+  const ownerEvents: EventEnvelope[] = [];
+  const spectatorEvents: EventEnvelope[] = [];
+  const ownerClosed = vi.fn();
+  const owner = data(transport.connectEvents({ context }, ownerOffer, { message: (event) => ownerEvents.push(event), closed: ownerClosed }));
+  data(transport.connectEvents({ context: spectator }, spectatorOffer,
+    { message: (event) => spectatorEvents.push(event), closed() {} }));
+  transport.controls.observeProximity(150);
+  await Promise.resolve();
+  expect(ownerEvents.map(({ type, event_seq }) => [type, event_seq])).toEqual([["snapshot", 1], ["proximity_warning_changed", 2]]);
+  expect(spectatorEvents.map(({ event_seq }) => event_seq)).toEqual([1, 2]);
+  data(await transport.request("POST /control-lease", { context, body: {
+    client_id: context.client_id, request_id: crypto.randomUUID(), session_id: null, takeover: false,
+  } }));
+  const videoClosed = vi.fn();
+  data(transport.connectFrames({ context }, "robot", await ticket(transport, context, "robot-video"),
+    { ...silent, closed: videoClosed }));
+  for (let count = 0; count < 12; count++) transport.controls.injectGap();
+  expect(ownerClosed).toHaveBeenCalledOnce();
+  expect(videoClosed).not.toHaveBeenCalled();
+  expect(data(await transport.snapshot({ context })).lease.state).toBe("Unowned");
+  owner.close();
+  const freshOffer = await ticket(transport, context, "events");
+  expect(freshOffer).not.toEqual(ownerOffer);
+  const resync: EventEnvelope[] = [];
+  data(transport.connectEvents({ context }, freshOffer, { message: (event) => resync.push(event), closed() {} }));
+  await Promise.resolve();
+  expect(resync).toEqual([expect.objectContaining({ type: "snapshot", event_seq: data(await transport.snapshot({ context })).event_seq })]);
+});
+
+test("restart drops pending actions and old tickets while eligible committed receipts can still be replayed", async ({ onTestFinished }) => {
+  vi.useFakeTimers();
+  vi.setSystemTime(sampleTime);
+  const transport = createFixtureTransport({ monotonic: () => Date.now() - sampleTime });
+  onTestFinished(() => { transport.dispose(); vi.useRealTimers(); });
+  const context = data(await transport.bootstrap());
+  const obsoleteOffer = await ticket(transport, context, "events");
+  const settings = data(await transport.request("GET /settings", { context }));
+  const retentionChange = { expected_revision: settings.revision, retention_days: 8 };
+  const preview = data(await transport.request("POST /settings/retention-preview", { context, body: retentionChange }));
+  const journal: EventEnvelope[] = [];
+  const events = data(transport.connectEvents({ context }, await ticket(transport, context, "events"),
+    { message: (event) => journal.push(event), closed() {} }));
+  let frame: WorkspaceHeartbeat["displayed_robot_frame"] = null;
+  data(transport.connectFrames({ context }, "robot", await ticket(transport, context, "robot-video"), {
+    closed() {},
+    message(bytes) {
+      const { frame_id, stream_epoch } = parseFrameEnvelope(bytes, context.qualification_profile!, "robot")!.metadata;
+      frame = { frame_id, stream_epoch };
+    },
+  }));
+  const acquired = data(await transport.request("POST /control-lease", { context, body: {
+    request_id: crypto.randomUUID(), client_id: context.client_id, session_id: null, takeover: false,
+  } }));
+  expect(frame).not.toBeNull();
+  const heartbeat: WorkspaceHeartbeat = { type: "workspace_heartbeat", protocol_version: 1, backend_boot_id: context.backend_boot_id,
+    client_id: context.client_id, client_lease_id: acquired.client_lease_id!, session_id: null, control_generation: acquired.control_generation,
+    heartbeat_seq: 1, workspace_visible: true, workspace_focused: true, workspace_operational: true, displayed_robot_frame: frame };
+  expect(events.heartbeat(heartbeat)).toBe(true);
+  const object = data(await transport.request("GET /objects/{id}", { context, id: "sample-wallet" }));
+  const start = { action_id: crypto.randomUUID(), client_id: context.client_id, client_lease_id: acquired.client_lease_id!,
+    object_id: object.id, expected_revision: object.revision, control_mode: "Gestures" } as const;
+  const started = data(await transport.request("POST /sessions", { context, body: start }));
+  const session = started.result!.session!;
+  expect(journal).toContainEqual(expect.objectContaining({ type: "session_changed", session_id: session.id,
+    payload: expect.objectContaining({ operation: expect.objectContaining({ action_id: start.action_id, persistence: "Committed" }) }) }));
+  transport.controls.scriptSearch("pending");
+  const body = { action: "stop", action_id: crypto.randomUUID(), session_id: session.id,
+    client_id: context.client_id, client_lease_id: acquired.client_lease_id!, expected_revision: session.revision } as const;
+  const pending = data(await transport.request("POST /sessions/{id}/actions", { context, id: session.id, body }));
+  expect(pending.persistence).toBe("Pending");
+
+  transport.controls.restart();
+  const fresh = data(await transport.bootstrap());
+  expect(fresh.backend_boot_id).not.toBe(context.backend_boot_id);
+  expect(fresh.client_id).not.toBe(context.client_id);
+  expect(fresh.capability).not.toBe(context.capability);
+  expect(events.heartbeat(heartbeat)).toBe(false);
+  expect(transport.connectEvents({ context: fresh }, obsoleteOffer, silent)).toMatchObject({ kind: "api-error" });
+  expect(await transport.request("GET /health", { context: fresh })).toMatchObject({ status: 503, data: { initialization: "Starting" } });
+  await vi.advanceTimersByTimeAsync(250);
+  transport.controls.finishSearchSave(true);
+  const state = data(await transport.snapshot({ context: fresh }));
+  expect(state).toMatchObject({ active_session: null, operations: [], lease: { state: "Unowned" },
+    runtime: { effective_session_state: null, motion_permission: "Disarmed", persistence_pending: false } });
+  expect(data(await transport.request("GET /sessions/{id}", { context: fresh, id: session.id })))
+    .toMatchObject({ id: session.id, state: "Ended", end_reason: "Interrupted" });
+  expect(await transport.request("PUT /settings/retention", { context: fresh, body: {
+    ...retentionChange, action_id: crypto.randomUUID(), preview_id: preview.preview_id, confirmed: true,
+  } })).toMatchObject({ error: { code: "PREVIEW_STALE" } });
+  const replay = (fields: Partial<typeof start> | { control_mode: "Controller" } = {}) =>
+    transport.request("POST /sessions", { context: fresh, body: { ...start, ...fields, client_id: fresh.client_id } });
+  expect(data(await replay())).toEqual(started);
+  expect(await replay({ control_mode: "Controller" })).toMatchObject({ error: { code: "ACTION_ID_CONFLICT" } });
+  expect(await transport.request("POST /sessions/{id}/actions", { context: fresh, id: session.id,
+    body: { ...body, client_id: fresh.client_id } })).toMatchObject({ error: { code: "LEASE_REQUIRED" } });
+});
+
 test("redeems a ticket once for its exact boot, client, channel and protocol before the monotonic deadline", async ({ onTestFinished }) => {
   let clock = 0;
   let utc = sampleTime;

@@ -2,8 +2,9 @@ import type { EmergencyStopRequest, EmergencyStopResponse, FrontendProfile, Heal
 import { compatibleProfile, conforms } from "@/lib/fixture-contracts";
 import { pendingReview } from "@/lib/match-evidence";
 import type { ApplicationTransport, HttpRequest, ProtectedPath, ProtectedRequest, ReadEndpoint, ReadParams, ReadResult } from "@/lib/transport";
-import { openWorkspace, type WorkspaceView } from "./workspace";
+import { openWorkspace, reconnectDelay, type WorkspaceView } from "./workspace";
 import { openSearchActions, searchActionKey, type SearchFeedback, type SearchIntent, unresolved } from "./search-actions";
+import { validSnapshot } from "./workspace-events";
 
 type EmergencyFeedback =
   | { kind: "sending" }
@@ -13,6 +14,7 @@ type EmergencyFeedback =
 type RuntimeView = {
   disconnected?: boolean;
   snapshot?: Snapshot;
+  recordSnapshot?: Snapshot;
   failedRead?: Exclude<ReadResult<never>, { kind: "ok" }>;
   loading: boolean;
   connected?: boolean;
@@ -22,6 +24,9 @@ type RuntimeView = {
   profile?: FrontendProfile;
   workspace?: WorkspaceView;
   searchActions?: Readonly<Record<string, SearchFeedback>>;
+  authority?: number;
+  recovering?: boolean;
+  reconnectingSessionId?: string;
 };
 
 export type RegistrationAction = Pick<HttpRequest<"POST /objects">, "body" | "actionCreatedAtMs">;
@@ -33,6 +38,9 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
   let context: ProtectedRequest["context"] | undefined;
   let clock: { server: number; received: number } | undefined;
   let readRequest: AbortController | undefined;
+  let protectedScope = new AbortController();
+  let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
+  let recoveryDelay = 250;
   let uncertainRequest: EmergencyStopRequest | undefined;
   let workspace: ReturnType<typeof openWorkspace> | undefined;
   let surface: HTMLElement | undefined;
@@ -87,12 +95,18 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         const bootstrap = await transport.bootstrap(signal);
         if (signal.aborted) return;
         if (bootstrap.kind !== "ok") {
+          if (view.recovering) {
+            update({ loading: false, failedRead: bootstrap });
+            retryBootstrap();
+            return;
+          }
           workspace?.dispose();
           workspace = undefined;
+          resetProtectedScope();
           context = undefined;
           clock = undefined;
-          update({ loading: false, failedRead: bootstrap, health: undefined, snapshot: undefined, connected: false,
-            profile: undefined, workspace: undefined });
+          update({ loading: false, failedRead: bootstrap, health: undefined, snapshot: undefined, recordSnapshot: undefined, connected: false,
+            profile: undefined, workspace: undefined, authority: (view.authority ?? 0) + 1 });
           return;
         }
         const candidate = bootstrap.data.qualification_profile;
@@ -104,14 +118,19 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
           workspace?.dispose();
           workspace = undefined;
         }
-        if (!sameAuthority) {
-          searchActions.clear();
+        const authorityChanged = !sameAuthority && context !== undefined;
+        if (authorityChanged) {
+          resetProtectedScope();
+          searchActions.changeAuthority();
           uncertainRequest = undefined;
         }
         context = bootstrap.data;
         clock = { server: bootstrap.data.server_time_ms, received: bootstrapStarted };
         update({ connected: true, profile: sameProfile ? view.profile : profile,
-          ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, removedOwners: undefined, emergency: undefined }) });
+          ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined, removedOwners: undefined,
+            emergency: undefined, authority: (view.authority ?? 0) + 1 }),
+          ...(authorityChanged && { recovering: true,
+            reconnectingSessionId: view.snapshot?.active_session?.id ?? view.reconnectingSessionId }) });
       }
       const request = { context, signal };
       const unavailable = () => ({ kind: "unavailable" } as const);
@@ -120,32 +139,64 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         transport.request("GET /health", request).catch(unavailable),
       ]);
       if (signal.aborted) return;
-      const eventsLive = view.workspace?.eventsLive;
-      if (status.kind === "ok") {
-        searchActions.reconcile(status.data, request.context);
-        reconcileEmergency(status.data);
+      const ordered = workspace !== undefined;
+      const next = status.kind === "ok" && validSnapshot(status.data, request.context.backend_boot_id) ? status.data : undefined;
+      if (next && !ordered) {
+        searchActions.synchronize(next, request.context);
+        reconcileEmergency(next);
       }
       update({
-        snapshot: eventsLive ? view.snapshot : status.kind === "ok" ? status.data : view.snapshot,
-        failedRead: status.kind === "ok" || eventsLive ? undefined : status,
+        snapshot: ordered ? view.snapshot : next ?? view.snapshot,
+        recordSnapshot: ordered ? view.recordSnapshot : next ?? view.recordSnapshot,
+        failedRead: next || view.workspace?.eventsLive ? undefined : status.kind === "ok" ? unavailable() : status,
         health: health.kind === "ok" ? health.data : undefined,
         loading: false,
+        ...(next && !ordered && { recovering: false, reconnectingSessionId: undefined }),
       });
+      if (view.recovering && !next) retryBootstrap();
+      else if (next && !ordered) recoveryComplete();
     } catch {
-      if (!signal.aborted) update({ loading: false, failedRead: { kind: "unavailable" }, health: undefined });
+      if (!signal.aborted) {
+        update({ loading: false, failedRead: { kind: "unavailable" }, health: undefined });
+        if (view.recovering) retryBootstrap();
+      }
     }
+  }
+
+  function retryBootstrap() {
+    clearTimeout(recoveryTimer);
+    recoveryTimer = setTimeout(() => void refresh({ readBootstrap: true }), reconnectDelay(recoveryDelay));
+    recoveryDelay = Math.min(5_000, recoveryDelay * 2);
+  }
+
+  function recoveryComplete() {
+    clearTimeout(recoveryTimer);
+    recoveryDelay = 250;
+  }
+
+  function resetProtectedScope() {
+    protectedScope.abort();
+    protectedScope = new AbortController();
+  }
+
+  async function protectedRead<T>(signal: AbortSignal, load: (request: ProtectedRequest) => Promise<ReadResult<T>>) {
+    if (!context) return { kind: "unavailable" } as const;
+    const scoped = AbortSignal.any([signal, protectedScope.signal, lifetime.signal]);
+    const result = await load({ context, signal: scoped });
+    scoped.throwIfAborted();
+    return result;
   }
 
   async function emergency() {
     if (!context || lifetime.signal.aborted || view.emergency?.kind === "sending") return;
-    const request = { context, signal: lifetime.signal };
+    const request = { context, signal: AbortSignal.any([protectedScope.signal, lifetime.signal]) };
     const generation = view.snapshot?.runtime.control_generation;
     const body = uncertainRequest ?? { request_id: crypto.randomUUID() };
     uncertainRequest = body;
     update({ emergency: { kind: "sending" } });
     try {
       const result = await transport.emergency(body, request);
-      if (context?.backend_boot_id !== request.context.backend_boot_id) return;
+      if (request.signal.aborted) return;
       if (result.kind === "ok" && conforms("EmergencyStopResponse", result.data) && result.data.request_id === body.request_id &&
           result.data.backend_boot_id === request.context.backend_boot_id) {
         uncertainRequest = undefined;
@@ -163,7 +214,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         update({ emergency: { kind: "unavailable" } });
       }
     } catch {
-      update({ emergency: { kind: "unavailable" } });
+      if (!request.signal.aborted) update({ emergency: { kind: "unavailable" } });
     }
   }
 
@@ -197,14 +248,20 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         transport, context, profile: view.profile, serverTime,
         update: (observation) => update({ workspace: observation }),
         snapshot: (next, removedOwner) => {
-          update({ snapshot: next, failedRead: undefined,
+          const refreshRecords = removedOwner || view.recovering || recordsChanged(view.snapshot, next);
+          recoveryComplete();
+          update({ snapshot: next, failedRead: undefined, recovering: false, reconnectingSessionId: undefined,
+            ...(refreshRecords && { recordSnapshot: next }),
             ...(removedOwner && { removedOwners: new Set([...view.removedOwners ?? [], removedOwner]) }) });
           if (removedOwner) searchActions.purge([removedOwner]);
-          if (context) searchActions.reconcile(next, context);
+          if (context) searchActions.synchronize(next, context);
           reconcileEmergency(next);
         },
         recover: () => {
-          update({ snapshot: undefined, failedRead: { kind: "unavailable" } });
+          update({ recovering: true, reconnectingSessionId: view.snapshot?.active_session?.id });
+          searchActions.suspend();
+          resetProtectedScope();
+          if (view.emergency?.kind === "sending") update({ emergency: { kind: "unavailable" } });
           void refresh({ readBootstrap: true });
         },
       });
@@ -265,7 +322,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       return searchActions.submit(key, { ...body, action: intent.kind }, context, active.object_id);
     },
     retrySearch(kind: SearchIntent["kind"], id: string) {
-      if (context) return searchActions.retry(searchActionKey(kind, id), context);
+      if (context && view.workspace?.eventsLive) return searchActions.retry(searchActionKey(kind, id), context);
     },
     async register(action: RegistrationAction, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;
@@ -280,21 +337,18 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       return transport.request("PUT /settings/retention", { body, context, signal: AbortSignal.any([signal, lifetime.signal]) });
     },
     async get<Path extends ProtectedPath>(path: Path, id: string | undefined, signal: AbortSignal) {
-      if (!context) return { kind: "unavailable" } as const;
-      return transport.get(path, { id, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+      return protectedRead(signal, (request) => transport.get(path, { ...request, id }));
     },
     async read<Route extends ReadEndpoint>(route: Route, params: ReadParams<Route>, signal: AbortSignal) {
-      if (!context) return { kind: "unavailable" } as const;
       // GET routes have no body. Keep the protected context at the runtime boundary.
-      const request = { ...params, context, signal: AbortSignal.any([signal, lifetime.signal]) } as HttpRequest<Route>;
-      return transport.request(route, request);
+      return protectedRead(signal, (request) => transport.request(route, { ...params, ...request } as HttpRequest<Route>));
     },
     async media(id: string, signal: AbortSignal) {
-      if (!context) return { kind: "unavailable" } as const;
-      return transport.media(id, { context, signal: AbortSignal.any([signal, lifetime.signal]) });
+      return protectedRead(signal, (request) => transport.media(id, request));
     },
     dispose() {
       clearTimeout(handoffTimer);
+      clearTimeout(recoveryTimer);
       workspace?.dispose();
       lifetime.abort();
       searchActions.clear();
@@ -303,6 +357,20 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       transport.dispose();
     },
   };
+}
+
+function recordsChanged(before: Snapshot | undefined, after: Snapshot) {
+  const session = after.active_session;
+  const object = after.active_object;
+  const previousObject = before?.active_object;
+  return !before || before.active_session?.id !== session?.id || before.active_session?.revision !== session?.revision ||
+    previousObject?.id !== object?.id || previousObject?.revision !== object?.revision ||
+    previousObject?.expires_at_ms !== object?.expires_at_ms || previousObject?.retention_grace !== object?.retention_grace ||
+    before.pending_candidate?.id !== after.pending_candidate?.id ||
+    before.retention.settings.revision !== after.retention.settings.revision ||
+    before.retention.deletion.status !== after.retention.deletion.status ||
+    after.operations.some((operation) => operation.persistence === "Committed" && !before.operations.some((previous) =>
+      previous.action_id === operation.action_id && previous.request_id === operation.request_id && previous.persistence === "Committed"));
 }
 
 export type RuntimeProjection = ReturnType<typeof openRuntimeProjection>;

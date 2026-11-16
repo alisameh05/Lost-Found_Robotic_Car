@@ -12,18 +12,19 @@ import { useRuntime, useRuntimeView } from "./runtime-provider";
 export function RuntimeFrame({ children }: { children: ReactNode }) {
   const runtime = useRuntime()?.connection?.runtime;
   const pathname = usePathname();
-  const { snapshot, health, failedRead, emergency, connected } = useRuntimeView();
+  const { snapshot, health, failedRead, emergency, connected, recovering, reconnectingSessionId } = useRuntimeView();
   const session = snapshot?.active_session;
   const active = session?.state === "Searching" || session?.state === "Paused";
+  const activeSearchId = recovering ? reconnectingSessionId : active && !failedRead ? session.id : undefined;
   const offerEmergency = active || !!health?.active_session_state ||
     (!!connected && (/^\/objects\/[^/]+\/search\/?$/.test(pathname ?? "") ||
       /^\/sessions\/[^/]+\/live\/?$/.test(pathname ?? "")));
 
   return (
-    <AppShell fixtureEnabled activeSearch={snapshot && active && !failedRead && (
+    <AppShell fixtureEnabled activeSearch={activeSearchId && (
       <div className="active-search">
-        <p>{snapshot.runtime.effective_session_state ?? session.state}{snapshot.active_object && ` · ${snapshot.active_object.name}`}</p>
-        <Link href={`/sessions/${encodeURIComponent(session.id)}/live`}>Return to Active Search</Link>
+        <p>{recovering ? "Resynchronizing search" : `${snapshot?.runtime.effective_session_state ?? session?.state}${snapshot?.active_object ? ` · ${snapshot.active_object.name}` : ""}`}</p>
+        <Link href={`/sessions/${encodeURIComponent(activeSearchId)}/live`}>Return to Active Search</Link>
       </div>
     )} priorityAction={(offerEmergency || emergency) && (
       <div className="emergency-bar">

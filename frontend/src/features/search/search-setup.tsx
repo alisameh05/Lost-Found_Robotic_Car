@@ -166,11 +166,11 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
             {spectator ? "Another workspace holds control." : workspace?.controlling
               ? "Waiting for the fixture to acknowledge the displayed robot frame." : "Acquire control to finish checking readiness."}
           </Notice>}
-        {workspace?.message && <p>{workspace.message}</p>}
-        <ActionFeedback label="Starting search" feedback={starting?.stage === "committed" && !active ? undefined : starting} retry={() => {
+        {workspace?.message && <p role="status">{workspace.message}</p>}
+        <ActionFeedback label="Starting search" feedback={starting?.stage === "committed" && !active ? undefined : starting} retry={workspace?.eventsLive ? () => {
           requestedStart.current = true;
           void runtime?.retrySearch("start", object.id);
-        }} />
+        } : undefined} />
       </div>
       <div className={styles.actions}>
         <Link className="button button--secondary" href={objectHref(object.id)}>Back to Object Details</Link>

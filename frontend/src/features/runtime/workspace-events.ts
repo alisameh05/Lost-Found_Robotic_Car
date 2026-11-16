@@ -11,10 +11,34 @@ function completeReadiness(readiness: Snapshot["readiness"]) {
 function consistentReadiness(state: Snapshot) {
   if (!completeReadiness(state.readiness)) return false;
   const { can_start, components } = state.readiness;
-  const shared = state.qualification_profile !== null && state.lease.state === "Owned" && !state.active_session &&
+  const shared = state.qualification_profile !== null && state.lease.state === "Owned" &&
     components.every(({ component, status }) => component === "Webcam" || component === "Controller" || status === "Ready");
-  return (!can_start.Gestures || (shared && components.some(({ component, status }) => component === "Webcam" && status === "Ready"))) &&
-    (!can_start.Controller || (shared && components.some(({ component, status }) => component === "Controller" && status === "Ready")));
+  const selectedReady = (mode: NonNullable<Snapshot["active_session"]>["control_mode"]) =>
+    components.some(({ component, status }) => component === (mode === "Gestures" ? "Webcam" : "Controller") && status === "Ready");
+  const session = state.active_session;
+  return (!can_start.Gestures || (shared && !session && selectedReady("Gestures"))) &&
+    (!can_start.Controller || (shared && !session && selectedReady("Controller"))) &&
+    (!state.readiness.can_resume || (shared && session?.state === "Paused" && selectedReady(session.control_mode) &&
+      state.runtime.effective_session_state === "Paused" && !state.runtime.persistence_pending && !state.pending_candidate &&
+      state.failures.every(({ restored, acknowledged }) => restored && acknowledged)));
+}
+
+function equalJson(left: unknown, right: unknown): boolean {
+  if (left === right) return true;
+  if (!left || !right || typeof left !== "object" || typeof right !== "object" || Array.isArray(left) !== Array.isArray(right)) return false;
+  const other = right as Record<string, unknown>;
+  const entries = Object.entries(left);
+  return entries.length === Object.keys(other).length && entries.every(([key, value]) =>
+    Object.hasOwn(other, key) && equalJson(value, other[key]));
+}
+
+function sameOperation(left: Operation, right: Operation) {
+  return left.action_id === right.action_id && left.request_id === right.request_id;
+}
+
+function conflicts(previous: Operation, operation: Operation) {
+  return previous.persistence === "Committed" &&
+    (operation.persistence !== "Committed" || !equalJson(previous.result, operation.result));
 }
 
 export function validSnapshot(state: Snapshot, boot: string) {
@@ -22,14 +46,18 @@ export function validSnapshot(state: Snapshot, boot: string) {
     state.qualification_profile_id === (state.qualification_profile?.profile_id ?? null) &&
     state.active_session?.state !== "Ended" &&
     state.runtime.control_generation === state.lease.control_generation &&
+    (state.runtime.effective_session_state !== null) === (state.active_session !== null) &&
+    (state.runtime.motion_permission === "Disarmed" || state.runtime.effective_session_state === "Searching") &&
+    state.failures.every(({ session_id }) => session_id === state.active_session?.id) &&
     (state.active_object?.id ?? null) === (state.active_session?.object_id ?? null) &&
     (!state.pending_candidate || pendingReview(state));
 }
 
 function withOperation(state: Snapshot, operation: Operation | null) {
   if (!operation) return state;
-  const operations = state.operations.filter((existing) =>
-    existing.action_id !== operation.action_id || existing.request_id !== operation.request_id);
+  const existing = state.operations.find((previous) => sameOperation(previous, operation));
+  if (existing && conflicts(existing, operation)) return;
+  const operations = state.operations.filter((previous) => !sameOperation(previous, operation));
   operations.push(operation);
   const pending = operations.filter(({ persistence }) => persistence === "Pending");
   const completed = operations.filter(({ persistence }) => persistence !== "Pending");
@@ -48,10 +76,11 @@ function sameCapture(left: Match, right: Match) {
 }
 
 // Undefined invalidates the stream. Returning the same state discards a duplicate.
-export function projectWorkspaceEvent(current: Snapshot | undefined, event: EventEnvelope, boot: string): Snapshot | undefined {
+export function projectWorkspaceEvent(current: Snapshot | undefined, event: EventEnvelope, boot: string, replacing = false): Snapshot | undefined {
   if (!conforms("EventEnvelope", event) || event.backend_boot_id !== boot ||
       (event.session_id === null) !== (event.session_revision === null)) return;
-  if (current && event.event_seq < current.event_seq) return current;
+  if (replacing && event.type !== "snapshot") return;
+  if (current && event.event_seq < current.event_seq) return replacing ? undefined : current;
   if (event.type === "snapshot") {
     const { payload } = event;
     if (!validSnapshot(payload, boot) || payload.event_seq !== event.event_seq ||
@@ -60,8 +89,8 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
   } else if (!current) {
     return;
   }
-  if (current && event.event_seq === current.event_seq) return current;
-  if (current && event.event_seq > current.event_seq + 1) return;
+  if (current && event.event_seq === current.event_seq && event.type !== "snapshot") return current;
+  if (!replacing && current && event.event_seq > current.event_seq + 1) return;
   const session = current?.active_session;
   if (session?.id === event.session_id && event.session_revision !== null && event.session_revision < session.revision) return;
   if (event.type === "snapshot") {
@@ -73,26 +102,50 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
     if (current && (payload.runtime.control_generation < current.runtime.control_generation ||
       payload.retention.settings.revision < current.retention.settings.revision ||
       (current.active_object && current.active_object.id === payload.active_object?.id &&
-        payload.active_object.revision < current.active_object.revision))) return;
+        payload.active_object.revision < current.active_object.revision) ||
+      (session && session.id === payload.active_session?.id && session.revision === payload.active_session.revision &&
+        !equalJson(session, payload.active_session)) ||
+      payload.operations.some((operation) => current.operations.some((previous) =>
+        sameOperation(previous, operation) && conflicts(previous, operation))))) return;
     return payload;
   }
   if (!current) return;
-  const next = { ...current, event_seq: event.event_seq };
   const { payload } = event;
+  // A new generation needs a full public lease projection. Runtime deltas
+  // alone cannot establish the identity of the owner for that generation.
   if ("runtime" in payload && payload.runtime.control_generation !== current.lease.control_generation) return;
+  const next = { ...current, event_seq: event.event_seq };
+  if (event.type !== "session_changed" && event.session_id !== null &&
+      (event.session_id !== session?.id || event.session_revision !== session.revision)) return;
+  if ("runtime" in payload && event.type !== "session_changed" &&
+      ((payload.runtime.effective_session_state !== null) !== (session !== null) ||
+       (payload.runtime.motion_permission !== "Disarmed" && payload.runtime.effective_session_state !== "Searching"))) return;
   switch (event.type) {
     case "readiness_changed":
       const changed = { ...next, ...event.payload };
       return consistentReadiness(changed) ? changed : undefined;
     case "session_changed": {
-      const { session, runtime } = event.payload;
-      if (session.id !== event.session_id || session.revision !== event.session_revision) return;
-      // A new active record needs the matching object from a fresh snapshot.
-      if (session.state !== "Ended" && session.object_id !== next.active_object?.id) return;
-      return withOperation({ ...next, runtime, active_session: session.state === "Ended" ? null : session,
-        active_object: session.state === "Ended" ? null : next.active_object,
-        pending_candidate: session.state === "Paused" && session.pause_causes.some(({ cause }) => cause === "CandidateReview")
-          ? next.pending_candidate : null }, event.payload.operation);
+      const { session: changed, runtime, operation } = event.payload;
+      if (changed.id !== event.session_id || changed.revision !== event.session_revision) return;
+      const result = operation?.result;
+      if ((result?.session && !equalJson(result.session, changed)) || (result?.object && result.object.id !== changed.object_id) ||
+          (result?.match && (result.match.session_id !== changed.id || result.match.object_id !== changed.object_id))) return;
+      const ended = changed.state === "Ended";
+      if (session && (session.id !== changed.id || session.object_id !== changed.object_id ||
+          session.control_mode !== changed.control_mode || session.started_at_ms !== changed.started_at_ms ||
+          (session.revision === changed.revision && !equalJson(session, changed)))) return;
+      if (session?.revision === changed.revision && equalJson(current.runtime, runtime)) return withOperation(next, operation);
+      const object = next.active_object ?? result?.object;
+      if ((!ended && object?.id !== changed.object_id) || ended !== (runtime.effective_session_state === null ||
+          runtime.effective_session_state === "Ended") ||
+          (runtime.motion_permission !== "Disarmed" && runtime.effective_session_state !== "Searching")) return;
+      const reviewsCandidate = changed.state === "Paused" && changed.pause_causes.some(({ cause }) => cause === "CandidateReview");
+      return withOperation({ ...next, runtime, active_session: ended ? null : changed,
+        active_object: ended ? null : object ?? null, failures: ended ? [] : next.failures,
+        readiness: { ...next.readiness, can_start: { Gestures: false, Controller: false }, can_resume: false },
+        retention: { ...next.retention, active_object_expires_at_ms: ended ? null : object?.expires_at_ms ?? null,
+          active_object_grace: !ended && !!object?.retention_grace },
+        pending_candidate: reviewsCandidate ? next.pending_candidate : null }, operation);
     }
     case "candidate_pending":
       if (!session || event.session_id !== session.id || event.session_revision !== session.revision ||
@@ -101,18 +154,32 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
       return { ...next, pending_candidate: event.payload.match };
     case "recovery_changed":
       if (event.payload.failures.some((failure) => failure.session_id !== session?.id)) return;
-      return { ...next, failures: event.payload.failures, runtime: event.payload.runtime };
-    case "retention_changed":
-      if (event.payload.retention.settings.revision < next.retention.settings.revision) return;
-      return withOperation({ ...next, retention: event.payload.retention }, event.payload.operation);
+      return { ...next, failures: event.payload.failures, runtime: event.payload.runtime,
+        readiness: { ...next.readiness, can_resume: next.readiness.can_resume &&
+          event.payload.failures.every(({ restored, acknowledged }) => restored && acknowledged) } };
+    case "retention_changed": {
+      const { retention, operation } = event.payload;
+      if (retention.settings.revision < next.retention.settings.revision ||
+          (operation?.result?.settings && operation.result.settings.revision !== retention.settings.revision) ||
+          (retention.active_object_expires_at_ms === null) !== (next.active_object === null)) return;
+      return withOperation({ ...next, retention, active_object: next.active_object && {
+        ...next.active_object, expires_at_ms: retention.active_object_expires_at_ms!, retention_grace: retention.active_object_grace,
+      } }, operation);
+    }
     case "object_removed":
       if (next.active_object?.id === event.payload.object_id) return;
       return { ...next, operations: next.operations.filter(({ result }) =>
         result?.object?.id !== event.payload.object_id && result?.session?.object_id !== event.payload.object_id &&
         result?.match?.object_id !== event.payload.object_id) };
-    case "storage_fault":
+    case "storage_fault": {
+      const components = structuredClone(next.readiness.components);
+      const storage = components.find(({ component }) => component === "Storage");
+      if (!storage) return;
+      storage.status = "Unavailable";
+      storage.cause_codes = [event.payload.code];
       return withOperation({ ...next, runtime: event.payload.runtime, retention: { ...next.retention, deletion: event.payload.deletion },
-        readiness: { ...next.readiness, can_start: { Gestures: false, Controller: false }, can_resume: false } }, event.payload.operation);
+        readiness: { components, can_start: { Gestures: false, Controller: false }, can_resume: false } }, event.payload.operation);
+    }
     case "proximity_warning_changed":
       return { ...next, proximity: event.payload.proximity };
   }

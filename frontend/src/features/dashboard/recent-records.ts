@@ -17,10 +17,10 @@ function useRecentSessionPage(owner?: ObjectRecord) {
 
 export function useRecentRecords() {
   const runtime = useRuntime()?.connection?.runtime;
-  const { snapshot, failedRead, removedOwners } = useRuntimeView();
+  const { snapshot, recordSnapshot, failedRead, removedOwners } = useRuntimeView();
   const catalogue = useProtectedRead("GET /objects", objectQuery);
   // Suppress the previous scope while its replacement is being read.
-  const objectPage = catalogue.result?.kind === "ok" && catalogue.snapshotAtRead !== snapshot ? undefined : catalogue.result;
+  const objectPage = catalogue.result?.kind === "ok" && catalogue.snapshotAtRead !== recordSnapshot ? undefined : catalogue.result;
   const recentObjects = objectPage?.kind === "ok" ? objectPage.data.items.slice(0, objectLimit) : [];
   const activeOwner = failedRead ? undefined : snapshot?.active_session?.object_id;
   // The catalogue page has three slots. Each owner settles and invalidates independently.
