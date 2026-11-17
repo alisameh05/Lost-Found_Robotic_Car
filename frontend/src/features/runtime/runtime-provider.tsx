@@ -102,39 +102,67 @@ export function useRuntimeRead<Path extends ProtectedPath>(path: Path, id?: stri
   return useApplicationRead(load, enabled).result;
 }
 
+function ownerRemoved(record: unknown, removed: ReadonlySet<string>) {
+  if (!record || typeof record !== "object") return false;
+  if ("object_id" in record && typeof record.object_id === "string") return removed.has(record.object_id);
+  return "registered_at_ms" in record && "id" in record && typeof record.id === "string" && removed.has(record.id);
+}
+
+function eligibleRead<T>(result: ReadResult<T>, removed?: ReadonlySet<string>): ReadResult<T> | undefined {
+  if (result.kind !== "ok" || !removed?.size) return result;
+  const data = result.data;
+  if (ownerRemoved(data, removed)) return;
+  if (data && typeof data === "object" && "items" in data && Array.isArray(data.items)) {
+    const items = data.items.filter((item) => !ownerRemoved(item, removed));
+    if (items.length !== data.items.length) return { ...result, data: { ...data, items } };
+  }
+  return result;
+}
+
 export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal: AbortSignal) => Promise<ReadResult<T>>,
   enabled = true, waitForRuntime = false) {
   const runtime = useRuntime()?.connection?.runtime;
   const refresh = useRefreshRuntime();
-  const { authority, recordSnapshot: snapshot, connected, failedRead, loading } = useRuntimeView();
+  const { authority, recordSnapshot: snapshot, connected, failedRead, loading, removedOwners } = useRuntimeView();
   const ready = connected && (!waitForRuntime || snapshot !== undefined || !loading);
   const [attempt, setAttempt] = useState(0);
   const [read, setRead] = useState<{
     runtime: RuntimeProjection; load: typeof load; attempt: number; result: ReadResult<T>;
-    snapshot: RuntimeView["snapshot"]; authority: RuntimeView["authority"];
+    snapshot: RuntimeView["snapshot"]; authority: RuntimeView["authority"]; removedOwners: RuntimeView["removedOwners"];
   }>();
+  let visibleRead = read;
+  if (read && read.authority !== authority) visibleRead = undefined;
+  else if (read && read.removedOwners !== removedOwners) {
+    const result = eligibleRead(read.result, removedOwners);
+    visibleRead = result && { ...read, result, removedOwners };
+  }
+  if (visibleRead !== read) setRead(visibleRead);
 
   useEffect(() => {
     if (!runtime || !ready || !enabled) return;
     const currentRuntime = runtime;
     const lifetime = new AbortController();
     function publish(result: ReadResult<T>) {
-      if (!lifetime.signal.aborted) setRead({ runtime: currentRuntime, load, attempt, result, snapshot, authority });
+      const eligible = eligibleRead(result, removedOwners);
+      if (!lifetime.signal.aborted && eligible) {
+        setRead({ runtime: currentRuntime, load, attempt, result: eligible, snapshot, authority, removedOwners });
+      }
     }
     void load(currentRuntime, lifetime.signal).then(publish).catch((error: unknown) => {
       if (!(error instanceof DOMException && error.name === "AbortError")) publish({ kind: "unavailable" });
     });
     return () => lifetime.abort();
-  }, [runtime, load, attempt, snapshot, authority, ready, enabled]);
+  }, [runtime, load, attempt, snapshot, authority, removedOwners, ready, enabled]);
 
-  const current = enabled && read?.runtime === runtime && read?.load === load && read.attempt === attempt && read.authority === authority;
+  const current = enabled && visibleRead && visibleRead.runtime === runtime && visibleRead.load === load &&
+    visibleRead.attempt === attempt ? visibleRead : undefined;
   const retry = useCallback(() => {
     if (connected) setAttempt((previous) => previous + 1);
     else refresh();
   }, [connected, refresh]);
   return {
-    result: current ? read.result : connected ? undefined : failedRead,
-    snapshotAtRead: current ? read.snapshot : undefined,
+    result: current?.result ?? (connected ? undefined : failedRead),
+    snapshotAtRead: current?.snapshot,
     retry,
   };
 }

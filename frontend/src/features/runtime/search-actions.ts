@@ -23,12 +23,13 @@ export function unresolved(feedback?: SearchFeedback) {
 }
 
 export function openSearchActions({
-  transport, signal, notify, refresh,
+  transport, signal, notify, refresh, removed,
 }: {
   transport: ApplicationTransport;
   signal: AbortSignal;
   notify(feedback: Readonly<Record<string, SearchFeedback>>): void;
   refresh(code?: ApiError["code"]): void;
+  removed?(objectId: string, sessionId: string): void;
 }) {
   const actions = new Map<string, Action>();
   const interrupted = new Map<string, { objectId: string; feedback: SearchFeedback }>();
@@ -78,6 +79,7 @@ export function openSearchActions({
     if (data.persistence === "Committed") {
       if (!resultMatches(action, data.result)) return false;
       action.feedback = { stage: "committed", session: data.result.session };
+      if (data.result.session === null && "session_id" in action.body) removed?.(action.objectId, action.body.session_id);
     } else if (data.persistence === "Failed") {
       action.feedback = { stage: "failed", message: data.error.message, retryable: data.error.retryable };
     } else {
@@ -187,8 +189,7 @@ export function openSearchActions({
     purge(owners: readonly string[]) {
       for (const [key, action] of interrupted) if (owners.includes(action.objectId)) interrupted.delete(key);
       for (const [key, action] of actions) {
-        if (!owners.includes(action.objectId) || (unresolved(action.feedback) &&
-            "action" in action.body && (action.body.action === "stop" || action.body.action === "confirm"))) continue;
+        if (!owners.includes(action.objectId)) continue;
         cancel(action);
         actions.delete(key);
       }

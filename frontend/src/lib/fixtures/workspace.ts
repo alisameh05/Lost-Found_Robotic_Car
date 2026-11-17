@@ -314,7 +314,7 @@ export function openFixtureWorkspace({
       publishProximity();
     },
     publishRemoval: (object_id: string) => emit((_state, envelope) => ({
-      ...envelope, type: "object_removed", payload: { object_id, reason: "Expired" },
+      ...envelope, session_id: null, session_revision: null, type: "object_removed", payload: { object_id, reason: "Expired" },
     })),
     watermark: () => watermark,
     hasEvents: () => events.size > 0,

@@ -75,3 +75,26 @@ test("projects the scoped candidate and rejects replacement evidence for the sam
     payload: { ...event.payload, match: { ...pending_candidate, frame_id: "different-frame" } },
   }, backend_boot_id)).toBeUndefined();
 });
+
+test("an ordered removal clears the grace session and its receipts before any replacement snapshot", async ({ onTestFinished }) => {
+  const harness = await createFixtureHarness();
+  const { transport } = harness.open("expiry-grace");
+  onTestFinished(() => transport.dispose());
+  const boot = await transport.bootstrap();
+  if (boot.kind !== "ok") throw new Error("Expected the fixture bootstrap");
+  const snapshot = await transport.snapshot({ context: boot.data });
+  if (snapshot.kind !== "ok" || !snapshot.data.active_session || !snapshot.data.active_object) throw new Error("Expected a grace session");
+  const { active_session, active_object, backend_boot_id, event_seq } = snapshot.data;
+  const receipt: Operation = { action_id: crypto.randomUUID(), request_id: null, persistence: "Committed", error: null,
+    result: { object: active_object, session: active_session, match: null, settings: null, deletion: null } };
+  const before = { ...snapshot.data, operations: [...snapshot.data.operations, receipt] };
+  const next = projectWorkspaceEvent(before, {
+    type: "object_removed", protocol_version: 1, backend_boot_id, event_seq: event_seq + 1,
+    session_id: null, session_revision: null, occurred_at_ms: boot.data.server_time_ms,
+    payload: { object_id: active_object.id, reason: "Expired" },
+  }, backend_boot_id);
+  expect(next).toMatchObject({ event_seq: event_seq + 1, active_session: null, active_object: null, pending_candidate: null,
+    lease: { state: "Unowned" }, runtime: { effective_session_state: null, motion_permission: "Disarmed" },
+    retention: { active_object_grace: false, active_object_expires_at_ms: null } });
+  expect(next?.operations).not.toContainEqual(receipt);
+});

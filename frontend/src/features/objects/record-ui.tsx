@@ -51,7 +51,7 @@ export function ReferenceImage({ object, thumbnail = false, target, onDisplay }:
   object: ObjectRecord; thumbnail?: boolean; target?: "both" | "selected"; onDisplay?: (available: boolean | undefined) => void;
 }) {
   const media = object.reference_media;
-  const load = useProtectedImage(media);
+  const load = useProtectedImage(media, object.id);
   return <ProtectedImage load={load} label={thumbnail ? "Reference thumbnail" : "Reference image"}
     alt={`Reference for ${object.name}`} width={media.width} height={media.height}
     target={target ? object.roi : undefined} targetOnly={target === "selected"} onDisplay={onDisplay} />;

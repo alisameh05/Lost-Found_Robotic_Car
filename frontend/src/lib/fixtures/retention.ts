@@ -14,7 +14,7 @@ const outdated = fixtureError(409, "PREVIEW_STALE", "The sample impact preview e
 const conflict = fixtureError(409, "REVISION_CONFLICT", "The saved sample retention revision changed.");
 export const unavailableStorage = fixtureError(503, "STORAGE_UNAVAILABLE", "Sample storage is unavailable.");
 
-export function openRetention({ now, initial, active, healthy, impactFor, collectExpired, purge, invalidate, manualCleanup }: {
+export function openRetention({ now, initial, active, healthy, impactFor, collectExpired, purge, invalidate, cleanupFailed, manualCleanup }: {
   now: () => number;
   initial: { settings: Settings; deletion: DeletionProgress };
   active: () => boolean;
@@ -23,6 +23,7 @@ export function openRetention({ now, initial, active, healthy, impactFor, collec
   collectExpired: (settings: Settings, time: number) => { id: string; files: number }[];
   purge: (owners: ReadonlyMap<string, number>) => void;
   invalidate: (owners?: string[], operation?: Operation) => void;
+  cleanupFailed: () => void;
   manualCleanup: boolean;
 }) {
   const previews = new Map<string, { value: RetentionPreview; signature: string }>();
@@ -41,6 +42,7 @@ export function openRetention({ now, initial, active, healthy, impactFor, collec
     cleanupDue = Infinity;
     if (failed) {
       deletion = { ...deletion, status: "Failed", error_code: "STORAGE_UNAVAILABLE" };
+      cleanupFailed();
     } else {
       purge(excluded);
       excluded.clear();

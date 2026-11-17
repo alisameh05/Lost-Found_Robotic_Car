@@ -12,6 +12,19 @@ import { duration, searchMode } from "./session-facts";
 import styles from "./session.module.css";
 
 export function SearchResultScreen({ sessionId }: { sessionId: string }) {
+  if (useRuntimeView().removedSessionId === sessionId) return <div className={styles.page}>
+    <PageHeader title="Search Result" />
+    <Notice role="status" tone="warning" title="Record removed after expiry">
+      The search ended and the expired record is no longer available.
+    </Notice>
+    <footer className={styles.actions}>
+      <Link href="/" className="button button--secondary">Return to Dashboard</Link>
+    </footer>
+  </div>;
+  return <SavedSearchResult sessionId={sessionId} />;
+}
+
+function SavedSearchResult({ sessionId }: { sessionId: string }) {
   const view = useRuntimeView();
   const runtime = useRuntime()?.connection?.runtime;
   const scope = useMemo(() => ({ id: sessionId }), [sessionId]);
