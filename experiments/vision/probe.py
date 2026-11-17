@@ -199,7 +199,9 @@ def mediapipe_probe(assets: Path):
 def run(args) -> int:
     assets = args.assets.resolve()
     attempts: list = []
-    os.environ["YOLO_CONFIG_DIR"] = str(args.output.parent.resolve() / "ultralytics-config")
+    config = args.output.parent.resolve() / "ultralytics-config"
+    config.mkdir(parents=True, exist_ok=True)
+    os.environ["YOLO_CONFIG_DIR"] = str(config)
     os.environ["YOLO_AUTOINSTALL"] = "false"
     os.environ["YOLO_OFFLINE"] = "true"
     os.environ["YOLO_VERBOSE"] = "false"

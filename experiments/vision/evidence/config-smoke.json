@@ -1,0 +1,395 @@
+{
+  "offline_enforcement": "Python socket audit denies connect and DNS; not an OS firewall",
+  "network_attempts": [],
+  "failures": [],
+  "models": [
+    {
+      "model": "yoloe-26n-seg.pt",
+      "model_sha256": "1741c1f8da3cea47e2c01829c334a50dc0b9bbd05e685b90a3ce84fae32c8c1b",
+      "device": "cuda:0",
+      "before": {
+        "system_available_bytes": 528199680,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 792694784,
+        "cuda_allocated_bytes": 0,
+        "cuda_reserved_bytes": 2097152,
+        "cuda_peak_allocated_bytes": 0,
+        "cuda_free_total_bytes": [
+          5306843136,
+          6438780928
+        ]
+      },
+      "dedicated_vram_before": "memory.total [MiB], memory.used [MiB], memory.free [MiB]\n6141 MiB, 102 MiB, 5820 MiB",
+      "checkpoint_load_ms": 119.02119999285787,
+      "actual_parameter_device": "cuda:0",
+      "prompt_and_first_target_ms": 1886.217699968256,
+      "reference_roi_xyxy": [
+        50,
+        390,
+        240,
+        900
+      ],
+      "encodes_after_prompt": 1,
+      "target_shape_hw": [
+        720,
+        1280
+      ],
+      "target_boxes_source_xyxy": [],
+      "memory_samples": [
+        {
+          "system_available_bytes": 289021952,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 1283477504,
+          "cuda_allocated_bytes": 74549760,
+          "cuda_reserved_bytes": 148897792,
+          "cuda_peak_allocated_bytes": 113974784,
+          "cuda_free_total_bytes": [
+            5145362432,
+            6438780928
+          ]
+        },
+        {
+          "system_available_bytes": 275423232,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 1283477504,
+          "cuda_allocated_bytes": 74549760,
+          "cuda_reserved_bytes": 148897792,
+          "cuda_peak_allocated_bytes": 113974784,
+          "cuda_free_total_bytes": [
+            5145362432,
+            6438780928
+          ]
+        }
+      ],
+      "warm_target_ms": [
+        52.551900036633015,
+        49.57899998407811
+      ],
+      "warm_median_ms": 51.06545001035556,
+      "warm_min_max_ms": [
+        49.57899998407811,
+        52.551900036633015
+      ],
+      "encodes_after_repeated_targets": 1,
+      "encoded_prompt_reused": true,
+      "negative_ms": 185.76850002864376,
+      "negative_boxes_source_xyxy": [],
+      "negative_shape_hw": [
+        382,
+        720
+      ],
+      "after_warm": {
+        "system_available_bytes": 281600000,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 1283543040,
+        "cuda_allocated_bytes": 54078464,
+        "cuda_reserved_bytes": 148897792,
+        "cuda_peak_allocated_bytes": 113974784,
+        "cuda_free_total_bytes": [
+          5145362432,
+          6438780928
+        ]
+      },
+      "dedicated_vram_after_warm": "memory.total [MiB], memory.used [MiB], memory.free [MiB]\n6141 MiB, 256 MiB, 5666 MiB",
+      "reference_change_ms": 166.82919999584556,
+      "encodes_after_reference_change": 2,
+      "reference_change_embedding_changed": true,
+      "encodes_after_reload": 3,
+      "reload_restores_reference_embedding": true,
+      "embedding_sha256": [
+        "24cc4985a032d32312770639827e993ecb63f0bc69c6615d08e55ea15e0d8eb8",
+        "2b9f80c244e2304cac9acac956946da90ec0c2d21cab7e0ae3f9ff71f46b380a",
+        "24cc4985a032d32312770639827e993ecb63f0bc69c6615d08e55ea15e0d8eb8"
+      ],
+      "after_reload": {
+        "system_available_bytes": 277262336,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 1291137024,
+        "cuda_allocated_bytes": 74549760,
+        "cuda_reserved_bytes": 148897792,
+        "cuda_peak_allocated_bytes": 113974784,
+        "cuda_free_total_bytes": [
+          5145362432,
+          6438780928
+        ]
+      }
+    },
+    {
+      "model": "yoloe-26s-seg.pt",
+      "model_sha256": "48f24206bc8680d60cbbfa296b0140da849669b9515058b72f5a945142df0654",
+      "device": "cuda:0",
+      "before": {
+        "system_available_bytes": 270659584,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 1291137024,
+        "cuda_allocated_bytes": 33554432,
+        "cuda_reserved_bytes": 33554432,
+        "cuda_peak_allocated_bytes": 33554432,
+        "cuda_free_total_bytes": [
+          5260705792,
+          6438780928
+        ]
+      },
+      "dedicated_vram_before": "memory.total [MiB], memory.used [MiB], memory.free [MiB]\n6141 MiB, 146 MiB, 5776 MiB",
+      "checkpoint_load_ms": 406.3919999753125,
+      "actual_parameter_device": "cuda:0",
+      "prompt_and_first_target_ms": 487.2895000153221,
+      "reference_roi_xyxy": [
+        50,
+        390,
+        240,
+        900
+      ],
+      "encodes_after_prompt": 1,
+      "target_shape_hw": [
+        720,
+        1280
+      ],
+      "target_boxes_source_xyxy": [
+        {
+          "xyxy": [
+            748.718994140625,
+            43.7978515625,
+            1150.433837890625,
+            719.4589233398438
+          ],
+          "confidence": 0.4315158724784851
+        },
+        {
+          "xyxy": [
+            124.72824096679688,
+            204.64537048339844,
+            1052.1292724609375,
+            717.4024047851562
+          ],
+          "confidence": 0.41812369227409363
+        }
+      ],
+      "memory_samples": [
+        {
+          "system_available_bytes": 421285888,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 929001472,
+          "cuda_allocated_bytes": 147004928,
+          "cuda_reserved_bytes": 257949696,
+          "cuda_peak_allocated_bytes": 221670912,
+          "cuda_free_total_bytes": [
+            5036310528,
+            6438780928
+          ]
+        },
+        {
+          "system_available_bytes": 421343232,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 929058816,
+          "cuda_allocated_bytes": 147004928,
+          "cuda_reserved_bytes": 257949696,
+          "cuda_peak_allocated_bytes": 221670912,
+          "cuda_free_total_bytes": [
+            5036310528,
+            6438780928
+          ]
+        }
+      ],
+      "warm_target_ms": [
+        30.114099965430796,
+        27.392500021960586
+      ],
+      "warm_median_ms": 28.75329999369569,
+      "warm_min_max_ms": [
+        27.392500021960586,
+        30.114099965430796
+      ],
+      "encodes_after_repeated_targets": 1,
+      "encoded_prompt_reused": true,
+      "negative_ms": 81.88549999613315,
+      "negative_boxes_source_xyxy": [],
+      "negative_shape_hw": [
+        382,
+        720
+      ],
+      "after_warm": {
+        "system_available_bytes": 419512320,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 929550336,
+        "cuda_allocated_bytes": 147000320,
+        "cuda_reserved_bytes": 257949696,
+        "cuda_peak_allocated_bytes": 221670912,
+        "cuda_free_total_bytes": [
+          5036310528,
+          6438780928
+        ]
+      },
+      "dedicated_vram_after_warm": "memory.total [MiB], memory.used [MiB], memory.free [MiB]\n6141 MiB, 360 MiB, 5562 MiB",
+      "reference_change_ms": 73.0743000167422,
+      "encodes_after_reference_change": 2,
+      "reference_change_embedding_changed": true,
+      "encodes_after_reload": 3,
+      "reload_restores_reference_embedding": true,
+      "embedding_sha256": [
+        "5052ade0f4f6bd8b8c23b836c6dd01a32ea98f96d95c7700366ae6ece9d1500b",
+        "712fdf0dc8cd6c498facb3a25f08e968d9c194094f0d2421c7dd0c841453a9ca",
+        "5052ade0f4f6bd8b8c23b836c6dd01a32ea98f96d95c7700366ae6ece9d1500b"
+      ],
+      "after_reload": {
+        "system_available_bytes": 402464768,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 994562048,
+        "cuda_allocated_bytes": 147004928,
+        "cuda_reserved_bytes": 257949696,
+        "cuda_peak_allocated_bytes": 222162944,
+        "cuda_free_total_bytes": [
+          5036310528,
+          6438780928
+        ]
+      }
+    }
+  ],
+  "conditions": "Post-review config-location check; Windows desktop, Next.js production server and MediaPipe resident; Python network audit enforced",
+  "repetitions": 2,
+  "imgsz": 640,
+  "confidence": 0.25,
+  "precision": "FP32",
+  "coexistence": "MediaPipe instance remains alive during YOLOE; other load in conditions",
+  "environment": {
+    "measured_at_utc": "2026-11-17T21:10:50.334637+00:00",
+    "platform": "Windows-10-10.0.26300-SP0",
+    "windows_registry": {
+      "ProductName": "Windows 10 Pro",
+      "DisplayVersion": "26H2",
+      "CurrentBuild": "26300",
+      "UBR": 9974
+    },
+    "python": "3.11.14 (main, Feb 12 2026, 00:37:49) [MSC v.1944 64 bit (AMD64)]",
+    "sqlite": "3.50.4",
+    "memory": {
+      "system_available_bytes": 1367261184,
+      "system_total_bytes": 13941923840,
+      "process_rss_bytes": 28205056
+    },
+    "disk": {
+      "C:/": {
+        "total": 362024218624,
+        "used": 341781471232,
+        "free": 20242747392
+      },
+      "D:/": {
+        "total": 149133717504,
+        "used": 65911271424,
+        "free": 83222446080
+      }
+    },
+    "gpu": "name, driver_version, memory.total [MiB], memory.free [MiB]\nNVIDIA GeForce RTX 4050 Laptop GPU, 560.94, 6141 MiB, 5913 MiB",
+    "node": "v24.21.0",
+    "packages": {
+      "Jinja2": "3.1.6",
+      "MarkupSafe": "3.0.4",
+      "PyYAML": "6.0.3",
+      "absl-py": "2.5.1",
+      "annotated-doc": "0.0.6",
+      "annotated-types": "0.8.0",
+      "anyio": "4.16.0",
+      "certifi": "2026.10.23",
+      "cffi": "2.1.1",
+      "charset-normalizer": "3.5.2",
+      "click": "8.5.1",
+      "contourpy": "1.3.3",
+      "cycler": "0.12.1",
+      "fastapi": "0.163.2",
+      "filelock": "4.2.11",
+      "flatbuffers": "25.12.19",
+      "fonttools": "4.68.0",
+      "fsspec": "2026.9.0",
+      "h11": "0.16.0",
+      "idna": "3.20",
+      "kiwisolver": "1.5.1",
+      "librt": "0.16.0",
+      "matplotlib": "3.11.2",
+      "mediapipe": "0.10.32",
+      "mpmath": "1.3.0",
+      "mypy": "1.19.1",
+      "mypy_extensions": "1.2.0",
+      "networkx": "3.6.1",
+      "numpy": "1.26.4",
+      "opencv-contrib-python": "4.11.0.86",
+      "opencv-python": "4.11.0.86",
+      "opentelemetry-api": "1.45.2",
+      "packaging": "26.3",
+      "pathspec": "1.1.1",
+      "pillow": "12.1.1",
+      "pip": "24.0",
+      "polars": "2.1.0",
+      "polars-runtime-32": "2.1.0",
+      "psutil": "7.2.2",
+      "pycparser": "3.12",
+      "pydantic": "2.14.3",
+      "pydantic_core": "2.50.4",
+      "pygame": "2.6.1",
+      "pyparsing": "3.3.3",
+      "pyserial": "3.5",
+      "python-dateutil": "4.0.0",
+      "requests": "2.34.2",
+      "ruff": "0.15.1",
+      "scipy": "1.17.1",
+      "setuptools": "79.0.1",
+      "sounddevice": "0.5.6",
+      "starlette": "1.10.0",
+      "sympy": "1.13.1",
+      "torch": "2.6.0+cu124",
+      "torchvision": "0.21.0+cu124",
+      "typing-inspection": "0.4.5",
+      "typing_extensions": "4.16.0",
+      "tzdata": "2026.6",
+      "ultralytics": "8.4.23",
+      "ultralytics-thop": "2.2.5",
+      "urllib3": "2.8.0",
+      "uvicorn": "0.41.0"
+    }
+  },
+  "assets": {
+    "yoloe-26n-seg.pt": "1741c1f8da3cea47e2c01829c334a50dc0b9bbd05e685b90a3ce84fae32c8c1b",
+    "yoloe-26s-seg.pt": "48f24206bc8680d60cbbfa296b0140da849669b9515058b72f5a945142df0654",
+    "hand_landmarker.task": "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1",
+    "bus.jpg": "c02019c4979c191eb739ddd944445ef408dad5679acab6fd520ef9d434bfbc63",
+    "zidane.jpg": "16d73869e3267a7d4ed00de8e860833bd1657c1b252e94c0c348277adc7b6edb",
+    "right_hands.jpg": "4b5134daa4cb60465535239535f9f74c2842aba3aa5fd30bf04ef5678f93d87f"
+  },
+  "torch_import_ms": 4880.086900026072,
+  "torch_cuda_available": true,
+  "torch_cuda_build": "12.4",
+  "torch_cpu_threads": 4,
+  "cuda_smoke_value": 8.0,
+  "mediapipe": {
+    "initialization_ms": 158.47799996845424,
+    "delegate": "CPU",
+    "api": "tasks.vision.HandLandmarker",
+    "memory": {
+      "system_available_bytes": 666501120,
+      "system_total_bytes": 13941923840,
+      "process_rss_bytes": 681996288
+    },
+    "process_ms": 48.33570000482723,
+    "hands": 2,
+    "landmark_counts": [
+      21,
+      21
+    ]
+  },
+  "supporting_initialization": {
+    "opencv": "4.11.0",
+    "opencv_contrib_aruco": true,
+    "fastapi_app_created": true,
+    "uvicorn": "0.41.0",
+    "pygame_sdl": [
+      2,
+      28,
+      4
+    ],
+    "pyserial": "3.5"
+  },
+  "reference_shape_hw": [
+    1080,
+    810
+  ],
+  "model_change_invalidation": "Each checkpoint uses a new model and encodes its own reference"
+}

@@ -9,7 +9,9 @@ from pathlib import Path
 @unittest.skipUnless(importlib.util.find_spec("ultralytics"), "Pinned runtime is not installed")
 class PinnedApiTest(unittest.TestCase):
     def test_wide_target_box_is_mapped_to_original_pixels(self):
-        os.environ["YOLO_CONFIG_DIR"] = str(Path(".local-runtime/test-ultralytics-config").resolve())
+        config = Path(".local-runtime/test-ultralytics-config").resolve()
+        config.mkdir(parents=True, exist_ok=True)
+        os.environ["YOLO_CONFIG_DIR"] = str(config)
         os.environ["YOLO_AUTOINSTALL"] = "false"
         os.environ["YOLO_OFFLINE"] = "true"
         import torch

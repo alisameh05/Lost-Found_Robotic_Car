@@ -112,6 +112,11 @@ disabled. Both reports contain **zero network attempts and zero failures**.
 passing. Python audit enforcement is not a machine-wide air gap or proof about
 arbitrary native library networking; no system network configuration was changed.
 
+A follow-up [GPU config-location smoke check](evidence/config-smoke.json) also
+passes for both models. Config parents are explicitly created before import to
+prevent the pinned library from falling back to a generated repository-root
+config directory. The main timing tables retain the original 20/5-call runs.
+
 The initial setup encountered a DNS failure at the alternate PyTorch CDN.
 A direct official-CDN transfer was slow. Resumable parallel HTTP ranges were
 used locally to cache the same 2,532,350,702-byte wheel, verified against lock
