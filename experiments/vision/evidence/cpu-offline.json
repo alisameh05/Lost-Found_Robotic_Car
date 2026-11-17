@@ -1,0 +1,360 @@
+{
+  "offline_enforcement": "Python socket audit denies connect and DNS; not an OS firewall",
+  "network_attempts": [],
+  "failures": [],
+  "models": [
+    {
+      "model": "yoloe-26n-seg.pt",
+      "model_sha256": "1741c1f8da3cea47e2c01829c334a50dc0b9bbd05e685b90a3ce84fae32c8c1b",
+      "device": "cpu",
+      "before": {
+        "system_available_bytes": 1047531520,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 654307328
+      },
+      "dedicated_vram_before": "memory.total [MiB], memory.used [MiB], memory.free [MiB]\n6141 MiB, 9 MiB, 5913 MiB",
+      "checkpoint_load_ms": 96.53759998036548,
+      "actual_parameter_device": "cpu",
+      "prompt_and_first_target_ms": 670.8109999890439,
+      "reference_roi_xyxy": [
+        50,
+        390,
+        240,
+        900
+      ],
+      "encodes_after_prompt": 1,
+      "target_shape_hw": [
+        720,
+        1280
+      ],
+      "target_boxes_source_xyxy": [],
+      "memory_samples": [
+        {
+          "system_available_bytes": 893353984,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 829091840
+        },
+        {
+          "system_available_bytes": 893304832,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 829091840
+        },
+        {
+          "system_available_bytes": 893353984,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 829091840
+        },
+        {
+          "system_available_bytes": 893689856,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 829091840
+        },
+        {
+          "system_available_bytes": 893779968,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 829091840
+        }
+      ],
+      "warm_target_ms": [
+        91.83570003369823,
+        72.47100002132356,
+        72.3347999737598,
+        75.13270003255457,
+        75.21159999305382
+      ],
+      "warm_median_ms": 75.13270003255457,
+      "warm_min_max_ms": [
+        72.3347999737598,
+        91.83570003369823
+      ],
+      "encodes_after_repeated_targets": 1,
+      "encoded_prompt_reused": true,
+      "negative_ms": 99.94860005099326,
+      "negative_boxes_source_xyxy": [],
+      "negative_shape_hw": [
+        382,
+        720
+      ],
+      "after_warm": {
+        "system_available_bytes": 884514816,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 834883584
+      },
+      "dedicated_vram_after_warm": "memory.total [MiB], memory.used [MiB], memory.free [MiB]\n6141 MiB, 9 MiB, 5913 MiB",
+      "reference_change_ms": 208.70279998052865,
+      "encodes_after_reference_change": 2,
+      "reference_change_embedding_changed": true,
+      "encodes_after_reload": 3,
+      "reload_restores_reference_embedding": true,
+      "embedding_sha256": [
+        "b80110a6472bd76105135617395fe24e644ce2000a53bc83dcab19da2bd638f8",
+        "aa2673f451c4318aecb154f747b7b3b00766847faeaa83b5382ca96b3acf0d86",
+        "b80110a6472bd76105135617395fe24e644ce2000a53bc83dcab19da2bd638f8"
+      ],
+      "after_reload": {
+        "system_available_bytes": 887107584,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 847691776
+      }
+    },
+    {
+      "model": "yoloe-26s-seg.pt",
+      "model_sha256": "48f24206bc8680d60cbbfa296b0140da849669b9515058b72f5a945142df0654",
+      "device": "cpu",
+      "before": {
+        "system_available_bytes": 883519488,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 847130624
+      },
+      "dedicated_vram_before": "memory.total [MiB], memory.used [MiB], memory.free [MiB]\n6141 MiB, 9 MiB, 5913 MiB",
+      "checkpoint_load_ms": 104.0571000194177,
+      "actual_parameter_device": "cpu",
+      "prompt_and_first_target_ms": 547.5737999659032,
+      "reference_roi_xyxy": [
+        50,
+        390,
+        240,
+        900
+      ],
+      "encodes_after_prompt": 1,
+      "target_shape_hw": [
+        720,
+        1280
+      ],
+      "target_boxes_source_xyxy": [
+        {
+          "xyxy": [
+            748.710205078125,
+            43.73095703125,
+            1150.424560546875,
+            719.4292602539062
+          ],
+          "confidence": 0.43117669224739075
+        },
+        {
+          "xyxy": [
+            124.67657470703125,
+            204.63478088378906,
+            1052.0517578125,
+            717.376953125
+          ],
+          "confidence": 0.41869622468948364
+        }
+      ],
+      "memory_samples": [
+        {
+          "system_available_bytes": 642404352,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 974352384
+        },
+        {
+          "system_available_bytes": 649437184,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 974356480
+        },
+        {
+          "system_available_bytes": 654397440,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 974356480
+        },
+        {
+          "system_available_bytes": 618180608,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 974356480
+        },
+        {
+          "system_available_bytes": 597250048,
+          "system_total_bytes": 13941923840,
+          "process_rss_bytes": 974360576
+        }
+      ],
+      "warm_target_ms": [
+        166.34870000416413,
+        170.55889999028295,
+        220.69589997408912,
+        151.1616000207141,
+        145.1859999797307
+      ],
+      "warm_median_ms": 166.34870000416413,
+      "warm_min_max_ms": [
+        145.1859999797307,
+        220.69589997408912
+      ],
+      "encodes_after_repeated_targets": 1,
+      "encoded_prompt_reused": true,
+      "negative_ms": 188.188900006935,
+      "negative_boxes_source_xyxy": [],
+      "negative_shape_hw": [
+        382,
+        720
+      ],
+      "after_warm": {
+        "system_available_bytes": 559173632,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 978026496
+      },
+      "dedicated_vram_after_warm": "memory.total [MiB], memory.used [MiB], memory.free [MiB]\n6141 MiB, 9 MiB, 5913 MiB",
+      "reference_change_ms": 448.55400000233203,
+      "encodes_after_reference_change": 2,
+      "reference_change_embedding_changed": true,
+      "encodes_after_reload": 3,
+      "reload_restores_reference_embedding": true,
+      "embedding_sha256": [
+        "e0f63b45f766d530a63296457d5d5781c6bcd79ca5e64850f2d2c6c1c24e514f",
+        "b9176b685e00ba25fff5b3cb4a4028df51f216710d0757d9cefeb95105d43528",
+        "e0f63b45f766d530a63296457d5d5781c6bcd79ca5e64850f2d2c6c1c24e514f"
+      ],
+      "after_reload": {
+        "system_available_bytes": 461549568,
+        "system_total_bytes": 13941923840,
+        "process_rss_bytes": 999038976
+      }
+    }
+  ],
+  "conditions": "CPU comparison, 4 PyTorch/OpenCV threads; same Windows desktop and resident MediaPipe; Next.js production server running; no camera, control or production backend; Python network audit enforced",
+  "repetitions": 5,
+  "imgsz": 640,
+  "confidence": 0.25,
+  "precision": "FP32",
+  "coexistence": "MediaPipe instance remains alive during YOLOE; other load in conditions",
+  "environment": {
+    "measured_at_utc": "2026-11-17T21:04:07.977458+00:00",
+    "platform": "Windows-10-10.0.26300-SP0",
+    "windows_registry": {
+      "ProductName": "Windows 10 Pro",
+      "DisplayVersion": "26H2",
+      "CurrentBuild": "26300",
+      "UBR": 9974
+    },
+    "python": "3.11.14 (main, Feb 12 2026, 00:37:49) [MSC v.1944 64 bit (AMD64)]",
+    "sqlite": "3.50.4",
+    "memory": {
+      "system_available_bytes": 1156878336,
+      "system_total_bytes": 13941923840,
+      "process_rss_bytes": 28098560
+    },
+    "disk": {
+      "C:/": {
+        "total": 362024218624,
+        "used": 350656053248,
+        "free": 11368165376
+      },
+      "D:/": {
+        "total": 149133717504,
+        "used": 65910861824,
+        "free": 83222855680
+      }
+    },
+    "gpu": "name, driver_version, memory.total [MiB], memory.free [MiB]\nNVIDIA GeForce RTX 4050 Laptop GPU, 560.94, 6141 MiB, 5913 MiB",
+    "node": "v24.21.0",
+    "packages": {
+      "Jinja2": "3.1.6",
+      "MarkupSafe": "3.0.4",
+      "PyYAML": "6.0.3",
+      "absl-py": "2.5.1",
+      "annotated-doc": "0.0.6",
+      "annotated-types": "0.8.0",
+      "anyio": "4.16.0",
+      "certifi": "2026.10.23",
+      "cffi": "2.1.1",
+      "charset-normalizer": "3.5.2",
+      "click": "8.5.1",
+      "contourpy": "1.3.3",
+      "cycler": "0.12.1",
+      "fastapi": "0.163.2",
+      "filelock": "4.2.11",
+      "flatbuffers": "25.12.19",
+      "fonttools": "4.68.0",
+      "fsspec": "2026.9.0",
+      "h11": "0.16.0",
+      "idna": "3.20",
+      "kiwisolver": "1.5.1",
+      "librt": "0.16.0",
+      "matplotlib": "3.11.2",
+      "mediapipe": "0.10.32",
+      "mpmath": "1.3.0",
+      "mypy": "1.19.1",
+      "mypy_extensions": "1.2.0",
+      "networkx": "3.6.1",
+      "numpy": "1.26.4",
+      "opencv-contrib-python": "4.11.0.86",
+      "opencv-python": "4.11.0.86",
+      "opentelemetry-api": "1.45.2",
+      "packaging": "26.3",
+      "pathspec": "1.1.1",
+      "pillow": "12.1.1",
+      "pip": "24.0",
+      "polars": "2.1.0",
+      "polars-runtime-32": "2.1.0",
+      "psutil": "7.2.2",
+      "pycparser": "3.12",
+      "pydantic": "2.14.3",
+      "pydantic_core": "2.50.4",
+      "pygame": "2.6.1",
+      "pyparsing": "3.3.3",
+      "pyserial": "3.5",
+      "python-dateutil": "4.0.0",
+      "requests": "2.34.2",
+      "ruff": "0.15.1",
+      "scipy": "1.17.1",
+      "setuptools": "79.0.1",
+      "sounddevice": "0.5.6",
+      "starlette": "1.10.0",
+      "sympy": "1.13.1",
+      "torch": "2.6.0+cu124",
+      "torchvision": "0.21.0+cu124",
+      "typing-inspection": "0.4.5",
+      "typing_extensions": "4.16.0",
+      "tzdata": "2026.6",
+      "ultralytics": "8.4.23",
+      "ultralytics-thop": "2.2.5",
+      "urllib3": "2.8.0",
+      "uvicorn": "0.41.0"
+    }
+  },
+  "assets": {
+    "yoloe-26n-seg.pt": "1741c1f8da3cea47e2c01829c334a50dc0b9bbd05e685b90a3ce84fae32c8c1b",
+    "yoloe-26s-seg.pt": "48f24206bc8680d60cbbfa296b0140da849669b9515058b72f5a945142df0654",
+    "hand_landmarker.task": "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1",
+    "bus.jpg": "c02019c4979c191eb739ddd944445ef408dad5679acab6fd520ef9d434bfbc63",
+    "zidane.jpg": "16d73869e3267a7d4ed00de8e860833bd1657c1b252e94c0c348277adc7b6edb",
+    "right_hands.jpg": "4b5134daa4cb60465535239535f9f74c2842aba3aa5fd30bf04ef5678f93d87f"
+  },
+  "torch_import_ms": 23443.258000013884,
+  "torch_cuda_available": true,
+  "torch_cuda_build": "12.4",
+  "torch_cpu_threads": 4,
+  "mediapipe": {
+    "initialization_ms": 2524.6846999507397,
+    "delegate": "CPU",
+    "api": "tasks.vision.HandLandmarker",
+    "memory": {
+      "system_available_bytes": 1215807488,
+      "system_total_bytes": 13941923840,
+      "process_rss_bytes": 543473664
+    },
+    "process_ms": 51.757799985352904,
+    "hands": 2,
+    "landmark_counts": [
+      21,
+      21
+    ]
+  },
+  "supporting_initialization": {
+    "opencv": "4.11.0",
+    "opencv_contrib_aruco": true,
+    "fastapi_app_created": true,
+    "uvicorn": "0.41.0",
+    "pygame_sdl": [
+      2,
+      28,
+      4
+    ],
+    "pyserial": "3.5"
+  },
+  "reference_shape_hw": [
+    1080,
+    810
+  ],
+  "model_change_invalidation": "Each checkpoint uses a new model and encodes its own reference"
+}

@@ -1,0 +1,9 @@
+# Reinstall this provider last, with the same verified hashes as requirements.lock.
+opencv-contrib-python==4.11.0.86 \
+    --hash=sha256:194841c664ceaa0692410b4ed0af557425608e33db3a181ded28b87acb66748d \
+    --hash=sha256:4ff773dab44911da366b906621c9592d4eb96f6ad3777098933a23f064aab38e \
+    --hash=sha256:654758a9ae8ca9a75fca7b64b19163636534f0eedffe1e14c3d7218988625c8d \
+    --hash=sha256:c47c0ef1098461cdc6fa1cdce4c942b8ec974c87423f4b5951443d26bb9ae407 \
+    --hash=sha256:d911cedc511d98f79994580b245d59fc97f57f0f9923a99945d8b92c7ac671f6 \
+    --hash=sha256:e10a293af18aa5f842d012fa14e87345b3ee06db4c29bd592ff94b51f7ffca2b \
+    --hash=sha256:f21034bc8b00eb286a0a0a92b99767bf596bfe426cf4bc2e79647d64ad0dd6da
