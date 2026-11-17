@@ -85,6 +85,8 @@ export function createFixtureTransport({
   let deliverCapture: (() => void) | undefined;
   let holdSearchResponse = false;
   let deliverSearchResponse: (() => void) | undefined;
+  let holdEvidenceRead = false;
+  let deliverEvidenceRead: (() => void) | undefined;
   let snapshotError = scene.snapshotError;
   const lifetime = new AbortController();
   const pages = fixturePages();
@@ -109,6 +111,7 @@ export function createFixtureTransport({
   });
   const retention: ReturnType<typeof openRetention> = openRetention({
     now, initial: snapshot.retention, active: () => Boolean(snapshot.active_session), healthy, impactFor: retentionImpact,
+    cleanupFailed: () => observePath("Storage", false),
     collectExpired: (settings, time) => allObjects().filter((object) =>
       !isActiveOwner(object.id) && expiryFor(object.registered_at_ms, settings.retention_days) <= time)
       .map(({ id }) => ({ id, files: 1 + matches.filter((match) => match.object_id === id).length })),
@@ -245,10 +248,13 @@ export function createFixtureTransport({
 
   function invalidate(owners?: string[], operation?: Operation) {
     for (const owner of owners ?? []) searchSaves.purge(owner);
+    for (const owner of owners ?? []) workspace.publishRemoval(owner);
     if (operation) workspace.publishRetention(operation);
     else workspace.publish();
-    for (const owner of owners ?? []) workspace.publishRemoval(owner);
-    for (const listener of retentionListeners) listener(owners);
+    // Ordered subscribers receive removals first. Other screens refresh through the fixture read adapter.
+    queueMicrotask(() => {
+      for (const listener of retentionListeners) listener(owners);
+    });
   }
 
   function scheduleRetention() {
@@ -531,9 +537,8 @@ export function createFixtureTransport({
         return committedSearch(body.action_id, { session: resumed });
       }
       if (body.action === "stop") {
-        const grace = snapshotRead().active_object?.retention_grace;
         const ended = endFixtureSearch();
-        return committedSearch(body.action_id, grace ? {} : ended ?? {});
+        return committedSearch(body.action_id, ended?.removed ? {} : { session: ended?.session, match: ended?.match });
       }
       const paused: Session = session.state === "Paused" ? session : { ...session, state: "Paused",
         pause_causes: [{ cause: "ManualPause", failure_id: null }], revision: session.revision + 1 };
@@ -589,7 +594,7 @@ export function createFixtureTransport({
         objects = objects.map((item) => item.id === found.id ? found : item);
         registrations.updateObject(found);
         const ended = endFixtureSearch("Confirmed", reviewed_at_ms);
-        return committedSearch(body.action_id, object.retention_grace ? {} : { object: found, session: ended?.session, match });
+        return committedSearch(body.action_id, ended?.removed ? {} : { object: found, session: ended?.session, match });
       }
       const session: Session = { ...active, revision: active.revision + 1, pause_causes: [
         ...active.pause_causes.filter(({ cause }) => cause !== "CandidateReview"), { cause: "ReviewRejected", failure_id: null },
@@ -871,6 +876,8 @@ export function createFixtureTransport({
   function endFixtureSearch(end_reason: Extract<Session, { state: "Ended" }>["end_reason"] = "Stopped", endedAt = now()) {
     const active = snapshot.active_session;
     if (!active) return;
+    const object = snapshot.active_object;
+    const removed = !!object && projectObject(object, endedAt).retention_grace;
     const ended: Session = { ...active, state: "Ended", end_reason, ended_at_ms: endedAt, revision: active.revision + 1, pause_causes: [] };
     const candidate = snapshot.pending_candidate;
     const match: Match | null = end_reason !== "Confirmed" && candidate
@@ -892,13 +899,13 @@ export function createFixtureTransport({
       lease: { state: "Unowned", owner_client_id: null, can_acquire: false, control_generation },
       runtime: { effective_session_state: null, motion_permission: "Disarmed", persistence_pending: false, control_generation },
       readiness: { ...snapshot.readiness, can_resume: false, can_start: { Gestures: false, Controller: false } } };
-    retention.sweep();
+    retention.sweep(endedAt);
     scheduleRetention();
     const competing = end_reason === "Confirmed" ? ["stop"] as const : ["confirm", "reject"] as const;
     // Settle any losing save against the committed terminal state.
     for (const action of competing) if (searchSaves.pending(action)) searchSaves.finish(true, action);
     invalidate();
-    return { session: ended, match };
+    return { session: ended, match, removed };
   }
 
   function restart() {
@@ -947,8 +954,15 @@ export function createFixtureTransport({
   function deliverHeldObservations() {
     deliverCapture?.();
     deliverSearchResponse?.();
+    releaseEvidenceRead();
     deliverCapture = undefined;
     deliverSearchResponse = undefined;
+  }
+
+  function releaseEvidenceRead() {
+    holdEvidenceRead = false;
+    deliverEvidenceRead?.();
+    deliverEvidenceRead = undefined;
   }
 
   return {
@@ -970,6 +984,8 @@ export function createFixtureTransport({
       restart,
       scriptSearch(delivery: SearchDelivery) { searchSaves.script(delivery); },
       holdNextSearchResponse() { if (!deliverSearchResponse) holdSearchResponse = true; },
+      holdNextEvidenceRead() { if (!deliverEvidenceRead) holdEvidenceRead = true; },
+      releaseEvidenceRead,
       observeCandidate,
       observePath,
       observeProximity: proximity.observe,
@@ -1086,9 +1102,12 @@ export function createFixtureTransport({
         if (capture?.readFault === "corrupt-media") bytes.fill(0);
         if ((scene.recordsRecovery && id === "sample-keys-Z-reference") ||
             (scene.historyRecovery && id === "sample-earlier-evidence-2")) bytes.fill(0);
-        return ok({ bytes, headers: {
+        const response = ok<ProtectedMedia>({ bytes, headers: {
           "Content-Type": media.content_type, "Cache-Control": "no-store", "X-Content-Type-Options": "nosniff", "Accept-Ranges": "none",
         } });
+        if (!capture || !holdEvidenceRead) return response;
+        holdEvidenceRead = false;
+        return new Promise<void>((resolve) => { deliverEvidenceRead = resolve; }).then(() => response);
       });
     },
     dispose() {

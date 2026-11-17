@@ -64,9 +64,13 @@ function MediaInspector({ runtime, expire, mediaExamples }: {
 }) {
   const [selected, setSelected] = useState<string>(mediaExamples[0].id);
   const [revision, setRevision] = useState(0);
+  const { removedOwners, authority } = useRuntimeView();
   const example = mediaExamples.find(({ id }) => id === selected) ?? mediaExamples[0];
+  const removed = removedOwners?.has(example.ownerId) ?? false;
   const load = useCallback<ComponentProps<typeof ProtectedImage>["load"]>(async (signal) => {
-    const result = await runtime.media(selected, signal);
+    if (removed) return { kind: "expired", detail: "Sample record expired." };
+    if (authority === undefined) return { kind: "unavailable", detail: "Sample media request unavailable." };
+    const result = await runtime.media(example.id, signal, example.ownerId);
     if (result.kind === "ok") {
       const { bytes, headers } = result.data;
       return { kind: "ok", image: new Blob([bytes], { type: headers["Content-Type"] }) };
@@ -76,7 +80,7 @@ function MediaInspector({ runtime, expire, mediaExamples }: {
     if (code === "EXPIRED") return { kind: "expired", detail: message };
     const kind = code === "MEDIA_UNAVAILABLE" ? example.failure ?? "unavailable" : "unavailable";
     return { kind, detail: message };
-  }, [runtime, selected, example]);
+  }, [runtime, example, removed, authority]);
   return (
     <>
       <div className="control-row">

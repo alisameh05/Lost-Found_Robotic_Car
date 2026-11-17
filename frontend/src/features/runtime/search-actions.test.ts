@@ -1,4 +1,4 @@
-import { expect, test, vi } from "vitest";
+import { expect, onTestFinished, test, vi } from "vitest";
 import type { MutationResponse, Operation, StartRequest } from "@/generated/api-v1";
 import { createFixtureHarness } from "@/lib/create-transport";
 import type { ReadResult } from "@/lib/transport";
@@ -58,4 +58,35 @@ test("discarded deliveries cannot restore an operation, and a fresh receipt must
   expect(feedback).toMatchObject({ stage: "interrupted" });
   expect(actions.retry(key, fresh.data)).toBeUndefined();
   expect(request).toHaveBeenCalledTimes(2);
+});
+
+test.each(["confirm", "stop"] as const)("recognizes an all-null %s receipt from HTTP without an event", async (action) => {
+  const harness = await createFixtureHarness();
+  const { transport } = harness.open("candidate");
+  const lifetime = new AbortController();
+  onTestFinished(() => { lifetime.abort(); transport.dispose(); });
+  const bootstrap = await transport.bootstrap();
+  if (bootstrap.kind !== "ok") throw new Error("Expected fixture authorization");
+  const context = bootstrap.data;
+  const status = await transport.snapshot({ context });
+  if (status.kind !== "ok" || !status.data.active_session || !status.data.pending_candidate) throw new Error("Expected a candidate");
+  const { active_session: session, pending_candidate: candidate } = status.data;
+  const common = { action_id: crypto.randomUUID(), client_id: context.client_id, client_lease_id: context.capability,
+    session_id: session.id, expected_revision: session.revision };
+  const body = action === "confirm" ? { ...common, action, candidate_id: candidate.id } : { ...common, action };
+  const result = { object: null, session: null, match: null, settings: null, deletion: null };
+  const request = vi.spyOn(transport, "request");
+  const removed = vi.fn();
+  const actions = openSearchActions({ transport, signal: lifetime.signal, removed, notify() {}, refresh() {} });
+  const key = searchActionKey(action, session.id);
+  request.mockResolvedValueOnce({ kind: "ok", status: 200, data: {
+    action_id: crypto.randomUUID(), persistence: "Committed", result, error: null,
+  } });
+  await actions.submit(key, body, context, session.object_id);
+  expect(removed).not.toHaveBeenCalled();
+  request.mockResolvedValueOnce({ kind: "ok", status: 200, data: {
+    action_id: body.action_id, persistence: "Committed", result, error: null,
+  } });
+  await actions.retry(key, context);
+  expect(removed).toHaveBeenCalledExactlyOnceWith(session.object_id, session.id);
 });

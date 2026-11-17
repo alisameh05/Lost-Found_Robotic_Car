@@ -22,16 +22,17 @@ import { duration, searchMode } from "./session-facts";
 import styles from "./session.module.css";
 
 export function LiveSearchScreen({ sessionId }: { sessionId: string }) {
-  const { health, snapshot, searchActions, removedOwners, workspace } = useRuntimeView();
+  const { health, snapshot, searchActions, removedSessionId, workspace } = useRuntimeView();
   const router = useRouter();
   const stop = searchActions?.[searchActionKey("stop", sessionId)];
   const confirm = searchActions?.[searchActionKey("confirm", sessionId)];
   const terminal = confirm?.stage === "committed" ? confirm : stop?.stage === "committed" ? stop : undefined;
+  const removed = removedSessionId === sessionId;
   useEffect(() => {
-    if (!workspace?.resynchronizing && terminal?.session?.id === sessionId) router.replace(`${sessionHref(sessionId)}/result`);
-  }, [router, sessionId, terminal, workspace?.resynchronizing]);
-  const active = snapshot?.active_session?.id === sessionId && snapshot.active_object && !removedOwners?.has(snapshot.active_object.id);
-  const read = useRuntimeRead("/sessions/{id}", sessionId, !active);
+    if (removed || (!workspace?.resynchronizing && terminal?.session?.id === sessionId)) router.replace(`${sessionHref(sessionId)}/result`);
+  }, [removed, router, sessionId, terminal, workspace?.resynchronizing]);
+  const active = snapshot?.active_session?.id === sessionId && snapshot.active_object && !removed;
+  const read = useRuntimeRead("/sessions/{id}", sessionId, !active && !removed);
   const refresh = useRefreshRuntime();
 
   if (active && snapshot) return <Workspace sessionId={sessionId} snapshot={snapshot} />;
@@ -41,10 +42,9 @@ export function LiveSearchScreen({ sessionId }: { sessionId: string }) {
   return <div className={styles.page}>
     <PageHeader title="Live Search Workspace" />
     {unknown && <ActionFeedback label="Search action" feedback={unknown} />}
-    {health?.initialization === "Starting" ? <Notice title="Initializing services">Checking the service and saved search records.</Notice>
-      : terminal && !terminal.session ? <Notice title="Record removed after expiry">
-      The search ended and the expired record is no longer available.
-    </Notice> : absent ? <RecordAbsent status={absent} title="Session" />
+    {removed ? <LoadingState label="Opening search result" />
+      : health?.initialization === "Starting" ? <Notice title="Initializing services">Checking the service and saved search records.</Notice>
+      : absent ? <RecordAbsent status={absent} title="Session" />
       : !read ? <LoadingState label="Loading search session" />
       : read.kind !== "ok" ? <RecordReadFailure title="Search workspace unavailable" retry={refresh} />
       : read.data.state === "Ended" ? <Notice title="Search has ended">
@@ -204,6 +204,9 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
         {!candidate && <Button variant="destructive" disabled={blocked} onClick={stopSearch}>Stop Search</Button>}
       </div>
     </Panel>
+    {object.retention_grace && <Notice role="status" tone="warning" title="Active-session grace">
+      The retention deadline has passed. The target and evidence remain available until this search ends.
+    </Notice>}
     {destination && <Panel className={styles.exit} aria-label="Leave search workspace">
       <h2>Leave search workspace?</h2>
       <p>Leaving paused keeps the current target and session available in Return to Active Search.</p>

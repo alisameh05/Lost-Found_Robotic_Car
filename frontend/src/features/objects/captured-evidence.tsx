@@ -15,7 +15,7 @@ export function CapturedEvidence({ match, zoom, onDisplay }: {
   onDisplay?: (available: boolean | undefined) => void;
 }) {
   const media = match.evidence_media;
-  const load = useProtectedImage(media);
+  const load = useProtectedImage(media, match.object_id);
   return <article className={styles.capture}>
     <ProtectedImage load={load} label="Captured evidence" alt="Captured evidence"
       width={media.width} height={media.height} box={match.box} zoom={zoom} onDisplay={onDisplay} />

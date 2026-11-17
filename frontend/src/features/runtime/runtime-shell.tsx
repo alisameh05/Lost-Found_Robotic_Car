@@ -3,7 +3,7 @@
 import { Octagon } from "lucide-react";
 import Link from "next/link";
 import { usePathname } from "next/navigation";
-import type { ReactNode } from "react";
+import { useEffect, type ReactNode } from "react";
 import { AppShell } from "@/components/layout/app-shell";
 import { Notice } from "@/components/ui/feedback";
 import type { EmergencyFeedback } from "./projection";
@@ -12,7 +12,12 @@ import { useRuntime, useRuntimeView } from "./runtime-provider";
 export function RuntimeFrame({ children }: { children: ReactNode }) {
   const runtime = useRuntime()?.connection?.runtime;
   const pathname = usePathname();
-  const { snapshot, health, failedRead, emergency, connected, recovering, reconnectingSessionId } = useRuntimeView();
+  const { snapshot, health, failedRead, emergency, connected, recovering, reconnectingSessionId, removedSessionId } = useRuntimeView();
+  useEffect(() => {
+    if (!removedSessionId) return;
+    const path = `/sessions/${encodeURIComponent(removedSessionId)}/`;
+    if (pathname !== `${path}live` && pathname !== `${path}result`) runtime?.clearRemovedResult(removedSessionId);
+  }, [pathname, removedSessionId, runtime]);
   const session = snapshot?.active_session;
   const active = session?.state === "Searching" || session?.state === "Paused";
   const activeSearchId = recovering ? reconnectingSessionId : active && !failedRead ? session.id : undefined;

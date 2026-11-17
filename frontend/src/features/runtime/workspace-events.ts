@@ -65,6 +65,21 @@ function withOperation(state: Snapshot, operation: Operation | null) {
   return { ...state, operations: [...pending, ...completed.slice(-64)] };
 }
 
+export function withoutRemovedOwners(snapshot: Snapshot, removed?: ReadonlySet<string>): Snapshot {
+  if (!removed?.size) return snapshot;
+  const operations = snapshot.operations.filter(({ result }) =>
+    ![result?.session?.object_id, result?.object?.id, result?.match?.object_id].some((id) => id && removed.has(id)));
+  const active = snapshot.active_session;
+  if (!active || !removed.has(active.object_id)) {
+    return operations.length === snapshot.operations.length ? snapshot : { ...snapshot, operations };
+  }
+  return { ...snapshot, operations, active_object: null, active_session: null, pending_candidate: null, failures: [],
+    lease: { ...snapshot.lease, state: "Unowned", owner_client_id: null, can_acquire: false },
+    runtime: { ...snapshot.runtime, effective_session_state: null, motion_permission: "Disarmed", persistence_pending: false },
+    readiness: { ...snapshot.readiness, can_start: { Gestures: false, Controller: false }, can_resume: false },
+    retention: { ...snapshot.retention, active_object_expires_at_ms: null, active_object_grace: false } };
+}
+
 function sameCapture(left: Match, right: Match) {
   const before = left.evidence_media;
   const after = right.evidence_media;
@@ -167,10 +182,7 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
       } }, operation);
     }
     case "object_removed":
-      if (next.active_object?.id === event.payload.object_id) return;
-      return { ...next, operations: next.operations.filter(({ result }) =>
-        result?.object?.id !== event.payload.object_id && result?.session?.object_id !== event.payload.object_id &&
-        result?.match?.object_id !== event.payload.object_id) };
+      return withoutRemovedOwners(next, new Set([event.payload.object_id]));
     case "storage_fault": {
       const components = structuredClone(next.readiness.components);
       const storage = components.find(({ component }) => component === "Storage");

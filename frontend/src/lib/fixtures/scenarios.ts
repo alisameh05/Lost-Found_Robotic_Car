@@ -1,9 +1,9 @@
 import type { BootstrapResponse, Error as ApiError, Health, Match, Object as LostObject, Session, Snapshot } from "@/generated/api-v1";
 import type { FrameMode } from "./workspace";
 import {
-  bootstrapFacts, clear, confirmed, earlierWalletMatches, earlierWalletSessions, expiredObject, expiredSession,
+  bootstrapFacts, clear, confirmed, day, earlierWalletMatches, earlierWalletSessions, expiredObject, expiredSession,
   fixtureProfile, foundObject, foundSession, foundWallet, healthFor, interruptedSession, libraryRecords, notReviewed, paused,
-  pending, readiness, recoveryFailure, rejected, sampleObject, sampleSession, searching, snapshot, walletConfirmed,
+  pending, readiness, recoveryFailure, rejected, sampleObject, sampleSession, sampleTime, searching, snapshot, walletConfirmed,
   walletConfirmedSession, warning,
 } from "./samples";
 
@@ -89,9 +89,15 @@ const dashboardTies = [
   { ...sampleSession, id: "sample-tied-search-a", object_id: libraryRecords[1].id },
   { ...sampleSession, id: "sample-tied-search-Z", object_id: foundObject.id },
 ];
+const boundaryRegistration = sampleTime - 7 * day + 60_000;
+const boundaryObject = { ...sampleObject, registered_at_ms: boundaryRegistration, expires_at_ms: boundaryRegistration + 7 * day,
+  reference_media: { ...sampleObject.reference_media, created_at_ms: boundaryRegistration } };
 
 const scenarios = {
   idle: withSnapshot(setup),
+  "retention-boundary": withSnapshot(setup, {
+    objects: [boundaryObject], sessions: [], matches: [],
+  }),
   "no-profile": initial,
   "setup-ps4": withSnapshot({ ...setup, readiness: readiness({ ...controllerReady,
     DisplayedRobotVideo: "Unavailable", Workspace: "Unavailable" }, setupProfile, null, false) }),

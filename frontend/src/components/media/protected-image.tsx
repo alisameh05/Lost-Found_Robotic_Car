@@ -1,6 +1,6 @@
 "use client";
 
-import { useEffect, useId, useRef, useState, type CSSProperties } from "react";
+import { useEffect, useId, useLayoutEffect, useRef, useState, type CSSProperties } from "react";
 import { MediaViewport } from "@/components/layout/panel";
 import { Button } from "@/components/ui/button";
 import { DataFeedback, LoadingState } from "@/components/ui/feedback";
@@ -47,7 +47,7 @@ export function ProtectedImage({
     if (available) setInspection({ image: state, scale: next });
   }
 
-  useEffect(() => {
+  useLayoutEffect(() => {
     const lifetime = new AbortController();
     let url: string | undefined;
     onDisplay?.(undefined);

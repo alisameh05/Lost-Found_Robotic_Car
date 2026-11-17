@@ -9,10 +9,10 @@ export function createScenarioHarness() {
   return {
     scenarios: scenarioIds.map((id) => ({ id, label: id.replaceAll("-", " ") })),
     mediaExamples: [
-      { id: sampleObject.reference_media.id, name: "Stale sample", label: "Not live", failure: undefined },
-      { id: confirmed.evidence_media.id, name: "Saved sample", label: "Captured evidence", failure: undefined },
-      { id: notReviewed.evidence_media.id, name: "Missing sample", label: "Captured evidence", failure: "missing" },
-      { id: foundObject.reference_media.id, name: "Corrupt sample", label: "Sample reference", failure: "corrupt" },
+      { id: sampleObject.reference_media.id, ownerId: sampleObject.id, name: "Stale sample", label: "Not live", failure: undefined },
+      { id: confirmed.evidence_media.id, ownerId: confirmed.object_id, name: "Saved sample", label: "Captured evidence", failure: undefined },
+      { id: notReviewed.evidence_media.id, ownerId: notReviewed.object_id, name: "Missing sample", label: "Captured evidence", failure: "missing" },
+      { id: foundObject.reference_media.id, ownerId: foundObject.id, name: "Corrupt sample", label: "Sample reference", failure: "corrupt" },
     ] as const,
     open(id: string) {
       const scenario = scenarioIds.find((name) => name === id) ?? "idle";

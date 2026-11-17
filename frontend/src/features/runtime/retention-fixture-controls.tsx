@@ -14,6 +14,8 @@ export function RetentionFixtureControls() {
     <div className="control-row">
       <Button onClick={() => fixture.advanceTime(60_000)}>Advance fixture clock 1 minute</Button>
       <Button onClick={() => fixture.advanceTime(604_800_000)}>Advance fixture clock 7 days</Button>
+      <Button onClick={fixture.retention.holdNextEvidenceRead}>Hold next captured evidence read</Button>
+      <Button onClick={fixture.retention.releaseEvidenceRead}>Deliver held evidence read</Button>
       <Button onClick={() => fixture.retention.save("Hold")}>Hold next retention save</Button>
       <Button disabled={!hold} onClick={() => fixture.retention.save("Commit")}>Deliver retention save</Button>
       <Button disabled={!hold} onClick={() => fixture.retention.save("Lose response")}>Lose retention save response</Button>

@@ -4,7 +4,7 @@ import { pendingReview } from "@/lib/match-evidence";
 import type { ApplicationTransport, HttpRequest, ProtectedPath, ProtectedRequest, ReadEndpoint, ReadParams, ReadResult } from "@/lib/transport";
 import { openWorkspace, reconnectDelay, type WorkspaceView } from "./workspace";
 import { openSearchActions, searchActionKey, type SearchFeedback, type SearchIntent, unresolved } from "./search-actions";
-import { validSnapshot } from "./workspace-events";
+import { validSnapshot, withoutRemovedOwners } from "./workspace-events";
 
 type EmergencyFeedback =
   | { kind: "sending" }
@@ -21,6 +21,7 @@ type RuntimeView = {
   health?: Health;
   emergency?: EmergencyFeedback;
   removedOwners?: ReadonlySet<string>;
+  removedSessionId?: string;
   profile?: FrontendProfile;
   workspace?: WorkspaceView;
   searchActions?: Readonly<Record<string, SearchFeedback>>;
@@ -39,6 +40,9 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
   let clock: { server: number; received: number } | undefined;
   let readRequest: AbortController | undefined;
   let protectedScope = new AbortController();
+  let recordReads = new AbortController();
+  const mediaReads = new Set<{ ownerId: string; controller: AbortController }>();
+  let lastActiveSearch: { sessionId: string; objectId: string; sequence: number; grace: boolean } | undefined;
   let recoveryTimer: ReturnType<typeof setTimeout> | undefined;
   let recoveryDelay = 250;
   let uncertainRequest: EmergencyStopRequest | undefined;
@@ -46,6 +50,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
   let surface: HTMLElement | undefined;
   let handoffTimer: ReturnType<typeof setTimeout> | undefined;
   const searchActions = openSearchActions({ transport, signal: lifetime.signal,
+    removed: (objectId, sessionId) => removeRecords([objectId], sessionId),
     notify: (feedback) => update({ searchActions: feedback }), refresh: (code) => {
       if (code === "REVISION_CONFLICT") workspace?.resynchronize();
       else void refresh();
@@ -123,11 +128,13 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
           resetProtectedScope();
           searchActions.changeAuthority();
           uncertainRequest = undefined;
+          lastActiveSearch = undefined;
         }
         context = bootstrap.data;
         clock = { server: bootstrap.data.server_time_ms, received: bootstrapStarted };
         update({ connected: true, profile: sameProfile ? view.profile : profile,
-          ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined, removedOwners: undefined,
+          ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined,
+            removedOwners: undefined, removedSessionId: undefined,
             emergency: undefined, authority: (view.authority ?? 0) + 1 }),
           ...(authorityChanged && { recovering: true,
             reconnectingSessionId: view.snapshot?.active_session?.id ?? view.reconnectingSessionId }) });
@@ -140,14 +147,16 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       ]);
       if (signal.aborted) return;
       const ordered = workspace !== undefined;
-      const next = status.kind === "ok" && validSnapshot(status.data, request.context.backend_boot_id) ? status.data : undefined;
+      const next = status.kind === "ok" && validSnapshot(status.data, request.context.backend_boot_id)
+        ? withoutRemovedOwners(status.data, view.removedOwners) : undefined;
       if (next && !ordered) {
+        observeActiveSearch(next);
         searchActions.synchronize(next, request.context);
         reconcileEmergency(next);
       }
       update({
-        snapshot: ordered ? view.snapshot : next ?? view.snapshot,
-        recordSnapshot: ordered ? view.recordSnapshot : next ?? view.recordSnapshot,
+        snapshot: ordered ? view.snapshot : next ? withoutRemovedOwners(next, view.removedOwners) : view.snapshot,
+        recordSnapshot: ordered ? view.recordSnapshot : next ? withoutRemovedOwners(next, view.removedOwners) : view.recordSnapshot,
         failedRead: next || view.workspace?.eventsLive ? undefined : status.kind === "ok" ? unavailable() : status,
         health: health.kind === "ok" ? health.data : undefined,
         loading: false,
@@ -179,9 +188,53 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     protectedScope = new AbortController();
   }
 
-  async function protectedRead<T>(signal: AbortSignal, load: (request: ProtectedRequest) => Promise<ReadResult<T>>) {
+  function observeActiveSearch(snapshot: Snapshot) {
+    const session = snapshot.active_session;
+    if (session) {
+      lastActiveSearch = { sessionId: session.id, objectId: session.object_id,
+        sequence: snapshot.event_seq, grace: snapshot.retention.active_object_grace };
+      return;
+    }
+    if (!lastActiveSearch) return;
+    const { sessionId, sequence, grace } = lastActiveSearch;
+    const saved = snapshot.operations.some(({ result }) => result?.session?.id === sessionId && result.session.state === "Ended");
+    // A terminal checkpoint may arrive immediately before removal at the cutoff.
+    if (saved || (!grace && snapshot.event_seq > sequence + 1)) lastActiveSearch = undefined;
+  }
+
+  function removeRecords(owners: readonly string[], sessionId?: string) {
+    const previous = view.removedOwners;
+    const active = view.snapshot?.active_session;
+    const search = active ? { objectId: active.object_id, sessionId: active.id } : lastActiveSearch;
+    const saved = !active && search && (["confirm", "stop"] as const).some((kind) => {
+      const action = view.searchActions?.[searchActionKey(kind, search.sessionId)];
+      return action?.stage === "committed" && action.session?.id === search.sessionId;
+    });
+    const removedSessionId = sessionId ?? (!saved && search && owners.includes(search.objectId) ? search.sessionId : undefined);
+    if (lastActiveSearch && owners.includes(lastActiveSearch.objectId)) lastActiveSearch = undefined;
+    if (owners.every((id) => previous?.has(id)) && (!removedSessionId || removedSessionId === view.removedSessionId)) return;
+    recordReads.abort();
+    recordReads = new AbortController();
+    for (const { ownerId, controller } of mediaReads) if (owners.includes(ownerId)) controller.abort();
+    const removedOwners = new Set([...previous ?? [], ...owners]);
+    const snapshot = view.snapshot;
+    const recordSnapshot = view.recordSnapshot;
+    const emergency = view.emergency;
+    // Publish the filtered snapshot and action feedback together.
+    view = { ...view, removedOwners,
+      ...(removedSessionId && { removedSessionId }),
+      ...(removedSessionId === view.reconnectingSessionId && { reconnectingSessionId: undefined }),
+      ...(emergency?.kind === "result" && emergency.response.session_id === removedSessionId && { emergency: undefined }),
+      snapshot: snapshot && withoutRemovedOwners(snapshot, removedOwners),
+      recordSnapshot: recordSnapshot && withoutRemovedOwners(recordSnapshot, removedOwners),
+    };
+    searchActions.purge(owners);
+  }
+
+  async function protectedRead<T>(signal: AbortSignal, load: (request: ProtectedRequest) => Promise<ReadResult<T>>,
+    scope = recordReads.signal) {
     if (!context) return { kind: "unavailable" } as const;
-    const scoped = AbortSignal.any([signal, protectedScope.signal, lifetime.signal]);
+    const scoped = AbortSignal.any([signal, scope, protectedScope.signal, lifetime.signal]);
     const result = await load({ context, signal: scoped });
     scoped.throwIfAborted();
     return result;
@@ -191,6 +244,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     if (!context || lifetime.signal.aborted || view.emergency?.kind === "sending") return;
     const request = { context, signal: AbortSignal.any([protectedScope.signal, lifetime.signal]) };
     const generation = view.snapshot?.runtime.control_generation;
+    const ownerId = view.snapshot?.active_session?.object_id;
     const body = uncertainRequest ?? { request_id: crypto.randomUUID() };
     uncertainRequest = body;
     update({ emergency: { kind: "sending" } });
@@ -200,6 +254,11 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       if (result.kind === "ok" && conforms("EmergencyStopResponse", result.data) && result.data.request_id === body.request_id &&
           result.data.backend_boot_id === request.context.backend_boot_id) {
         uncertainRequest = undefined;
+        if ((ownerId && view.removedOwners?.has(ownerId)) ||
+            (result.data.session_id !== null && result.data.session_id === view.removedSessionId)) {
+          update({ emergency: undefined });
+          return;
+        }
         const unchanged = view.snapshot?.runtime.control_generation === generation;
         if (unchanged) workspace?.clearControl("Control was released by Emergency Stop.");
         update({ emergency: { kind: "result", status: result.status, response: result.data },
@@ -220,11 +279,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
 
   let refreshQueued = false;
   const unsubscribeRetention = transport.subscribeRetention?.((owners) => {
-    if (owners?.length) {
-      // Immediately suppress data from protected reads that were already in flight.
-      update({ removedOwners: new Set([...view.removedOwners ?? [], ...owners]) });
-      searchActions.purge(owners);
-    }
+    if (owners?.length) removeRecords(owners);
     if (refreshQueued) return;
     refreshQueued = true;
     queueMicrotask(() => { refreshQueued = false; void refresh({ readBootstrap: true }); });
@@ -239,6 +294,9 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     refresh,
     emergency,
     serverTime,
+    clearRemovedResult(sessionId: string) {
+      if (view.removedSessionId === sessionId) update({ removedSessionId: undefined });
+    },
     mountWorkspace(robot: HTMLElement, webcam?: HTMLElement, sessionId?: string) {
       if (!context || !view.profile || lifetime.signal.aborted) return () => {};
       clearTimeout(handoffTimer);
@@ -248,12 +306,13 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         transport, context, profile: view.profile, serverTime,
         update: (observation) => update({ workspace: observation }),
         snapshot: (next, removedOwner) => {
+          if (removedOwner) removeRecords([removedOwner]);
+          next = withoutRemovedOwners(next, view.removedOwners);
+          observeActiveSearch(next);
           const refreshRecords = removedOwner || view.recovering || recordsChanged(view.snapshot, next);
           recoveryComplete();
           update({ snapshot: next, failedRead: undefined, recovering: false, reconnectingSessionId: undefined,
-            ...(refreshRecords && { recordSnapshot: next }),
-            ...(removedOwner && { removedOwners: new Set([...view.removedOwners ?? [], removedOwner]) }) });
-          if (removedOwner) searchActions.purge([removedOwner]);
+            ...(refreshRecords && { recordSnapshot: next }) });
           if (context) searchActions.synchronize(next, context);
           reconcileEmergency(next);
         },
@@ -343,8 +402,16 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       // GET routes have no body. Keep the protected context at the runtime boundary.
       return protectedRead(signal, (request) => transport.request(route, { ...params, ...request } as HttpRequest<Route>));
     },
-    async media(id: string, signal: AbortSignal) {
-      return protectedRead(signal, (request) => transport.media(id, request));
+    async media(id: string, signal: AbortSignal, ownerId: string) {
+      const load = (request: ProtectedRequest) => transport.media(id, request);
+      if (view.removedOwners?.has(ownerId)) return { kind: "unavailable" } as const;
+      const read = { ownerId, controller: new AbortController() };
+      mediaReads.add(read);
+      try {
+        return await protectedRead(signal, load, read.controller.signal);
+      } finally {
+        mediaReads.delete(read);
+      }
     },
     dispose() {
       clearTimeout(handoffTimer);
