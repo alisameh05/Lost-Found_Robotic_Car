@@ -10,6 +10,47 @@ async function setup(page: Page) {
   await action(page, "Acquire control").click();
 }
 
+test("maps finger counts and stops changing or invalid gestures without bypassing neutral", async ({ page }) => {
+  await setup(page);
+  await action(page, "Start Search").click();
+  await expect(page).toHaveURL(/\/live$/);
+  await page.getByText("Workspace fixture controls", { exact: true }).click();
+  const feedback = page.getByRole("region", { name: "Gesture feedback" });
+  for (const [direction, count] of [["forward", 1], ["backward", 2], ["left", 3], ["right", 4]] as const) {
+    await action(page, "Release input").click();
+    await expect(feedback).toContainText("0 fingers · neutral / stop");
+    await action(page, `Hold ${direction}`).click();
+    await expect(feedback).toContainText(`Held ${direction} · ${count} ${count === 1 ? "finger" : "fingers"}`);
+    await expect(feedback).toContainText("Motion permission · Armed");
+  }
+  // A different count immediately stops the old direction, without silently rearming.
+  await action(page, "Hold backward").click();
+  await expect(feedback).toContainText("Motion permission · Disarmed");
+  for (const observation of ["Observe five fingers", "Observe no hand", "Observe multiple hands", "Observe changing count", "Ambiguous gesture"]) {
+    await action(page, "Release input").click();
+    await action(page, "Hold forward").click();
+    await expect(feedback).toContainText("Motion permission · Armed");
+    await action(page, observation).click();
+    await expect(feedback).toContainText("Motion permission · Disarmed");
+    await expect(feedback).toContainText("Ambiguous or unsupported gesture · stopped");
+    await action(page, "Hold forward").click();
+    await expect(feedback).toContainText("Motion permission · Disarmed");
+  }
+  await action(page, "Pause").click();
+  await action(page, "Resume").click();
+  await action(page, "Observe five fingers").click();
+  await action(page, "Hold forward").click();
+  await expect(feedback).toContainText("Motion permission · Disarmed");
+  await action(page, "Release input").click();
+  await action(page, "Hold forward").click();
+  await expect(feedback).toContainText("Motion permission · Armed");
+  await action(page, "Control Help").click();
+  const help = page.getByRole("region", { name: "Gesture directions and stop" });
+  await expect(help).toContainText("1 finger for forward, 2 fingers for backward, 3 fingers for left, or 4 fingers for right");
+  await expect(help).toContainText("0 fingers (a closed fist) for neutral / stop");
+  await expect(action(page, "Emergency Stop")).toBeEnabled();
+});
+
 test("starts a single search and saves the stopped session without changing Lost", async ({ page }) => {
   await setup(page);
   await expect(action(page, "Start Search")).toBeEnabled();

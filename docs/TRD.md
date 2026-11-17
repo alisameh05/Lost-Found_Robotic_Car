@@ -1,9 +1,9 @@
 ---
 title: "Lost and Found — Technical Requirements Document"
-version: "1.3"
+version: "1.4"
 status: final
 created: 2026-11-05
-updated: 2026-11-13
+updated: 2026-11-17
 audience: Implementation team
 architecture: ARCHITECTURE.md
 requirements: PRD.md
@@ -18,12 +18,12 @@ This TRD defines the software implementation contract for the Windows laptop app
 
 Read sources in this order:
 
-1. [PRD v1.3](PRD.md): scope, FR-1–FR-18, NFR-1–NFR-6 and success metrics, including the authorized 2026-11-13 acceptance wording amendment in section 9.
-2. [Architecture v1.3](ARCHITECTURE.md): AD-1–AD-14 adopted by Alisa on 2026-11-05 and AD-15 adopted on 2026-11-06, with dated amendments to AD-3/AD-5/AD-14 on 2026-11-13. This is the technical source of truth.
+1. [PRD v1.4](PRD.md): scope, FR-1–FR-18, NFR-1–NFR-6 and success metrics, including the dated amendments in section 9.
+2. [Architecture v1.5](ARCHITECTURE.md): adopted AD-1–AD-15, including the 2026-11-13 scope changes and 2026-11-17 reuse/finger-count amendment. This is the technical source of truth.
 3. This TRD: detailed contracts derived under Alisa's explicit authorization.
 4. Historical UX inputs: `EXPERIENCE.md` and `DESIGN.md` were referenced under `_bmad-output/planning-artifacts/ux-designs/ux-Robotics-2026-11-05/`. They are absent from the tracked baseline. The adopted flow, input and accessibility rules are retained in sections 4–6 and 12; this contract does not depend on retrieving those missing artifacts. Branding is still deferred.
 
-The earlier design session resolved UX G1–G3 through AD-6, input/image rules in G4 through AD-10/AD-11, and G5 through AD-9. PRD v1.1 and AD-15 record the PS4-only and advisory proximity-warning decisions. G4 thresholds/device qualification, G6 branding/accessibility qualification and G7 equipment/performance remain explicit gates. Historical UX proposals apply only where explicitly adopted here; PRD v1.3 and architecture v1.3 govern this software contract. The addendum's former stack proposals are adopted only to the extent explicitly recorded in AD-2/AD-8.
+The earlier design session resolved UX G1–G3 through AD-6, input/image rules in G4 through AD-10/AD-11, and G5 through AD-9. PRD v1.1 and AD-15 record the PS4-only and advisory proximity-warning decisions. G4 thresholds/device qualification, G6 branding/accessibility qualification and G7 equipment/performance remain explicit gates. Historical UX proposals apply only where explicitly adopted here; current PRD v1.4 and architecture v1.5 govern this software contract. The addendum's former stack proposals are adopted only to the extent explicitly recorded in AD-2/AD-8.
 
 Alisa authorized documentation completion with the section 13 gates open and the 2026-11-13 cleanup plan implemented here. Software and simulator development can proceed independently of device availability. Device-connected software checks T2 interface configuration/compatibility and the applicable runtime, firmware and protocol gates. Assessed acceptance requires the software and real-device evidence specified in PRD section 7; simulator results cannot establish wheel stopping, battery endurance or room-to-room coverage. A failure to meet a target requires evidence and an explicit requirement/architecture revision, not a smaller demonstration presented as a pass.
 
@@ -40,13 +40,53 @@ No autonomous navigation, obstacle avoidance/steering, servo functionality, mapp
 | Application backend | Python, FastAPI, Uvicorn | One authoritative service and one Uvicorn worker; no reload in the release. Exact compatible Python/framework versions at T1. |
 | Persistence | SQLite through Python sqlite3 | One serialized write owner, explicit transactions, foreign keys enabled on every connection; record actual engine version at T1. |
 | Video and images | OpenCV | Webcam capture, image processing and frame decoding. Preserve source freshness metadata outside the decoder. |
-| Gestures | MediaPipe hand landmarks | Derive the approved pointing directions from landmarks; do not assume the canned gesture labels implement arbitrary pointing directions. |
+| Gestures | MediaPipe hand landmarks | Count fingers on one valid hand and validate stable intent under section 6.1; no custom gesture model training. |
 | Candidate matching | Ultralytics YOLOE visual prompting, PyTorch | Prompt with the selected reference region; use the laptop's NVIDIA GPU after compatibility and performance checks. Exact checkpoint/settings at T1/T5. |
 | Controller | Pygame/SDL | Backend reads the selected PS4 DualShock 4 and handles hotplug/disconnect. Qualify the actual device mapping. |
 | Movement connection | pySerial; HC-05 Bluetooth serial | Bounded command/response I/O to Arduino; no browser Bluetooth requirement. |
 | Firmware | Arduino Uno firmware; ESP32-CAM firmware | Command-expiry stopping; camera acquisition/freshness metadata and local video. Toolchain/board-core versions at T1/T6; selected identity and firmware build target at T2. |
 
 No exact package/runtime combination has been approved or installed by this document. AD-8 expressly defers that lock until early laptop benchmarking. T1 records exact versions, dependency locks, GPU/runtime compatibility, model files and checksums. All required models, fonts, scripts and frontend assets are installed locally. Neither development nor release may add a mandatory hosted inference service.
+
+### 2.1 Reuse and license assessment
+
+The 2026-11-17 source review inspected the two gesture examples and Espressif streaming source and checked the official YOLOE model/API documentation. None was executed against this application or qualified on the robot. Use one Ultralytics runtime; the [THU-MIG research implementation](https://github.com/THU-MIG/yoloe) is background reference, not a second inference stack. Record exact upstream revisions, package/asset licenses, hashes, attribution and redistribution requirements at T1 before incorporation.
+
+| Component / requirement | Source and reuse method | Integration and verification | License / current status |
+| --- | --- | --- | --- |
+| Hand landmarks; FR-4/FR-5 | [MediaPipe Hand Landmarker](https://ai.google.dev/edge/mediapipe/solutions/vision/hand_landmarker/python); pretrained local library/model | Backend webcam adapter, handedness and finger-count rules; test one/multiple/no hands, mirroring, occlusion and loss | Verify package and model notices at T1; integration proposed, no application webcam qualification |
+| Finger classification; FR-4/FR-5 | [Gesture-RoboCar input_fingers.py](https://github.com/samarthmahesh/Gesture-RoboCar/blob/486a2188a804f4cc22fec8096e52786e785ba8e3/input_fingers.py); reference only | Inspected legacy `mp.solutions.hands` loop sends UDP and sends nothing on no-hand frames. Independently implement counting, consistency and explicit invalid/loss stop through the shared manager | No explicit license in inspected repository tree / GitHub license metadata; no copying without permission. Compatibility and runtime untested |
+| Serial ideas; FR-7/FR-17 | [hand-gesture-car](https://github.com/omarelsawaf/hand-gesture-car), `Car's code.py`; reference only | Inspected code uses two-hand relative positions and direct one-byte writes. Retain pySerial but use our command/acknowledgment, challenge, expiry and recovery protocol, not its gestures or hardcoded COM/baud | No explicit license in inspected tree / GitHub license metadata; no copying without permission. Not a qualified protocol implementation |
+| Visual prompting; FR-9–FR-12 | [Ultralytics YOLOE](https://docs.ultralytics.com/models/yoloe/); pretrained Python API | Saved reference + ROI prompt, separate target frames, session prompt reuse, source-coordinate boxes and continuity; benchmark Nano/Small locally | Inspected upstream [LICENSE](https://github.com/ultralytics/ultralytics/blob/main/LICENSE) is AGPL-3.0; record applicable package/model terms and notices before distribution. API/model documented; local execution pending |
+| Robot video; FR-3/FR-7 | Espressif [CameraWebServer.ino](https://github.com/espressif/arduino-esp32/blob/master/libraries/ESP32/examples/Camera/CameraWebServer/CameraWebServer.ino) and [app_httpd.cpp](https://github.com/espressif/arduino-esp32/blob/master/libraries/ESP32/examples/Camera/CameraWebServer/app_httpd.cpp); adapt streaming foundation | Preserve capture timestamps; add boot/stream epoch, sequence, clock-age exchange and bounded fan-out under 6.2. Test disconnected internet, stale frames and reconnect | Inspected `app_httpd.cpp` has Apache-2.0 notice; preserve notices and inspect every incorporated file/core dependency. Hardware test pending |
+| PS4 input; FR-4–FR-7 | [Pygame joystick/SDL](https://www.pygame.org/docs/ref/joystick.html); library integration | Selected DualShock 4 identity, held D-pad, Circle, disconnect and inactive-mode isolation; actual profile qualification | Record package/SDL license notices at T1; existing fixture behavior only |
+| Reference-region UI; FR-1 | Existing Next.js registration/ROI editor; retain completed work | The [Hugging Face demo](https://huggingface.co/spaces/hamolato/YOLOE_visual_prompt_demo) is optional reference only. Its source/license were not inspected; do not replace the completed editor | No demo code imported; existing frontend retained |
+| Human review/storage and stopping; FR-6/FR-10–FR-17 | Application-specific coordinator, SQLite/media journal and Uno firmware | Implement human-only atomic confirmation, recovery, watchdog and failure tests against the approved contracts | Newly developed integration; fixture verification cannot qualify production software or wheel stopping |
+
+OpenCV decoding and pySerial remain library integrations, with their exact dependency notices recorded at T1. There is no incremental model-training saving to claim against the original roadmap, which already selected YOLOE and MediaPipe. For planning only, adapting a compatible streaming foundation may save roughly 2–4 hours versus writing basic MJPEG service code; license-blocked gesture/serial examples may save 0–1 hour of exploration each. These estimates exclude our protocols, safety, qualification and compatibility repairs; do not subtract them from the schedule before experiments.
+
+### 2.2 Reported laptop and environment verification
+
+The approved input supplied this baseline; it is not a fresh machine inventory or benchmark. Recheck changeable details at T1/T3.
+
+| Item | Supplied specification / status |
+| --- | --- |
+| CPU / RAM | Intel Core i7-13620H; 16 GB DDR5 |
+| GPUs | NVIDIA RTX 4050 Laptop, 6 GB dedicated VRAM; Intel UHD integrated graphics. Shared system memory is not extra NVIDIA VRAM |
+| OS | Windows 11 Pro 26H2, build 26300.9974; verify at setup |
+| NVIDIA driver / reported CUDA | 560.94 / `nvidia-smi` CUDA 12.6; verify compatibility with the selected PyTorch build, not just this reported capability |
+| Existing Python / storage | Python 3.13.7; NVMe SSD; free storage not measured |
+| Memory pressure | Supplied screenshot reported approximately 11.1 of 13 GB usable RAM occupied before full workload. Historical observation only; measure current idle and combined-workload RAM/VRAM |
+
+Keep the current Python installation. Evaluate a separate Python 3.11 environment as a conservative candidate; select exact wheels/versions only after testing. Follow [official PyTorch installation guidance](https://pytorch.org/get-started/locally/) for a driver-compatible build and verify both CUDA availability and an actual YOLOE visual-prompt GPU inference. A standalone CUDA Toolkit is not automatically required for prebuilt inference. Pin the tested Ultralytics, torch/torchvision, MediaPipe, OpenCV, FastAPI, Pygame and pySerial combination; inventory all model/task assets and disable runtime downloads. Do not recommend a RAM upgrade or claim FPS without simultaneous-workload measurements.
+
+### 2.3 Visual-prompt integration experiment
+
+In Phase 04, test `yoloe-26n-seg.pt` and `yoloe-26s-seg.pt`, documented as visual-prompt models by [Ultralytics](https://docs.ultralytics.com/models/yoloe/). Use compatible `-seg.pt` weights, not prompt-free `-seg-pf.pt`. Do not substitute ordinary category-only YOLO. Load from explicit local paths, configure with a saved reference image and its ROI, and infer on a different recorded target frame. Measure cold initialization, warmed latency, RAM/VRAM and qualitative matches/distractors before selecting the checkpoint/settings at T5.
+
+Retain a reusable prompt context per immutable session reference/checkpoint where supported by the pinned API; verify that repeated target inference does not unnecessarily re-encode the reference. Invalidate context on session/reference/model change or worker restart. Keep `.pt` prompting as the baseline; static exports can bake in prompts and are not a drop-in replacement for arbitrary new registrations. Record any needed supplementary local appearance matching as a measured proposal, never as guaranteed physical identity or a replacement for human confirmation.
+
+Keep the registration ROI in normalized-orientation reference pixels. Convert its `(x,y,width,height)` to the exact source-pixel box format required by the pinned YOLOE API. Record resize scale/letterbox padding for model inputs; map candidate boxes back to original robot-frame pixels exactly once, clamp to frame bounds and reject empty/nonfinite boxes. Backend evidence retains that source box and the exact identified frame; the browser only applies its display transform. Use non-square images, edge boxes, orientation and letterboxing in coordinate tests.
 
 ## 3. System architecture and responsibilities
 
@@ -151,13 +191,18 @@ Rejected candidate suppression belongs to the session, not permanent identity re
 
 | Mode/input | Action |
 | --- | --- |
-| One index finger pointing up/down/left/right in mirrored displayed webcam coordinates | Forward/backward/left/right while held |
-| Closed fist, no hand, multiple hands, ambiguous/invalid pointing | Ordinary motion stop; no stale direction substitution |
+| One valid hand with 0 extended fingers | Neutral / ordinary stop; permits the neutral step before a fresh hold |
+| One valid hand with 1 / 2 / 3 / 4 extended fingers | Forward / backward / left / right after stable validation, while held |
+| Five fingers, no hand, multiple hands, uncertain or changing count, stale/invalid recognition | Ordinary motion stop; no stale direction substitution and no validated-neutral claim |
 | PS4 DualShock 4 held D-pad up/down/left/right | Forward/backward/left/right |
 | D-pad release or conflicting directions | Ordinary motion stop |
 | PS4 DualShock 4 Circle; UI Emergency stop in either mode | Emergency stop and recovery latch |
 
 The backend reads the laptop webcam/controller directly. It reports input samples with connection generation and monotonic age. No webcam image needs to be uploaded from the browser. Inactive-mode input never commands motion. Poll/pump controller events independently of browser focus, then apply the focused-workspace gate; do not rely on default SDL foreground behavior to provide safe samples. Verify the PS4 DualShock 4 profile rather than hardcoding a guessed joystick index. Thresholds, ambiguity boundaries and firmware speed/PWM choices remain T4/T6 configuration gates.
+
+Count the thumb as well as the four fingers, validating handedness and orientation on the mirrored preview. The count-to-direction mapping itself is independent of mirroring. Require one confidently tracked hand; counting must still detect multiple hands rather than silently accepting the first. Validate a stable new directional hold using T4's measured confidence/consistency settings; any changed/invalid/lost observation stops renewal immediately, without waiting for the movement stabilization window. Only a valid zero count is neutral after Start/Resume/recovery. Five fingers or tracking loss stop but cannot satisfy that neutral step. UI Emergency Stop remains distinct from an ordinary zero-count stop.
+
+Gesture/PS4 outputs are abstract FORWARD/BACKWARD/LEFT/RIGHT/STOP intents plus validity, freshness and generation, consumed by the shared safety manager. They do not call serial directly or add browser direction APIs. The frontend fixture harness can inject counts and explicitly unsettled samples; it does not implement MediaPipe or qualify real stabilization thresholds.
 
 ### 6.2 Live video
 
@@ -398,7 +443,7 @@ These are intentionally open under AD-14, not unspecified implementation default
 | T1 Runtime and dependency lock | Exact supported Windows/browser/Node/Python/packages/SQLite/GPU runtime combination; selected firmware toolchains/board cores/libraries, coordinated with T6; local asset/model inventory, hashes and license notices; reproducible environment and durable SQLite settings. Do not choose versions solely because a machine currently has them installed. | Software team; early laptop benchmark before functional implementation is baselined/tested; device toolchain lock before corresponding firmware acceptance |
 | T2 Device interface configuration and compatibility | Section 6.5 configuration: selected endpoints/device identities, firmware build targets/hashes, compatible command/video/telemetry versions and bounds; message validation and actionable errors. Recheck affected evidence after configuration changes. | Software/integration team; before accepting the affected device connection; fixtures proceed independently |
 | T3 Runtime environment and connected-room coverage | Verify reported LOQ 15IRH8 / Windows 11 Pro / RTX 4050 / 16 GB, selected webcam/PS4 profiles, serial/video endpoints and protected network. Measure command/video coverage with the operator at a fixed desk through two adjacent rooms. | Team; early runtime/integration checks before route acceptance |
-| T4 Input and UI operating setup | Gesture orientation/ambiguity/neutral thresholds; PS4 DualShock 4 mapping; release/reapply behavior; HC-SR04 warning/clear thresholds; camera/scaling/minimum usable operational layout; mode-independent stop accessibility. | Input/frontend team; before driving/function tests |
+| T4 Input and UI operating setup | Finger counting including thumb/handedness, one/multiple-hand detection, confidence/consistency and neutral thresholds; stop on changing/lost count; PS4 DualShock 4 mapping; release/reapply behavior; HC-SR04 warning/clear thresholds; camera/scaling/minimum usable operational layout; mode-independent stop accessibility. | Input/frontend team; before driving/function tests |
 | T5 Matching and continuity | YOLOE visual-prompt checkpoint, compatible assets, inference/candidate thresholds, frame policy, tracking association/exit criteria and continuity-loss recovery; freeze five objects/references/lighting/placements with supervisor. | Vision team; early benchmark and before SM-1/SM-C1 |
 | T6 Firmware, protocol and timing | Serial encoding/rate/length/sequence/challenge/lease and acknowledgment; camera epoch/sequence/age protocol and clock uncertainty; browser display acknowledgments; firmware speed/logical output configuration and HC-SR04 telemetry validity/freshness. Freeze numbers/versions; verify expiry/revocation/failure timings and application stability. Retain component budgets for comparison with external SM-2 wheel-stop measurement; device SM-4 latency also requires measurement. | Integration/firmware team; before dependent device behavior acceptance and assessed qualification |
 | T7 Visual approval and assessment | Alisa's branding/density/icon/type choices, actual contrast/keyboard/reflow/scaling evidence, exact assessment date and final report/demo plan. | Alisa/team with supervisor; before visual sign-off and assessed demonstration |
@@ -435,6 +480,8 @@ There is no automatic search-duration limit. No record from a Found object can b
 
 ### 14.2 Official-source checks
 
+The 2026-11-17 reuse review in section 2.1 adds source/license inspection and the finger-count amendment; it supplies no runtime benchmark. Existing frontend package pins are in `frontend/package.json` and its lockfile. The Phase 04 Python/GPU lock and setup commands remain pending tested compatibility.
+
 Technology-family checks were recorded on 2026-11-05; these sources were retained for software/protocol context, not revalidated as part of the 2026-11-13 documentation cleanup. They do not select exact versions or establish runtime/device performance; T1 records the final compatibility lock.
 
 | Technology / mechanism | Primary reference |
@@ -449,3 +496,17 @@ Technology-family checks were recorded on 2026-11-05; these sources were retaine
 | OpenCV capture interface | [Official videoio source](https://github.com/opencv/opencv/blob/4.x/modules/videoio/include/opencv2/videoio.hpp) |
 | Camera local stream and source timestamps | [Espressif CameraWebServer source](https://github.com/espressif/arduino-esp32/blob/master/libraries/ESP32/examples/Camera/CameraWebServer/app_httpd.cpp) |
 | Local browser origin/Host controls | [Origin header](https://developer.mozilla.org/en-US/docs/Web/HTTP/Reference/Headers/Origin), [FastAPI middleware](https://fastapi.tiangolo.com/advanced/middleware/) |
+
+### 14.3 Integration verification matrix
+
+These are required future tests unless explicitly identified as fixture checks. Record outcomes, versions/configuration and evidence kind rather than marking a proposed scenario passed.
+
+| Requirements | Scenario / evidence | Phase |
+| --- | --- | --- |
+| FR-4/FR-5/FR-17; AD-10 | Fixture count mapping 0–5, invalid/lost/multiple hands, unsettled transitions, selected-mode isolation, neutral then fresh hold; later repeat with real landmark sequences and selected webcam | Amendment fixtures; 06 real adapter |
+| FR-1/FR-9/FR-10; AD-11 | Reference ROI transforms, separate target frames, original-frame boxes, prompt reuse and immutable frame/box association | 04 feasibility; 06 integration |
+| FR-10–FR-13/FR-15 | Pause before candidate review; human-only atomic Found; reject remains Paused; suppression across continuity loss; restart/save-response-loss and retention deletion | 04–06 |
+| FR-6/FR-7/FR-17; SM-2 | Block/kill inference and storage, lose input/video/command paths, replay queued commands; safety revokes independently and firmware expires. External wheel timing remains separate | 05 simulated; 07 devices; 08 qualification |
+| NFR-1/NFR-3; SM-1/SM-C1/SM-3/SM-4 | Separate capture/display/inference/gesture FPS, warmed latency and candidate-alert timing; CPU/RAM/GPU/dedicated VRAM under simultaneous load. Run approved recognition trials, twenty-minute stability and optional thirty-minute stress with internet disconnected | 04 early feasibility; 08 acceptance |
+
+Frame rates and the prompt's proposed five-second alert/200 ms emergency figures are diagnostic engineering suggestions, not replacements for PRD acceptance. Preserve SM-1's three-second trial criterion, SM-4's 0.5-second camera-to-display target and SM-2's complete external 0.5-second stop budget. Report failed or unperformed tests explicitly.

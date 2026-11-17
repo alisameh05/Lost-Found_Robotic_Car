@@ -6,8 +6,8 @@ import styles from "./control-guide.module.css";
 const instructions = {
   Gestures: {
     title: "Gesture directions and stop",
-    direction: "In the mirrored webcam view, hold one extended index finger pointing up for forward, down for backward, left for left, or right for right.",
-    stop: "Release the pointing gesture to stop. A closed fist, no hand, multiple hands, or ambiguous or invalid pointing stops ordinary movement.",
+    direction: "Hold a stable finger count on one hand: 1 finger for forward, 2 fingers for backward, 3 fingers for left, or 4 fingers for right. Count the thumb too. The mirrored webcam view does not reverse this mapping.",
+    stop: "Show 0 fingers (a closed fist) for neutral / stop. Five fingers, no hand, multiple hands, or uncertain recognition stop ordinary movement. Changing the gesture stops the previous movement while the new input is validated. After Start or Resume, show 0 fingers, then apply a fresh directional hold; an unsupported or lost gesture cannot satisfy neutral. Emergency Stop remains a separate action.",
   },
   Controller: {
     title: "PS4 controller",

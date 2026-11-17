@@ -14,6 +14,7 @@ import { objectHref, RecordAbsent, RecordReadFailure, RecordTime, ReferenceImage
 import { recordAbsence, searchActionKey, unresolved, useRefreshRuntime, useRuntime, useRuntimeRead, useRuntimeView } from "@/features/runtime";
 import type { Snapshot } from "@/generated/api-v1";
 import { pendingReview } from "@/lib/match-evidence";
+import { gestureFeedback } from "@/lib/gesture-input";
 import { ActionFeedback } from "./action-feedback";
 import { MatchReview } from "./match-review";
 import { ProximityAdvisory, RecoveryPanel } from "./recovery-panel";
@@ -149,7 +150,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const gestures = mode === "Gestures";
   const sample = owner && ready ? connection?.fixture?.search.readInput() : undefined;
   const permission = connected ? effective.motion_permission : "Unknown";
-  const input = sample === "invalid" ? gestures ? "Ambiguous gesture" : "Conflicting D-pad input"
+  const input = gestures ? gestureFeedback(sample) : sample === "invalid" ? "Conflicting D-pad input"
     : sample && sample !== "neutral" ? `Held ${sample}` : "No direction held";
   const searching = state === "Searching";
   const matching = searching && connected && readiness.components.some(({ component, status }) => component === "AI" && status === "Ready");

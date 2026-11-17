@@ -74,13 +74,13 @@ test("reads only bounded pages, cancels obsolete reads and removes a missing own
   const searches = screen.getByRole("region", { name: "Recent searches" });
   await within(objects).findByRole("link", { name: /Object c/ });
   expect(within(searches).getByRole("status").textContent).toContain("Loading recent searches");
-  expect(first.request.mock.calls.map(([route, { id, query }]) => ({ route, id, query }))).toEqual([
+  await waitFor(() => expect(first.request.mock.calls.map(([route, { id, query }]) => ({ route, id, query }))).toEqual([
     { route: "GET /health" },
     { route: "GET /objects", query: { limit: 3 } },
     { route: "GET /objects/{id}/sessions", id: "c", query: { limit: 3 } },
     { route: "GET /objects/{id}/sessions", id: "b", query: { limit: 3 } },
     { route: "GET /objects/{id}/sessions", id: "a", query: { limit: 3 } },
-  ]);
+  ]));
   expect(first.adapter.get).not.toHaveBeenCalled();
   expect(first.adapter.media).not.toHaveBeenCalled();
   expect(first.adapter.emergency).not.toHaveBeenCalled();

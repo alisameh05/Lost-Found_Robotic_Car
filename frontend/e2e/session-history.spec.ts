@@ -243,8 +243,9 @@ test("keeps grace evidence and keyboard Emergency Stop available during active i
   await expect(pending.locator("time")).toHaveCount(1);
   const pendingFrame = pending.getByRole("img", { name: "Captured evidence" });
   await expect(pendingFrame).toHaveAttribute("src", /^blob:/);
-  const pendingUrl = (await pendingFrame.getAttribute("src"))!;
   await pending.getByRole("button", { name: "Inspect evidence" }).click();
+  await expect(pending.getByRole("region", { name: "Enlarged captured evidence" })).toBeFocused();
+  const pendingUrl = (await pendingFrame.getAttribute("src"))!;
   await expect(page.getByText("Active-session grace", { exact: true })).toHaveCount(0);
   await page.clock.fastForward(8 * 86_400_000);
   await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();

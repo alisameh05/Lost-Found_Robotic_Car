@@ -6,9 +6,9 @@ altitude: system
 paradigm: Layered modular application with one authoritative local service
 scope: Windows laptop application, AI, firmware and logical device interfaces
 status: final
-version: "1.4"
+version: "1.5"
 created: 2026-11-05
-updated: 2026-11-13
+updated: 2026-11-17
 binds: [FR-1–FR-18, NFR-1–NFR-6, SM-1, SM-C1, SM-2, SM-3, SM-4]
 sources: [PRD.md]
 companions: [TRD.md]
@@ -18,23 +18,31 @@ companions: [TRD.md]
 
 ## Authority and design paradigm
 
-This is the canonical technical decision record. Alisa adopted AD-1–AD-14 during the guided architecture session on 2026-11-05 and approved AD-15 on 2026-11-06. Version 1.3 implements the authorized 2026-11-13 scope cleanup, amending AD-3/AD-5/AD-14 and the acceptance evidence boundary under [PRD v1.3](PRD.md), section 9. Earlier adoption dates do not imply prior approval of these amendments. The PRD owns scope and acceptance. This record governs technical invariants; [TRD v1.3](TRD.md) derives the implementation contracts. A conflict requires an explicit upstream revision, never an implicit override. Documentation finalization does not establish device compatibility or measured performance.
+This is the canonical technical decision record. Alisa adopted AD-1–AD-14 during the guided architecture session on 2026-11-05 and approved AD-15 on 2026-11-06. Version 1.3 implements the authorized 2026-11-13 scope cleanup, amending AD-3/AD-5/AD-14 and the acceptance evidence boundary recorded in [PRD section 9](PRD.md#9-approval). Earlier adoption dates do not imply prior approval of these amendments. The current PRD owns scope and acceptance. This record governs technical invariants; [TRD v1.4](TRD.md) derives the implementation contracts. A conflict requires an explicit upstream revision, never an implicit override. Documentation finalization does not establish device compatibility or measured performance.
 
 Version 1.4 adds the directory design selected by Alisa on 2026-11-13: one repository and coordinated release, `backend/` and `frontend/`, lean feature-based backend modules, and the recommended feature-based Next.js App Router frontend. This is an additive code-organization decision under AD-2/AD-4/AD-13; the existing process split, authority rules and qualification gates still apply. The trees below describe the intended implementation. This revision creates no application folders or starter code.
 
 Use a **layered modular application with one authoritative local service**. Next.js owns presentation. FastAPI owns application state and coordinates adapters for devices, AI and storage. AI runs in a separate worker process and cannot command motors or mutate records. Arduino owns the final command-expiry stop. Implementation contracts below these boundaries live in the TRD.
+
+Version 1.5 records the approved 2026-11-17 amendment under [PRD v1.4](PRD.md) and [TRD v1.4](TRD.md): AD-10 now uses finger counts, and AD-8 explicitly reuses pretrained libraries without MVP training. The completed frontend is retained. Phases 04–08 remain future integration and qualification work; no diagram or upstream example establishes readiness.
 
 ```mermaid
 flowchart LR
     UI[Browser UI] --> NEXT[Local Next.js server]
     UI --> API[FastAPI application service]
     API --> DATA[Local SQLite and managed images]
-    API --> AI[Separate AI worker]
-    API --> INPUT[Laptop webcam and controller adapters]
-    API --> SERIAL[HC-05 command adapter]
+    API --> AI[Separate YOLOE inference worker]
+    GATE[Shared control and safety manager] --> SERIAL[HC-05 command adapter]
     SERIAL --> UNO[Arduino command watchdog]
     UNO --> OUTPUT[Logical direction and stop output]
-    CAMERA[ESP32-CAM on local Wi-Fi] --> API
+    CAMERA[ESP32-CAM on local Wi-Fi] --> CAPTURE[Single bounded camera service]
+    CAPTURE --> AI
+    CAPTURE --> API
+    AI --> API
+    WEBCAM[Laptop webcam] --> GESTURE[MediaPipe finger-count adapter]
+    GESTURE --> GATE
+    PS4[PS4 D-pad and Circle adapter] --> GATE
+    API --> GATE
 ```
 
 Arrows represent permitted request/data dependencies and end at firmware/logical interfaces. Next.js never writes the database or drives a device; only FastAPI accesses those adapters. Device and worker outputs are observations, not authoritative session mutations.
@@ -83,11 +91,12 @@ Arrows represent permitted request/data dependencies and end at firmware/logical
 - **Prevents:** Partial saved decisions, orphaned evidence and independent storage writers.
 - **Rule:** SQLite holds structured records and media metadata; an application-managed local folder holds reference copies and screenshots. Backend owns all writes, review commit coordination and tracked file cleanup. Retry cannot duplicate a decision. Expiry removes related stored data, including media.
 
-### AD-8 — Local processing adapters [ADOPTED]
+### AD-8 — Local processing adapters [ADOPTED; clarified 2026-11-17]
 
 - **Binds:** Vision, input and command adapters.
 - **Prevents:** Cloud inference or browser-owned device pipelines changing the selected boundary.
 - **Rule:** Use OpenCV, MediaPipe, YOLOE visual prompting through Ultralytics/PyTorch, Pygame and pySerial. Backend owns webcam/controller access. NVIDIA inference must be qualified on the selected laptop. Exact compatible versions, model checkpoint and matching settings are selected and recorded by early local benchmarks before functional testing; no cloud fallback.
+- **Reuse:** Use locally installed pretrained YOLOE/MediaPipe assets, with no MVP training or fine-tuning. One camera service fans out identified frames to display and inference; bounded latest-frame delivery prevents backlog. Gesture and PS4 adapters emit normalized movement intent to the same safety manager, never directly to serial. Upstream examples require license inspection and contract adaptation; TRD section 2.1 records the reuse assessment.
 
 ### AD-9 — Retention and storage failure [ADOPTED]
 
@@ -95,11 +104,11 @@ Arrows represent permitted request/data dependencies and end at firmware/logical
 - **Prevents:** Searches extending retention, false deletion claims and operation with broken persistence.
 - **Rule:** Retention is 1–30 whole days, default seven, measured from registration. Confirmed changes apply immediately to existing registration times after an impact preview; changes are unavailable during Searching/Paused. Preserve the PRD's active-session grace and startup purge. Cleanup failure hides expired data, reports incomplete deletion and blocks new searches/data-changing tasks pending integrity restoration. Active storage failure stops/pauses.
 
-### AD-10 — Held directional controls [ADOPTED]
+### AD-10 — Held directional controls [ADOPTED; amended 2026-11-17]
 
 - **Binds:** Input adapters, guidance and qualification; UX G4.
-- **Prevents:** Reversed gesture directions, mixed modes or undocumented controller indices.
-- **Rule:** One extended index finger points up/down/left/right in the mirrored displayed webcam view for forward/backward/left/right. Fist, no hand, multiple hands or ambiguity stops motion. PS4 DualShock 4 uses held D-pad directions; release/conflict stops; Circle is emergency stop. UI emergency stop remains available in both modes. PS5 support is removed under PRD v1.1 with supervisor approval. Qualify recognition thresholds and the actual device mapping before driving.
+- **Prevents:** Inconsistent finger mappings, mixed modes or undocumented controller indices.
+- **Rule:** Count extended fingers on one valid hand: 0 neutral/stop, 1 forward, 2 backward, 3 left, 4 right. Five fingers, no hand, multiple hands, uncertainty or stale recognition stop motion. A changed count stops the prior movement while the next input is validated; direction requires a stable fresh hold. Mirroring changes display orientation, not this count-to-direction mapping. PS4 DualShock 4 uses held D-pad directions; release/conflict stops; Circle is emergency stop. UI emergency stop remains available in both modes. Neutral and a fresh hold remain mandatory after Start/Resume/recovery. Qualify counting/handedness, confidence/consistency and actual controller mapping at T4. PS5 remains out of scope.
 
 ### AD-11 — Reference image contract [ADOPTED]
 
@@ -262,7 +271,7 @@ backend/
 │   │   │   ├── serial_link.py      # pySerial; bounded command/challenge/acknowledgment protocol
 │   │   │   ├── robot_camera.py     # ESP32 frames, epochs and bounded clock-age exchange
 │   │   │   ├── webcam.py           # OpenCV capture and source frame identity
-│   │   │   ├── gestures.py         # MediaPipe pointing classification in mirrored coordinates
+│   │   │   ├── gestures.py         # MediaPipe finger counts, validity and stable held intent
 │   │   │   ├── controller.py       # Pygame/SDL PS4 identity, mapping and held-input samples
 │   │   │   └── proximity.py        # Validity/freshness and silent advisory warning/clear logic
 │   │   ├── video/
@@ -355,7 +364,7 @@ Names in this table describe intended Python interfaces, not new HTTP endpoints 
 
 Test through module interfaces: transition tables, false/stale input, expired challenges, loss of displayed-frame acknowledgments, mismatched worker generations, recovery and independent emergency revocation. Use real temporary SQLite/filesystem integration tests for atomic confirmation, receipt replay, crash reconciliation, expiry grace and denied/full storage. Prove STOP/expiry remains independent of blocked inference, storage and slow consumers. Device protocol fixtures test framing/compatibility without claiming wheel behavior.
 
-Backend HTTP definitions own generated OpenAPI; `contracts/` owns event/frame/worker definitions. Export only resolved public definitions and generate frontend HTTP/event/frame types from them. `scripts/generate-contracts.ps1` coordinates export and generation, and checks fail on generated drift or incompatible changes. Python worker/device contracts stay backend-owned; firmware compatibility is checked separately. [API.md](API.md), especially section 12, retains unresolved wire decisions: a folder tree does not approve proposed history routes, pagination, unknown payload fields or error literals. Resolve each affected decision before freezing its executable schema. Unrelated modules can proceed against the resolved subset and labeled fixtures.
+Backend HTTP definitions will own generated OpenAPI; `contracts/` will own event/frame/worker definitions in Phase 04. Export the approved definitions and generate frontend HTTP/event/frame types from them; the planned `scripts/generate-contracts.ps1` coordinates export and generation, with checks for drift or incompatibility. Until then, the frontend generator extracts the approved [API.md](API.md) schema and endpoint catalogue. API section 12 resolves the older wire questions, including history routes, pagination and errors; a directory tree cannot reopen them. Finger counts are adapter observations, not new browser movement endpoints or public enum values. Python worker/device contracts stay backend-owned; firmware compatibility is checked separately.
 
 ## Frontend directory architecture
 

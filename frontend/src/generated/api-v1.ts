@@ -1,4 +1,4 @@
-// Generated from docs/API.md v1.0 (SHA-256 944c12c922bd5109c83a30c80df0f7622e5bb03a0a11636ad2b29edf47348ee6). Do not edit.
+// Generated from docs/API.md v1.1 (SHA-256 36ef87ebae38954329969ca0277431236395fb1d9100ce22f5f06135e0f49b44). Do not edit.
 
 /**
  * This interface was referenced by `HttpResponses`'s JSON-Schema

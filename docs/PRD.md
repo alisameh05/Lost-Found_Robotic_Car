@@ -1,9 +1,9 @@
 ---
 title: "Lost and Found — Product Requirements Document"
 status: final
-version: "1.3"
+version: "1.4"
 created: 2026-11-05
-updated: 2026-11-13
+updated: 2026-11-17
 ---
 
 # Lost and Found — Product Requirements Document
@@ -11,6 +11,8 @@ updated: 2026-11-13
 ## 1. Purpose and vision
 
 Lost and Found helps people locate belongings in offices and shared spaces using a manually operated camera robot and a laptop application. The operator supplies a reference image, drives the robot through connected rooms, and reviews AI-generated potential matches. A human decision establishes that a belonging has been found; visual similarity alone never changes its status to Found.
+
+The MVP reuses pretrained vision technology; custom model training and dataset development are not required. All recognition runs locally after installation and asset download.
 
 This PRD defines the software scope for a university project assessed through a report and demonstration: the application, AI, device firmware, motion commands, software integration, records, stopping/recovery behavior, and measurable acceptance. Physical wiring and assembly are handled externally by Alisa. This requirements baseline includes the authorized 2026-11-13 amendment in section 9; it is not evidence of implemented or qualified performance. The canonical copy is maintained at `docs/PRD.md`.
 
@@ -66,6 +68,8 @@ Acceptance: the operator can see the robot feed, target, active mode, session st
 Acceptance: demonstrate every action in each mode. The inactive mode cannot command movement. Pause does not unlock mode selection.
 
 **FR-5 — Require held movement input.** Move only while a valid directional gesture/controller input is held. Release or loss of recognition stops movement.
+
+Gesture mode uses finger counts: 0 is neutral/stop; 1 forward; 2 backward; 3 left; 4 right. Five fingers, no hand, multiple hands or uncertain recognition stop movement. A changing gesture stops the previous movement while the new input is validated. Only a stable held gesture permits movement; recovery still requires FR-17.
 
 Acceptance: each direction and its release satisfy SM-2. Paused/ended sessions ignore movement input.
 
@@ -152,6 +156,7 @@ Manual forward/backward/left/right/stop commands; laptop-webcam gestures; PS4 Du
 - Object pickup/retrieval and guaranteed unique-belonging recognition.
 - Concurrent operators, robots, or targets; changing control mode within a session.
 - Public/social sharing, cloud accounts, and operating systems beyond Windows.
+- Custom model training or fine-tuning for the initial MVP.
 
 ### Delivery context and required software capabilities
 
@@ -211,3 +216,5 @@ T2 now checks software interface configuration and compatibility. T1–T7 and in
 Version 1.0 was approved by Alisa on 2026-11-05. Version 1.1 records the 2026-11-06 decisions for PS4-only support (supervisor-approved) and the advisory HC-SR04 warning. Version 1.2 records Alisa's 2026-11-07 approval of the complete software scope and external ownership of physical work. Those approvals apply to their dated baselines.
 
 Version 1.3 implements Alisa's approved cleanup plan on 2026-11-13. It removes physical-work procedures and handoff dependencies from the three core documents and replaces T2 with software interface configuration/compatibility. FR-1–FR-18, NFR-1–NFR-6 and metric IDs are retained. NFR-6 and SM-2/SM-3 now explicitly distinguish software verification from external measurements: the 0.5-second wheel-stop target remains an external integration target; the twenty-minute application stability criterion is separate from the original no-recharge battery-endurance target. This is a current acceptance wording amendment, not a claim that the new wording was approved in earlier versions or that physical targets have passed. Warning calibration, integration measurements and other unverified gates remain pending.
+
+Version 1.4 records Alisa's 2026-11-17 approval of finger-count controls in place of pointing gestures and the integration-focused reuse roadmap. It preserves every requirement ID, session/object state, human-confirmation rule and acceptance target. Phases 01–03 are completed frontend fixture work; this amendment does not implement or qualify phases 04–08. A supplemental thirty-minute stress exercise may extend SM-3 testing without replacing its twenty-minute criterion.

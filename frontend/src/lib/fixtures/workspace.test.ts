@@ -284,6 +284,28 @@ test("scopes Start and subsequent actions to one live lease and expires an aband
   transport.controls.input("Gestures", "neutral");
   transport.controls.input("Gestures", "forward");
   expect((await snapshot()).runtime.motion_permission).toBe("Armed");
+  for (const [count, direction] of [[1, "forward"], [2, "backward"], [3, "left"], [4, "right"]] as const) {
+    transport.controls.fingers(0);
+    expect((await snapshot()).runtime.motion_permission).toBe("Arming");
+    transport.controls.fingers(count);
+    expect(transport.controls.readInput()).toBe(direction);
+    expect((await snapshot()).runtime.motion_permission).toBe("Armed");
+  }
+  // Inactive PS4 observations cannot change gesture permission.
+  transport.controls.input("Controller", "invalid");
+  expect((await snapshot()).runtime.motion_permission).toBe("Armed");
+  transport.controls.fingers(2, false);
+  expect((await snapshot()).runtime.motion_permission).toBe("Disarmed");
+  for (const observation of [5, "no-hand", "multiple-hands", "uncertain", -1, 1.5, NaN] as const) {
+    transport.controls.fingers(0);
+    transport.controls.fingers(1);
+    expect((await snapshot()).runtime.motion_permission).toBe("Armed");
+    transport.controls.fingers(observation);
+    expect(transport.controls.readInput()).toBe("invalid");
+    expect((await snapshot()).runtime.motion_permission).toBe("Disarmed");
+    transport.controls.fingers(1);
+    expect((await snapshot()).runtime.motion_permission).toBe("Disarmed");
+  }
   const contextPause = { ...pause, client_id: context.client_id, action_id: crypto.randomUUID() };
   const paused = data(await transport.request("POST /sessions/{id}/actions", { id: session.id, context, body: contextPause })).result!.session!;
   const pauseGeneration = (await snapshot()).lease.control_generation;
@@ -304,6 +326,9 @@ test("scopes Start and subsequent actions to one live lease and expires an aband
   expect(eventSocket.heartbeat({ ...current, control_generation: pauseGeneration, heartbeat_seq: 4, displayed_robot_frame: frame })).toBe(false);
   await vi.advanceTimersByTimeAsync(80);
   expect(eventSocket.heartbeat({ ...current, control_generation: resumeGeneration, heartbeat_seq: 4, displayed_robot_frame: frame })).toBe(true);
+  transport.controls.fingers(5);
+  transport.controls.fingers(1);
+  expect((await snapshot()).runtime.motion_permission).toBe("Disarmed");
   transport.controls.input("Gestures", "neutral");
   transport.controls.input("Gestures", "left");
   expect((await snapshot()).runtime.motion_permission).toBe("Armed");
