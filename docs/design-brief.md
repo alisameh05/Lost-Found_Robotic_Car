@@ -4,6 +4,8 @@ Create the screens for a **Next.js web application running locally on the userâ€
 
 The application lets one operator register a missing belonging, select its reference-image target, manually drive a camera robot using gestures or a PS4 controller, review potential matches, and inspect saved history.
 
+The 2026-11-17 amendment retains the completed phases 01â€“03 screens and layout. Gesture copy and feedback use finger counts instead of the earlier pointing mapping. Existing Pencil exports are the layout baseline; their pointing instructions are superseded by this amendment and the shared implemented Control Guide.
+
 ## Navigation
 
 Use a left sidebar with:
@@ -274,13 +276,15 @@ Distinguish required devices for the selected mode from inactive or advisory dev
 
 Include:
 
-- Gesture directions and stopping gestures.
+- Finger-count mapping: 0 neutral/stop, 1 forward, 2 backward, 3 left, 4 right. Five fingers, no hand, multiple hands or uncertain recognition stop.
+- Stable held gestures; changing or losing the gesture stops the prior movement while input is validated. Feedback identifies the recognized count and direction without claiming that input alone grants movement permission.
 - PS4 D-pad movement and Circle emergency stop.
 - Held-input movement and release-to-stop behavior.
 - Pause versus Stop Search versus Emergency Stop.
 - Match confirmation and rejection.
 - Connection-failure recovery.
 - Fresh-input requirement after recovery.
+- After Start/Resume/recovery, show 0 fingers as neutral before a fresh directional hold; unsupported or uncertain recognition is stopped input, not validated neutral.
 
 Provide a standalone page and modeless workspace help panel using the same content.
 

@@ -2,6 +2,8 @@
 
 The fixture application runs locally on Windows with synthetic records and device observations. The fixture shell requires Node and a browser.
 
+Phases 01–03 are completed at the fixture boundary. The 2026-11-17 amendment changes gesture guidance and fixture feedback to finger counts while retaining the screens, API shapes and recovery workflow. Real backend, AI, webcam/controller capture, serial devices and firmware remain phases 04–08 work; see the [roadmap](../docs/IMPLEMENTATION_PLAN.md) and [reuse/environment assessment](../docs/TRD.md#21-reuse-and-license-assessment).
+
 ## Setup and startup
 
 Install Node.js 24.19.0 LTS with npm 11.17.0. From PowerShell in the repository root:
@@ -29,8 +31,11 @@ Install dependencies and the test browser while online. Normal fixture use works
 
 ## Verification
 
+Run verification from PowerShell 7. Set the script shell for this process so npm's Windows command shims do not split the `&` in the repository path. Install the browser required by the pinned Playwright version before the first run:
+
 ```powershell
-npx.cmd playwright install chromium
+$env:npm_config_script_shell = (Get-Process -Id $PID).Path
+node node_modules/@playwright/test/cli.js install chromium
 npm.cmd run verify
 ```
 
@@ -48,6 +53,8 @@ npm.cmd run verify
 The seed records the API document version, its line-ending-normalized SHA-256 and the endpoint catalogue. Ajv verifies the complete Draft 2020-12 definitions against fixture payloads. The contract checks also validate relationships between resources, readiness and profile bounds, and binary frame envelopes. Deliberately invalid vectors are exercised separately. In Phase 04, replace the documentation-derived generation input with backend-owned OpenAPI plus event and frame exports. Compare wire fields, required/nullability rules, enums, limits and fixture validation against this baseline before removing the seed.
 
 Search Setup decodes bounded fixture robot frames and reports successful display through the controlling workspace heartbeat. Open Setup from an eligible Lost record, inspect the preview, then select **Acquire control** to check readiness. The opt-in Search Setup fixture controls can freeze or disconnect the preview and restore fresh frames. Registration validates JPEG and PNG files locally and saves their normalized references in fixture memory. Select **registration recovery** to exercise a failed save followed by a Pending request and a lost response. **Retry Same Request** recovers the matching receipt. Playwright uses generated images for registration checks.
+
+In the gesture workspace, the fixture **Hold forward/backward/left/right** actions represent already validated stable counts of 1/2/3/4 fingers; **Release input** represents a valid 0-count neutral. Extra observations exercise five fingers, no hand, multiple hands and a changing count, all stopped and unable to satisfy recovery neutral. These are synthetic adapter observations, not recognition or timing measurements. A fresh neutral and directional hold are required after Start/Resume/recovery. The standalone Control Guide and modeless workspace help share the same mapping. PS4 uses the existing held D-pad and Circle behavior.
 
 Instrument Sans Variable weights 400–700 ship as local WOFF2 files from the pinned Fontsource package under the [SIL Open Font License](Instrument-Sans-LICENSE.txt). Navigation and controls use bundled Lucide icons distributed under the [Lucide license notices](Lucide-LICENSE.txt). The fixture adapter bundles original synthetic 32 × 24 JPEG and PNG swatches generated with System.Drawing. The swatches are repository-authored assets with no third-party source.
 

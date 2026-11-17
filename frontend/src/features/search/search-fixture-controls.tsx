@@ -3,6 +3,7 @@
 import { Button } from "@/components/ui/button";
 import { useRuntime } from "@/features/runtime";
 import type { ControlMode } from "@/generated/api-v1";
+import { gestureDirections } from "@/lib/gesture-input";
 
 const paths = { Command: "command link", Webcam: "webcam", Controller: "controller", AI: "matching service",
   RobotVideo: "robot camera", Storage: "storage" } as const;
@@ -27,11 +28,17 @@ export function InputControls({ mode, disabled }: { mode: ControlMode; disabled:
     <summary>Workspace fixture controls</summary>
     <div className="control-row" aria-label="Fixture input observations">
       {(["forward", "backward", "left", "right"] as const).map((direction) => <Button key={direction} disabled={disabled}
-        onClick={() => fixture.search.input(mode, direction)}>Hold {direction}</Button>)}
-      <Button disabled={disabled} onClick={() => fixture.search.input(mode, "neutral")}>Release input</Button>
-      <Button disabled={disabled} onClick={() => fixture.search.input(mode, "invalid")}>
+        onClick={() => mode === "Gestures" ? fixture.search.fingers(gestureDirections[direction]) : fixture.search.input(mode, direction)}>Hold {direction}</Button>)}
+      <Button disabled={disabled} onClick={() => mode === "Gestures" ? fixture.search.fingers(0) : fixture.search.input(mode, "neutral")}>Release input</Button>
+      <Button disabled={disabled} onClick={() => mode === "Gestures" ? fixture.search.fingers("uncertain") : fixture.search.input(mode, "invalid")}>
         {mode === "Gestures" ? "Ambiguous gesture" : "Conflicting D-pad input"}
       </Button>
+      {mode === "Gestures" && <>
+        <Button disabled={disabled} onClick={() => fixture.search.fingers(5)}>Observe five fingers</Button>
+        <Button disabled={disabled} onClick={() => fixture.search.fingers("no-hand")}>Observe no hand</Button>
+        <Button disabled={disabled} onClick={() => fixture.search.fingers("multiple-hands")}>Observe multiple hands</Button>
+        <Button disabled={disabled} onClick={() => fixture.search.fingers(2, false)}>Observe changing count</Button>
+      </>}
       {mode === "Controller" && <Button onClick={fixture.search.circle}>PS4 Circle</Button>}
       <Button onClick={() => fixture.search.changeFrames("frozen")}>Freeze robot frames</Button>
       <Button onClick={() => fixture.search.changeFrames("live")}>Send fresh frames</Button>

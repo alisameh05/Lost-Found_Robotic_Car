@@ -1,9 +1,9 @@
 ---
 title: "Lost and Found — API Contracts"
 status: "Approved v1 API contract; implementation and qualification require verification"
-version: "1.0"
+version: "1.1"
 created: 2026-11-13
-updated: 2026-11-13
+updated: 2026-11-17
 sources: [PRD.md, TRD.md, ARCHITECTURE.md]
 ---
 
@@ -11,7 +11,7 @@ sources: [PRD.md, TRD.md, ARCHITECTURE.md]
 
 ## 1. Authority and approval
 
-This is the approved browser/backend API contract for the local Lost and Found application. [PRD v1.3](PRD.md) owns scope and acceptance; [Architecture v1.4](ARCHITECTURE.md) owns technical invariants; [TRD v1.3](TRD.md), sections 5–10, supplies domain and integration requirements.
+This is the approved browser/backend API contract for the local Lost and Found application. [PRD v1.4](PRD.md) owns scope and acceptance; [Architecture v1.5](ARCHITECTURE.md) owns technical invariants; [TRD v1.4](TRD.md), sections 5–10, supplies domain and integration requirements.
 
 On 2026-11-13, Alisa approved the recommendations in interview questions Q1–Q21 and Q22–Q37, then authorized their incorporation with the additional definitions needed for a complete contract. This revision approves the history routes, pagination, wire shapes, validation, errors and retry policies below. It resolves the wire decisions referenced by Architecture's backend contract-ownership section and supersedes the earlier extraction's unselected alternatives. An approved wire choice does not change upstream product scope or establish measured device performance.
 
@@ -19,7 +19,9 @@ The embedded JSON Schemas use draft 2020-12 and define concrete public models. E
 
 ### 1.1 Versioning and compatibility
 
-HTTP uses `/api/v1`; event/frame metadata uses integer `protocol_version: 1`; sockets negotiate `laf.v1`. Editorial version `1.0` is independent of device protocols and database migrations.
+HTTP uses `/api/v1`; event/frame metadata uses integer `protocol_version: 1`; sockets negotiate `laf.v1`. Editorial version `1.1` is independent of device protocols and database migrations.
+
+The 2026-11-17 editorial amendment aligns input qualification with approved finger counts and the reuse roadmap. HTTP routes, public schemas, events, frame envelopes, state enums and wire protocol versions are unchanged. The backend input adapter translates 0 fingers to neutral/STOP and stable 1/2/3/4 to forward/backward/left/right; five fingers, missing/multiple hands, uncertainty and transitions stop. Only validated zero counts satisfy recovery neutral. Counts and landmarks are internal observations, not browser movement commands or new public fields. Retain modeless review, exact evidence-frame association and inference-independent revocation.
 
 Frontend and backend ship as one coordinated compatible release. There is no cross-release compatibility promise for the initial release. Within v1, preserve field meanings, required fields, enum values and resource revision scope. Breaking changes require a new major HTTP namespace and/or application subprotocol, release notes, generated types and a coordinated disarmed upgrade. No automatic future-version negotiation or interpretation is permitted. Unsupported application versions return `PROTOCOL_UNSUPPORTED`; do not confuse this with WebSocket transport-version negotiation.
 
@@ -610,7 +612,7 @@ Capacity errors return `503 CAPACITY_REACHED` without silently evicting active o
 | HC-05 / Uno | T2 identity/build manifest and T6 serial schema: bounded framing, integrity/ranges, boot/generation, increasing sequence, direction, device-issued expiring challenge, acknowledgment and logical output state. Stop/expiry invalidates the armed generation. Partial/oversized/replayed packets never refresh watchdogs. |
 | ESP32-CAM | T2 endpoint/build identity and T6 acquisition/clock-exchange schema: source epoch/sequence/us timestamp, bounded JPEG, protocol compatibility and uncertainty evidence. |
 | HC-SR04 | T2 observation identity/version and T4/T6 bounded mm/sample epoch/sequence/validity/freshness/calibrated warning-clear profile. Unknown is never clear. |
-| Webcam / PS4 | Backend-owned selected device/profile, connection generation and fresh samples; T4 measured gesture orientation/ambiguity/neutral and actual DualShock 4 mapping. Held D-pad controls directions; Circle stops. |
+| Webcam / PS4 | Backend-owned selected device/profile, connection generation and fresh samples; T4 measured finger counts, handedness, multi-hand rejection, consistency/ambiguity/neutral and actual DualShock 4 mapping. Stable 1/2/3/4 means forward/backward/left/right; 0 is neutral. Unsupported/lost/changing input stops renewal. Held D-pad controls directions; Circle triggers emergency stop. |
 | AI worker | T5 versioned model/checkpoint/assets/threshold/continuity manifest and T6 bounded IPC schema. Observations carry session/generation/frame identity, never record or motor authority. |
 
 These are firmware/worker interface deliverables outside the public browser API. This document defines their required artifact contents and fail-closed integration behavior; it supplies no fabricated board configuration, thresholds, installed versions or test results. Independent software continues with clearly labeled fixtures.

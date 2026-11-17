@@ -1,16 +1,18 @@
 ---
 title: "Lost and Found — Implementation Plan"
 status: approved
-version: "1.0"
+version: "1.1"
 created: 2026-11-13
-updated: 2026-11-13
-implementation_status: not started
+updated: 2026-11-17
+implementation_status: "Phases 01–03 complete at fixture boundary; phases 04–08 planned"
 sources: [PRD.md, ARCHITECTURE.md, TRD.md, API.md, design-brief.md]
 ---
 
 # Implementation Plan — Lost and Found
 
 **Three-week software build · Eight phases · Frontend first**
+
+The 2026-11-17 amendment retains the completed frontend, adopts finger-count controls and makes open-source reuse explicit in the remaining phases. This roadmap update does not execute phases 04–08. [Issue #42](https://github.com/alisameh05/Lost-Found_Robotic_Car/issues/42) tracks the documentation/frontend amendment; phase specifications and implementation tickets remain in GitHub.
 
 ## 1. Goal, scope, and delivery approach
 
@@ -32,22 +34,26 @@ The latest approved API contract governs wire details, including decisions that 
 
 Three weeks at 3–4 hours daily provides **63–84 hours**. This plan allocates **75 focused hours**, including phase specification, implementation, review, and verification.
 
+These are the original allocations, not actual hours spent or a renewed completion promise. Phases 04–08 retain an initial **51-hour** allocation; reforecast after Phase 04's license, compatibility and visual-prompt experiments. Source reuse does not remove safety, persistence, integration or qualification work. Conservative reuse estimates and their uncertainty are in TRD section 2.1.
+
 That requires averaging approximately **3.6 hours daily**. The schedule is ambitious, particularly for GPU compatibility and firmware integration; these are working allocations, not measured completion estimates. At three hours daily, the planned workload exceeds available time by approximately twelve hours.
 
 ## 2. Phases and schedule
 
-All eight phases are **Not started**. Relative Day 1 begins when phase execution starts, not when this roadmap is saved. An exit gate is passed only when its required evidence exists.
+As of 2026-11-17, Alisa reports phases **01–03 complete**, consistent with their closed implementation tickets and the frontend present on `main`. This means a labeled fixture application, not qualified hardware or production backend behavior. Phase parent specs remain separate from implementation completion. Relative days below are the original schedule positions, not new calendar dates. Exit gates still require their stated evidence.
 
-| # | Phase | Days | Depends on | Produces | Budget |
-|---|---|---|---|---|---|
-| 01 | Frontend foundation and contract fixtures | 1–2 | — | Application shell, shared components, typed fixture transport | 7 h |
-| 02 | Registration, records, and supporting screens | 3–5 | 01 | Nine functional screen surfaces, including both registration steps | 10 h |
-| 03 | Search setup, workspace, and results | 6–7 | 02 | Complete frontend journey and operational states | 7 h |
-| 04 | Backend foundation, storage, and records API | 8–10 | 03 | Local FastAPI service, durable records/media, history, retention | 11 h |
-| 05 | Session orchestration, realtime transport, and recovery | 11–13 | 04 | Authoritative search lifecycle and safety behavior using simulated devices | 11 h |
-| 06 | Local AI, computer vision, and operator inputs | 14–16 | 05 | YOLOE matching, MediaPipe gestures, PS4 input, candidate continuity | 11 h |
-| 07 | Device adapters, firmware, and connected integration | 17–19 | 06 | Compatible Uno/ESP32 software, real video/control, proximity telemetry | 11 h |
-| 08 | Qualification, offline release, and demonstration | 20–21 | 07 | Verified release, launcher, evidence, report/demo materials | 7 h |
+| # | Phase | Original days | Depends on | Produces | Budget | Status |
+|---|---|---|---|---|---|---|
+| 01 | Frontend foundation and contract fixtures | 1–2 | — | Application shell, shared components, typed fixture transport | 7 h | Complete: fixtures |
+| 02 | Registration, records, and supporting screens | 3–5 | 01 | Nine functional screen surfaces, including both registration steps | 10 h | Complete: fixtures |
+| 03 | Search setup, workspace, and results | 6–7 | 02 | Complete frontend journey and operational states | 7 h | Complete: fixtures |
+| 04 | Backend foundation, storage, and records API | 8–10 | 03 | Local FastAPI service, durable records/media, history, retention | 11 h | Planned |
+| 05 | Session orchestration, realtime transport, and recovery | 11–13 | 04 | Authoritative search lifecycle and safety behavior using simulated devices | 11 h | Planned |
+| 06 | Local AI, computer vision, and operator inputs | 14–16 | 05 | YOLOE matching, finger-count gestures, PS4 input, candidate continuity | 11 h | Planned |
+| 07 | Device adapters, firmware, and connected integration | 17–19 | 06 | Compatible Uno/ESP32 software, real video/control, proximity telemetry | 11 h | Planned |
+| 08 | Qualification, offline release, and demonstration | 20–21 | 07 | Verified release, launcher, evidence, report/demo materials | 7 h | Planned |
+
+Completion pointers: Phase 01 [spec #1](https://github.com/alisameh05/Lost-Found_Robotic_Car/issues/1), closed implementation tickets #2–#5; Phase 02 [spec #10](https://github.com/alisameh05/Lost-Found_Robotic_Car/issues/10), closed tickets #11–#16; Phase 03 [spec #29](https://github.com/alisameh05/Lost-Found_Robotic_Car/issues/29), closed tickets #30–#35. This status records implementation history, not a new execution of their checks or a production acceptance pass.
 
 These are **eight phase-sized specifications**, not eight individual coding tickets. Each phase can later contain a small dependency graph of implementation tickets.
 
@@ -127,6 +133,8 @@ Dashboard; Objects / History; Registration Step 1; Registration Step 2; Object D
 **Work:**
 
 - Begin with the agreed laptop/GPU feasibility check: verify the Windows environment and a compatible local Python, PyTorch/YOLOE, MediaPipe, and supporting-library combination.
+- Inspect source/licenses using TRD sections 2.1–2.2. Keep the existing Python installation; evaluate an isolated Python 3.11 environment, verify current driver/free disk/RAM and actual CUDA inference, then lock tested versions/assets. Unlicensed gesture/serial examples remain references unless permission is obtained.
+- Run an independent visual-prompt experiment with `yoloe-26n-seg.pt` and `yoloe-26s-seg.pt`: reference image + ROI, separate recorded target image, repeated prompt reuse, latency and RAM/VRAM. Check MediaPipe asset/API initialization without implementing the full gesture worker. Record failures and reforecast; no cloud fallback or custom training.
 - Record dependency locks, asset hashes, licenses, and benchmark limitations. Do not introduce cloud inference as a fallback.
 - Create the single-worker FastAPI application, dependency composition, owner lock, configuration, and disarmed lifecycle.
 - Implement local Host/Origin/capability protection, bootstrap, structured errors, and initialization diagnostics.
@@ -153,6 +161,7 @@ Dashboard; Objects / History; Registration Step 1; Registration Step 2; Object D
 - Implement controlling-client leases, generations, ordered events, snapshots, one-use socket tickets, and bounded video channels.
 - Validate workspace heartbeats and displayed-frame identity; stale or unavailable required paths revoke permission.
 - Implement immediate emergency revocation independently of ordinary actions, inference, storage, and subscriber delivery.
+- Keep the common control/safety interface between normalized gesture/PS4 intent and serial. Inject observations through adapters; neither library code nor the browser sends movement directly. Exercise blocked inference/storage before real motion hardware.
 - Implement deliberate recovery: restoration, acknowledgment, explicit Resume, then neutral input and a fresh hold.
 - Reconcile interrupted sessions and pending evidence at startup.
 - Connect search screens to the real backend using explicit simulated device and inference adapters.
@@ -172,9 +181,10 @@ Dashboard; Objects / History; Registration Step 1; Registration Step 2; Object D
 
 - Implement a Windows spawn-safe inference worker with bounded latest-frame processing and explicit failure reporting.
 - Prepare YOLOE visual prompts from the selected reference region and preserve session, generation, and frame identity through results.
+- Integrate the pretrained API selected by Phase 04; cache session prompt context where verified, invalidate it on reference/model/session change, and test ROI/model/source-frame coordinate conversion. No detector, segmenter or gesture-model training is added.
 - Pause before exposing a candidate and preserve its exact frame as durable PNG evidence with a separately rendered bounding box.
 - Implement rejection suppression through candidate continuity and observed exit/re-entry, including continuity loss during pause or recovery.
-- Implement backend-owned webcam capture and MediaPipe pointing recognition in mirrored display coordinates.
+- Implement backend-owned webcam capture and MediaPipe finger counting: 0 neutral/stop, stable 1 forward, 2 backward, 3 left, 4 right; five fingers, no/multiple hands, uncertainty and changing counts stop. Validate thumb/handedness, stabilization and loss independently of inference; retain neutral then fresh hold after recovery.
 - Implement selected PS4 identity/profile, held D-pad directions, Circle emergency stop, release/conflict handling, and disconnection.
 - Request actual webcam/controller details when needed; use recorded or synthetic frames for independent matching work.
 - Freeze the initial model, recognition, input, and continuity configuration before formal trials.
@@ -193,8 +203,10 @@ Dashboard; Objects / History; Registration Step 1; Registration Step 2; Object D
 
 - Obtain the selected serial identity, camera endpoint, board/build targets, logical output mapping, and proximity observation source from Alisa.
 - Preserve the existing motor-test sketch as reference; develop dedicated production firmware rather than assuming that sketch meets the contract.
+- Reuse Espressif's CameraWebServer streaming foundation with required attribution and pinned board/core versions. Keep Arduino Uno + HC-05 and existing logical wiring configuration; example ESP32/UDP motor architectures do not replace them. Serial reference code does not replace our protocol.
 - Implement the versioned Uno command/response protocol, bounded nonblocking parser, expiring challenges, sequence/generation checks, acknowledgment, and disabled boot/reset output.
 - Implement ESP32-CAM acquisition identity, bounded frames, epoch/sequence timestamps, and clock-age exchange.
+- Use one camera capture service with bounded latest-frame fan-out for display and inference. Standard MJPEG alone does not establish source freshness or satisfy clock-age exchange.
 - Integrate pySerial and camera adapters, including compatibility errors, disconnects, stale data, and recovery.
 - Integrate proximity validity/freshness and calibrated warning/clear behavior. It remains advisory.
 - Record versioned device manifests and measured configuration; do not copy fixture timers into device profiles.
@@ -215,10 +227,12 @@ Dashboard; Objects / History; Registration Step 1; Registration Step 2; Object D
 - Run accumulated automated checks and repair remaining integration defects.
 - Complete the PRD recognition trials: five objects, ten presentations each, plus ten negative scenes.
 - Measure camera-to-display latency under active control and AI load; run the twenty-minute application stability exercise.
+- Record capture/display/inference/gesture FPS separately, warmed inference and candidate-alert latency, robot command/revocation timing, CPU/system RAM/GPU/dedicated VRAM and memory stability. Add an optional thirty-minute simultaneous-workload stress test; keep SM-1's three-second trials and SM-2/SM-4's 0.5-second targets unchanged.
 - Verify offline registration, both input modes, review, history, restart, and retention.
 - Finish the Windows launcher, production frontend build, local runtime/assets, startup diagnostics, and disarmed shutdown.
 - Record release versions, model/firmware hashes, configuration, test conditions, and unresolved qualification results.
 - Prepare setup instructions, operator guidance, report evidence, and the demonstration script.
+- Publish only tested setup commands/versions, model/task downloads with hashes/notices, protected local 2.4 GHz Wi-Fi arrangement, Bluetooth pairing/endpoint configuration and offline startup/troubleshooting. Keep license review, device compatibility and external qualification failures explicit.
 
 **Exit gate:** A reproducible release and truthful acceptance report exist. A failed or unperformed metric remains open.
 
@@ -247,6 +261,20 @@ Use Vitest and React Testing Library for meaningful UI/logic checks, Playwright 
 - Local request protection, spectator isolation, and offline operation.
 
 ## 4. Phase-to-spec workflow and delivery rules
+
+### Approved change assessment (2026-11-17)
+
+| Requirements / concern | Disposition | Owning update |
+| --- | --- | --- |
+| FR-1–FR-3; FR-8–FR-16 | Keep registration, ROI, states, modeless review, human-only Found, exact evidence, history and retention | Existing frontend/API; backend implementation in phases 04–06 |
+| FR-4/FR-5/FR-17; AD-10 | Amend pointing to finger counts; preserve exclusive mode, held input and deliberate recovery | PRD/architecture/TRD, shared guide/feedback, fixtures and regression checks |
+| FR-6/FR-7/FR-18 | Keep independent safety, freshness, firmware expiry and advisory-only proximity | API/TRD; phases 05/07 verification |
+| NFR-1–NFR-6; all SM IDs | Keep offline/local stack and approved acceptance; separate supplied hardware from measured compatibility | TRD reuse/environment/verification matrices and phase 08 |
+| Documentation | Update canonical documents in place; setup guide links to TRD reuse inventory; no duplicate application-flow or spec files | README/design brief/roadmap; future phase specifications stay in GitHub |
+
+The completed-frontend amendment changes copy, recognized-count feedback, fixture observations and related tests. Screen routes, layout, records/review/recovery workflows and public API shapes remain intact. Original Pencil exports remain layout references; their pointing text is superseded by the amended brief. Production recognition, backend integration and device qualification remain future work.
+
+### Publishing remaining phase work
 
 This roadmap is maintained at **`docs/IMPLEMENTATION_PLAN.md`**. Saving the approved roadmap does not execute its phases, create phase specifications, publish issues, or establish qualification.
 

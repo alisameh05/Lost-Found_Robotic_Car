@@ -21,6 +21,7 @@ import { readScenario, type ScenarioId } from "./scenarios";
 import { expiryFor, openRetention, unavailableStorage } from "./retention";
 import { fixtureOk as ok, fixtureError as error } from "./responses";
 import { openSocketTickets, runtimeToken } from "./socket-tickets";
+import { inputForFingers, type FingerObservation, type MovementInput } from "../gesture-input";
 import { openFixtureWorkspace, type FrameMode } from "./workspace";
 import { committedSearch, openSearchSaves, type SearchDelivery } from "./search-saves";
 import { capturePng } from "./capture-png";
@@ -47,7 +48,7 @@ type OrdinaryAction = Extract<SessionAction, { action: "pause" | "resume" | "sto
 type ReviewAction = Extract<SessionAction, { action: "confirm" | "reject" }>;
 type AcknowledgeAction = Extract<SessionAction, { action: "acknowledge" }>;
 type CandidateObservation = "visible" | "exit" | "uncertain" | "unprepared" | "mismatched" | "stale" | "corrupt-media" | "missing-media" | "deferred";
-type SearchInput = "neutral" | "invalid" | "forward" | "backward" | "left" | "right";
+type SearchInput = MovementInput;
 const searchBusy = error(503, "CAPACITY_REACHED", "A sample search action is still saving.");
 const evidenceUnavailable = error(503, "MEDIA_UNAVAILABLE", "The captured evidence is unavailable.");
 const requiredPaths = { Command: "CommandUnavailable", Webcam: "InputUnavailable", Controller: "InputUnavailable",
@@ -438,6 +439,21 @@ export function createFixtureTransport({
     sampleInput = undefined;
     neutralObserved = false;
     snapshot = { ...snapshot, runtime: { ...snapshot.runtime, motion_permission: "Disarmed" } };
+  }
+
+  function applyInput(mode: StartRequest["control_mode"], input: SearchInput) {
+    workspace.checkDeadline();
+    if (snapshot.active_session?.control_mode !== mode || snapshot.runtime.effective_session_state !== "Searching" ||
+        snapshot.lease.owner_client_id !== bootstrap.client_id || !workspace.observations().displayed ||
+        storageBlocked() || snapshot.pending_candidate ||
+        snapshot.failures.some(({ restored, acknowledged }) => !restored || !acknowledged)) return;
+    const held = input !== "neutral" && input !== "invalid";
+    const continuing = sampleInput === input && snapshot.runtime.motion_permission === "Armed";
+    const permission = input === "neutral" ? "Arming" : held && (neutralObserved || continuing) ? "Armed" : "Disarmed";
+    sampleInput = input;
+    neutralObserved = input === "neutral";
+    snapshot = { ...snapshot, runtime: { ...snapshot.runtime, motion_permission: permission } };
+    workspace.publish("readiness_changed");
   }
 
   function advanceGeneration() {
@@ -1001,19 +1017,9 @@ export function createFixtureTransport({
         searchSaves.finish(commit);
       },
       readInput: () => sampleInput,
-      input(mode: StartRequest["control_mode"], input: SearchInput) {
-        workspace.checkDeadline();
-        if (snapshot.active_session?.control_mode !== mode || snapshot.runtime.effective_session_state !== "Searching" ||
-            snapshot.lease.owner_client_id !== bootstrap.client_id || !workspace.observations().displayed ||
-            storageBlocked() || snapshot.pending_candidate ||
-            snapshot.failures.some(({ restored, acknowledged }) => !restored || !acknowledged)) return;
-        const held = input !== "neutral" && input !== "invalid";
-        const continuing = sampleInput === input && snapshot.runtime.motion_permission === "Armed";
-        const permission = input === "neutral" ? "Arming" : held && (neutralObserved || continuing) ? "Armed" : "Disarmed";
-        sampleInput = input;
-        neutralObserved = input === "neutral";
-        snapshot = { ...snapshot, runtime: { ...snapshot.runtime, motion_permission: permission } };
-        workspace.publish("readiness_changed");
+      input: applyInput,
+      fingers(observation: FingerObservation, stable = true) {
+        applyInput("Gestures", inputForFingers(observation, stable));
       },
       activateSearch(state: "Searching" | "Paused") {
         const result = objectRead(sampleObject.id);

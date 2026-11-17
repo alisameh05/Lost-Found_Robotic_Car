@@ -135,9 +135,11 @@ test("shows the actual active mode and keeps Emergency Stop keyboard-operable fr
 
   await page.getByRole("link", { name: "Open Control Guide" }).click();
   const gestures = page.getByRole("region", { name: "Gesture directions and stop" });
-  await expect(gestures).toContainText(/mirrored webcam view.*up for forward, down for backward, left for left, or right for right/);
-  await expect(gestures).toContainText("closed fist, no hand, multiple hands, or ambiguous or invalid pointing");
-  await expect(gestures).toContainText("Release the pointing gesture to stop.");
+  await expect(gestures).toContainText("1 finger for forward, 2 fingers for backward, 3 fingers for left, or 4 fingers for right");
+  await expect(gestures).toContainText("0 fingers (a closed fist) for neutral / stop");
+  await expect(gestures).toContainText("Five fingers, no hand, multiple hands, or uncertain recognition stop ordinary movement");
+  await expect(gestures).toContainText("Changing the gesture stops the previous movement while the new input is validated");
+  await expect(gestures).toContainText("an unsupported or lost gesture cannot satisfy neutral");
   const controller = page.getByRole("region", { name: "PS4 controller" });
   await expect(controller).toContainText("up for forward, down for backward, left for left, or right for right");
   await expect(controller).toContainText("Release the D-pad to stop. Conflicting directions also stop ordinary movement.");
