@@ -4,7 +4,7 @@ status: approved
 version: "1.1"
 created: 2026-11-13
 updated: 2026-11-17
-implementation_status: "Phases 01–03 complete at fixture boundary; phases 04–08 planned"
+implementation_status: "Phases 01–03 complete at fixture boundary; Phase 04 feasibility measured; records and phases 05–08 pending"
 sources: [PRD.md, ARCHITECTURE.md, TRD.md, API.md, design-brief.md]
 ---
 
@@ -36,6 +36,8 @@ Three weeks at 3–4 hours daily provides **63–84 hours**. This plan allocates
 
 These are the original allocations, not actual hours spent or a renewed completion promise. Phases 04–08 retain an initial **51-hour** allocation; reforecast after Phase 04's license, compatibility and visual-prompt experiments. Source reuse does not remove safety, persistence, integration or qualification work. Conservative reuse estimates and their uncertainty are in TRD section 2.1.
 
+The [2026-11-17 measured feasibility report](../experiments/vision/BENCHMARK.md) records successful local CUDA visual prompting with both approved checkpoints and MediaPipe task processing, with Small provisionally preferred for the observed sample. Its low-confidence remaining-work reforecast is **52–80 focused hours**, excluding the completed experiment and external waiting. The original allocations below remain historical; records implementation, simultaneous workloads, devices and product qualification remain open.
+
 That requires averaging approximately **3.6 hours daily**. The schedule is ambitious, particularly for GPU compatibility and firmware integration; these are working allocations, not measured completion estimates. At three hours daily, the planned workload exceeds available time by approximately twelve hours.
 
 ## 2. Phases and schedule
@@ -47,7 +49,7 @@ As of 2026-11-17, Alisa reports phases **01–03 complete**, consistent with the
 | 01 | Frontend foundation and contract fixtures | 1–2 | — | Application shell, shared components, typed fixture transport | 7 h | Complete: fixtures |
 | 02 | Registration, records, and supporting screens | 3–5 | 01 | Nine functional screen surfaces, including both registration steps | 10 h | Complete: fixtures |
 | 03 | Search setup, workspace, and results | 6–7 | 02 | Complete frontend journey and operational states | 7 h | Complete: fixtures |
-| 04 | Backend foundation, storage, and records API | 8–10 | 03 | Local FastAPI service, durable records/media, history, retention | 11 h | Planned |
+| 04 | Backend foundation, storage, and records API | 8–10 | 03 | Local FastAPI service, durable records/media, history, retention | 11 h | Feasibility measured; records pending |
 | 05 | Session orchestration, realtime transport, and recovery | 11–13 | 04 | Authoritative search lifecycle and safety behavior using simulated devices | 11 h | Planned |
 | 06 | Local AI, computer vision, and operator inputs | 14–16 | 05 | YOLOE matching, finger-count gestures, PS4 input, candidate continuity | 11 h | Planned |
 | 07 | Device adapters, firmware, and connected integration | 17–19 | 06 | Compatible Uno/ESP32 software, real video/control, proximity telemetry | 11 h | Planned |
