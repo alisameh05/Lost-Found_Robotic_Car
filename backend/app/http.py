@@ -24,10 +24,16 @@ APP_HEADERS = ("content-type", "x-app-capability", "x-app-client-id", "x-action-
 RECORDS_ROUTES = {
     "/bootstrap": ("GET",), "/health": ("GET",), "/snapshot": ("GET",),
     "/objects": ("GET", "POST"), "/objects/{id}": ("GET",),
+    "/objects/{id}/sessions": ("GET",), "/sessions/{id}": ("GET",), "/sessions/{id}/matches": ("GET",),
     "/media/{id}": ("GET",), "/settings": ("GET",),
 }
-CLIENT_ROUTES = frozenset({"/snapshot", "/objects"})
-OBJECT_QUERY = frozenset({"name", "status", "cursor", "limit"})
+PAGE_QUERY = frozenset({"cursor", "limit"})
+LIST_QUERIES = {
+    "/objects": PAGE_QUERY | {"name", "status"},
+    "/objects/{id}/sessions": PAGE_QUERY,
+    "/sessions/{id}/matches": PAGE_QUERY,
+}
+CLIENT_ROUTES = frozenset(LIST_QUERIES) | {"/snapshot"}
 DOMAIN_ID = r"[A-Za-z0-9_-]{1,128}"
 
 
@@ -60,9 +66,9 @@ def route_path(request: Request) -> str:
     if full_path != path:
         if path in RECORDS_ROUTES:
             return path
-        for resource in ("objects", "media"):
-            if re.fullmatch(rf"/{resource}/{DOMAIN_ID}", path):
-                return f"/{resource}/{{id}}"
+        for route in RECORDS_ROUTES:
+            if "{id}" in route and re.fullmatch(route.replace("{id}", DOMAIN_ID), path):
+                return route
     return ""
 
 

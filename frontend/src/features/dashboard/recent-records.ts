@@ -7,22 +7,21 @@ import type { Object as ObjectRecord } from "@/generated/api-v1";
 const objectLimit = 3;
 const sessionLimit = 3;
 const objectQuery = { query: { limit: objectLimit } };
-function useRecentSessionPage(owner: ObjectRecord | undefined, enabled: boolean) {
+function useRecentSessionPage(owner: ObjectRecord | undefined) {
   const id = owner?.id;
   const params = useMemo(() => ({ id: id ?? "", query: { limit: sessionLimit } }), [id]);
-  return useProtectedRead("GET /objects/{id}/sessions", params, enabled && !!owner).result;
+  return useProtectedRead("GET /objects/{id}/sessions", params, !!owner).result;
 }
 
 export function useRecentRecords() {
-  const { recordSnapshot, recordsMode } = useRuntimeView();
+  const { recordSnapshot } = useRuntimeView();
   const catalogue = useProtectedRead("GET /objects", objectQuery);
   // Suppress the previous scope while its replacement is being read.
   const objectPage = catalogue.result?.kind === "ok" && catalogue.snapshotAtRead !== recordSnapshot ? undefined : catalogue.result;
   const recentObjects = objectPage?.kind === "ok" ? objectPage.data.items.slice(0, objectLimit) : [];
   const eligible = useEligibleObjects(recentObjects, catalogue.snapshotAtRead, catalogue.retry);
   const [first, second, third] = eligible;
-  const histories = [useRecentSessionPage(first, !recordsMode), useRecentSessionPage(second, !recordsMode),
-    useRecentSessionPage(third, !recordsMode)];
+  const histories = [useRecentSessionPage(first), useRecentSessionPage(second), useRecentSessionPage(third)];
   const owners = eligible.map((owner, index) => ({ owner, history: histories[index] }));
   const visible = owners.filter(({ history }) => !recordAbsence(history));
   const sessions = visible.flatMap(({ owner, history }) => history?.kind === "ok"

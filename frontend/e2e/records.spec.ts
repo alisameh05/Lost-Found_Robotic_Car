@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -92,11 +92,15 @@ function observe(page: Page) {
   return { requests, sockets };
 }
 
-async function seedLibrary(items: readonly (readonly [string, string, "Lost" | "Found", number])[], referenceIds: string[] = []) {
+async function waitForStorage() {
   const bootstrap = await fetch(`${backend}/bootstrap`, { headers: { Origin: frontend } });
   const { capability } = await bootstrap.json();
   await expect.poll(async () =>
     (await fetch(`${backend}/health`, { headers: { "X-App-Capability": capability } })).status).toBe(200);
+}
+
+async function seedLibrary(items: readonly (readonly [string, string, "Lost" | "Found", number])[], referenceIds: string[] = []) {
+  await waitForStorage();
   execFileSync(python, [
     "-c", [
       "from io import BytesIO", "import json, sys", "from pathlib import Path", "from PIL import Image",
@@ -131,7 +135,7 @@ test("opens connected empty records and read-only settings with one page identit
   const { requests, sockets } = observe(page);
   await page.goto("/");
   await expect(page.getByText("Records connected · Search unavailable")).toBeVisible();
-  await expect(page.getByText("Search history unavailable", { exact: true })).toBeVisible();
+  await expect(page.getByText("No sessions for recent objects", { exact: true })).toBeVisible();
   await expect(page.getByText(/Fixture mode|Fixture scenario|Sample device observations/)).toHaveCount(0);
   await page.getByRole("link", { name: "Objects / History" }).click();
   await expect(page.getByRole("heading", { name: "No objects registered" })).toBeVisible();
@@ -232,10 +236,10 @@ test("finds and pages real registrations, opens protected references and uses Da
   const recent = page.getByRole("list", { name: "Recent registrations" });
   await expect(recent.getByRole("listitem")).toHaveCount(3);
   await expect(recent.getByRole("link").first()).toHaveAttribute("href", "/objects/a");
-  await expect(page.getByText("Search history unavailable", { exact: true })).toBeVisible();
+  await expect(page.getByText("No sessions for recent objects", { exact: true })).toBeVisible();
   await expect(page.getByText("Search unavailable", { exact: true })).toBeVisible();
   await recent.getByRole("link").first().click();
-  await expect(page.getByRole("region", { name: "Object record" }).getByRole("heading")).toHaveText("Straße%_  Café Ᲊ");
+  await expect(page.getByRole("region", { name: "Object record" }).getByRole("heading", { level: 2 })).toHaveText("Straße%_  Café Ᲊ");
   await page.getByRole("link", { name: "Back to Objects" }).click();
   await expect(objectRows(page)).toHaveCount(25);
   await expect(objectRows(page).first().getByRole("link")).toHaveAttribute("href", "/objects/a");
@@ -276,7 +280,125 @@ test("finds and pages real registrations, opens protected references and uses Da
   await field.fill("🧭".repeat(121));
   await expect(page.getByText(/Enter no more than 120 characters/)).toBeVisible();
   expect(requests.filter((request) => request === "GET /api/v1/bootstrap")).toHaveLength(1);
-  expect(requests.some((request) => /\/sessions|\/control-lease/.test(request))).toBe(false);
+  expect(requests).toContain("GET /api/v1/objects/a/sessions");
+  expect(requests.some((request) => /\/control-lease|^POST .*\/sessions/.test(request))).toBe(false);
+});
+
+function seedStoredHistory(now: number, interrupted = false) {
+  execFileSync(python, [
+    "-c", [
+      "import sys", "from pathlib import Path",
+      "from backend.tests.test_session_history import seed_history, seed_interrupted",
+      "root, now = Path(sys.argv[1]), int(sys.argv[2])",
+      "seed_history(root, now)",
+      "if sys.argv[3] == 'true': seed_interrupted(root, now)",
+    ].join("\n"),
+    join(parent, "records"), String(now), String(interrupted),
+  ], { cwd: repo, windowsHide: true });
+}
+
+test("composes saved history offline and inspects the exact captured PNG with the keyboard", async ({ page }) => {
+  test.setTimeout(60_000);
+  await startBackend();
+  await waitForStorage();
+  const now = Date.now() - 1_000;
+  seedStoredHistory(now);
+  await loopbackOnly(page);
+  const { requests, sockets } = observe(page);
+  await page.goto("/");
+  const sessions = page.getByRole("list", { name: "Recent session records" });
+  await expect(sessions.getByRole("link").first()).toHaveAttribute("href", "/sessions/session-other");
+  await sessions.getByRole("link").filter({ hasText: "Ended · Found" }).click();
+  await expect(page.getByRole("heading", { name: "Session Details" })).toBeVisible();
+  const record = page.getByRole("region", { name: "Session record" });
+  await expect(record).toContainText("Gestures");
+  await expect(record).toContainText("Match confirmed");
+  await expect(record.locator("time").last()).toHaveAttribute("datetime", new Date(now - 29_000).toISOString());
+  const matches = page.getByRole("region", { name: "Captured matches" });
+  const captured = matches.getByRole("img", { name: "Captured evidence", exact: true });
+  await expect(captured).toHaveAttribute("src", /^blob:/);
+  expect(await captured.evaluate(async (element: HTMLImageElement) => {
+    await element.decode();
+    const canvas = document.createElement("canvas");
+    canvas.width = element.naturalWidth;
+    canvas.height = element.naturalHeight;
+    const context = canvas.getContext("2d")!;
+    context.drawImage(element, 0, 0);
+    return { size: [canvas.width, canvas.height], corner: Array.from(context.getImageData(79, 39, 1, 1).data) };
+  })).toEqual({ size: [80, 40], corner: [251, 37, 59, 255] });
+  const box = matches.locator("img + span");
+  await expect(box).toHaveCSS("position", "absolute");
+  expect(await box.evaluate(({ style }: HTMLElement) =>
+    [style.left, style.top, style.width, style.height])).toEqual(["12.5%", "20%", "37.5%", "40%"]);
+  const inspect = matches.getByRole("button", { name: "Inspect evidence" });
+  await inspect.focus();
+  await page.keyboard.press("Enter");
+  await expect(matches.getByRole("region", { name: "Enlarged captured evidence" })).toBeFocused();
+  await expect(matches.getByRole("button", { name: "Close inspection" })).toHaveAttribute("aria-expanded", "true");
+  const oldUrl = await captured.getAttribute("src");
+
+  const diskCapture = join(parent, "records", "media", "evidence-match-confirmed.png");
+  unlinkSync(diskCapture);
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(matches.getByText("Media missing", { exact: true })).toBeVisible();
+  await expect(captured).toHaveCount(0);
+  expect(await page.evaluate(async (url) => {
+    try { await fetch(url!); return true; } catch { return false; }
+  }, oldUrl)).toBe(false);
+  writeFileSync(diskCapture, "damaged test capture");
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(matches.getByText("Media corrupt", { exact: true })).toBeVisible();
+  await expect(record).toContainText("Match confirmed");
+
+  await page.getByRole("link", { name: "View Object", exact: true }).click();
+  await expect(page.getByRole("region", { name: "Object record" })).toContainText("History test · Wallet");
+  await expect(page.getByRole("region", { name: "Confirmed evidence" }).getByText("Media corrupt")).toBeVisible();
+  const history = page.getByRole("region", { name: "Search sessions" });
+  await expect(history.getByRole("link")).toHaveCount(3);
+  await expect(history.getByRole("link").nth(1)).toHaveAttribute("href", "/sessions/session-a");
+  await history.getByRole("link").nth(1).click();
+  await expect(matches.getByText("Rejected", { exact: true })).toBeVisible();
+  await expect(matches.getByText("Not reviewed", { exact: true })).toBeVisible();
+  await expect(matches.getByText("Reviewed", { exact: true })).toHaveCount(1);
+  await page.getByRole("link", { name: "View Search Result" }).click();
+  await expect(page.getByRole("heading", { name: "Search ended without confirmation" })).toBeVisible();
+  await expect(page.getByText("This session ended before the object's later confirmation.")).toBeVisible();
+  await expect(page.getByRole("button", { name: /Resume|Confirm Match|Reject Match/ })).toHaveCount(0);
+  expect(requests.filter((request) => request.startsWith("POST"))).toEqual([]);
+  expect(sockets).toEqual([]);
+});
+
+test("recovers interrupted history after a process restart and revokes the capture on expiry", async ({ page }) => {
+  test.setTimeout(60_000);
+  const offset = join(parent, "clock-offset");
+  writeFileSync(offset, "0");
+  await startBackend();
+  await waitForStorage();
+  await stopBackend();
+  seedStoredHistory(Date.now() - 1_000, true);
+  await startBackend({ clockOffset: offset });
+  await loopbackOnly(page);
+  await page.goto("/sessions/session-interrupted");
+  const record = page.getByRole("region", { name: "Session record" });
+  await expect(record).toContainText("Interrupted");
+  const matches = page.getByRole("region", { name: "Captured matches" });
+  await expect(matches.getByText("Not reviewed", { exact: true })).toBeVisible();
+  await expect(matches.getByText("Reviewed", { exact: true })).toHaveCount(0);
+  const image = matches.getByRole("img", { name: "Captured evidence", exact: true });
+  await expect(image).toHaveAttribute("src", /^blob:/);
+  const objectUrl = await image.getAttribute("src");
+  expect(existsSync(join(parent, "records", "staging", "a".repeat(32) + ".part"))).toBe(false);
+  expect(existsSync(join(parent, "records", "media", "a".repeat(32) + ".png"))).toBe(false);
+  const expiry = page.waitForResponse((response) =>
+    response.url() === `${backend}/sessions/session-interrupted` && response.status() === 410);
+  writeFileSync(offset, String(7 * 86_400_000));
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  expect(await (await expiry).json()).toMatchObject({ code: "EXPIRED" });
+  await expect(page.getByText("Session expired", { exact: true })).toBeVisible();
+  await expect(image).toHaveCount(0);
+  expect(await page.evaluate(async (url) => {
+    try { await fetch(url!); return true; } catch { return false; }
+  }, objectUrl)).toBe(false);
 });
 
 test("discards overtaken search reads, resets an expired cursor and restarts with a new authority", async ({ page }) => {

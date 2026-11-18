@@ -1,5 +1,4 @@
 import asyncio
-import re
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
@@ -12,7 +11,7 @@ from .http import (
     API_PREFIX,
     CLIENT_ROUTES,
     HEADER_LIMIT,
-    OBJECT_QUERY,
+    LIST_QUERIES,
     RECORDS_ROUTES,
     HttpError,
     authorize_address,
@@ -27,12 +26,12 @@ from .http import (
 )
 from .owner import own_data_root
 from .registration_input import NAME_LIMIT, normalize_name, parse_registration
-from .runtime import ObjectPageError, RecordsRuntime
+from .runtime import PageError, RecordsRuntime
 from .storage import RecordsStorage, storage_unavailable
 
-OBJECT_PAGE_ERRORS = {
-    "cursor_expired": (400, "CURSOR_EXPIRED", "Refresh the first page of objects.", False),
-    "scope_mismatch": (400, "CURSOR_INVALID", "Use the original page filters.", False),
+PAGE_ERRORS = {
+    "cursor_expired": (400, "CURSOR_EXPIRED", "Refresh the first page.", False),
+    "scope_mismatch": (400, "CURSOR_INVALID", "Refresh the first page or use the original page context.", False),
     "capacity": (503, "CAPACITY_REACHED", "Page capacity reached. Retry after pending reads complete.", True),
     "client_expired": (403, "CLIENT_INVALID", "Reconnect to obtain a current page identity.", False),
 }
@@ -45,6 +44,9 @@ def validate_objects_query(query: dict[str, str]) -> None:
     query["name"] = name
     if "status" in query and query["status"] not in ("Lost", "Found"):
         raise invalid_query("INVALID_VALUE", "/query/status")
+
+
+def validate_page_limit(query: dict[str, str]) -> None:
     if "limit" in query:
         limit = query["limit"]
         if not limit.isascii() or not limit.isdecimal():
@@ -53,8 +55,6 @@ def validate_objects_query(query: dict[str, str]) -> None:
         if not significant or len(significant) > 3 or int(significant) > 100:
             raise invalid_query("OUT_OF_RANGE", "/query/limit")
         query["limit"] = significant
-    if "cursor" in query and not re.fullmatch(r"[A-Za-z0-9_-]{43}", query["cursor"]):
-        raise HttpError(400, "CURSOR_INVALID", "Refresh the first page of objects.")
 
 
 def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStorage | None = None) -> FastAPI:
@@ -90,8 +90,8 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
             authorize_address(request, config, options or path == "/bootstrap")
             origin_authorized = request.headers.get("origin") == config.origin
             if options:
-                parse_query(request.scope["query_string"], OBJECT_QUERY if path == "/objects"
-                            and request.headers.get("access-control-request-method") == "GET" else ())
+                allowed = LIST_QUERIES.get(path, ()) if request.headers.get("access-control-request-method") == "GET" else ()
+                parse_query(request.scope["query_string"], allowed)
                 await require_empty_body(request)
                 response = preflight(request, path)
             else:
@@ -105,13 +105,15 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
                     header(request, "x-app-client-id", 403, "CLIENT_INVALID")
                 if not registering and path != "/bootstrap":
                     authorize_client(request, runtime, required=path in CLIENT_ROUTES)
-                list_objects = path == "/objects" and not registering
-                query = parse_query(request.scope["query_string"], OBJECT_QUERY if list_objects else ())
+                allowed = LIST_QUERIES.get(path, ()) if not registering else ()
+                query = parse_query(request.scope["query_string"], allowed)
                 if not registering:
                     await require_empty_body(request)
-                if list_objects:
+                if path == "/objects" and not registering:
                     validate_objects_query(query)
-                    request.state.objects_query = query
+                if allowed:
+                    validate_page_limit(query)
+                    request.state.page_query = query
                 response = await next_route(request)
         except HttpError as exc:
             response = exc.response()
@@ -146,13 +148,18 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
         return JSONResponse(runtime.health(storage), status_code=200 if storage and not storage.problem else 503)
 
     @app.get(API_PREFIX + "/objects")
-    async def objects(request: Request) -> JSONResponse:
+    @app.get(API_PREFIX + "/objects/{id}/sessions")
+    @app.get(API_PREFIX + "/sessions/{id}/matches")
+    async def records_page(request: Request) -> JSONResponse:
         runtime: RecordsRuntime = request.app.state.runtime
         runtime.check_started()
         try:
-            page = await runtime.objects(request.headers["x-app-client-id"], request.state.objects_query)
-        except ObjectPageError as error:
-            raise HttpError(*OBJECT_PAGE_ERRORS[error.reason]) from error
+            page = await runtime.page(
+                route_path(request), request.headers["x-app-client-id"],
+                request.state.page_query, request.path_params.get("id"),
+            )
+        except PageError as error:
+            raise HttpError(*PAGE_ERRORS[error.reason]) from error
         return JSONResponse(page)
 
     @app.post(API_PREFIX + "/objects")
@@ -168,6 +175,12 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
         runtime: RecordsRuntime = request.app.state.runtime
         runtime.check_started()
         return JSONResponse(await asyncio.to_thread(runtime.storage.read_object, id, runtime.preparing()))
+
+    @app.get(API_PREFIX + "/sessions/{id}")
+    async def session_details(request: Request, id: str) -> JSONResponse:
+        runtime: RecordsRuntime = request.app.state.runtime
+        runtime.check_started()
+        return JSONResponse(await asyncio.to_thread(runtime.storage.read_session, id, runtime.preparing()))
 
     @app.get(API_PREFIX + "/media/{id}")
     async def protected_media(request: Request, id: str) -> Response:

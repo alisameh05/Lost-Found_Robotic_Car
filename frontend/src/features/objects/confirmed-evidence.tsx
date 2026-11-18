@@ -54,7 +54,7 @@ export function ConfirmedEvidence({ objectId }: { objectId: string }) {
     if (!session.data) return found(null);
     return readConfirmedMatch(runtime, signal, session.data.id, objectId);
   }, [objectId]);
-  const { result, retry } = useApplicationRead(load, true, true);
+  const { result, retry } = useApplicationRead(load, true, true, true);
   return <section className={styles.confirmedEvidence} aria-label="Confirmed evidence">
     <h3>Confirmed evidence</h3>
     {!result ? <LoadingState label="Loading confirmation evidence" />
@@ -77,5 +77,5 @@ function readConfirmedMatch(runtime: RuntimeProjection, signal: AbortSignal, ses
 export function useConfirmedMatch(sessionId: string, objectId?: string) {
   const load = useCallback((runtime: RuntimeProjection, signal: AbortSignal) =>
     objectId ? readConfirmedMatch(runtime, signal, sessionId, objectId) : Promise.resolve(found(null)), [objectId, sessionId]);
-  return useApplicationRead(load, Boolean(objectId), true);
+  return useApplicationRead(load, Boolean(objectId), true, true);
 }

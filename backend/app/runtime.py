@@ -1,5 +1,6 @@
 import asyncio
 import json
+import re
 import sqlite3
 from collections import OrderedDict
 from collections.abc import Callable, Collection
@@ -12,6 +13,7 @@ from .http import HttpError
 from .reference_image import Reference, prepare_reference
 from .registration_input import SAFE_INTEGER, Registration, canonical_json
 from .storage import (
+    HistoryKind,
     IncompatibleStorage,
     Inspection,
     Receipt,
@@ -40,10 +42,8 @@ class CursorScope:
     name: str
     status: str
     limit: int
-    # This registry only accepts v1 object pages without a parent.
-    route: str = "/api/v1/objects"
-    parent: str | None = None
-    order: str = "registered_at_ms DESC, id COLLATE BINARY DESC"
+    route: str
+    parent: str | None
 
 
 @dataclass
@@ -54,7 +54,7 @@ class Cursor:
     readers: int = 0
 
 
-class ObjectPageError(Exception):
+class PageError(Exception):
     def __init__(self, reason: Literal["cursor_expired", "scope_mismatch", "capacity", "client_expired"]):
         super().__init__(reason)
         self.reason = reason
@@ -151,31 +151,47 @@ class RecordsRuntime:
     def preparing(self) -> tuple[str, ...]:
         return tuple(self._pending)
 
-    async def objects(self, client: str, query: dict[str, str]) -> dict[str, object]:
-        scope = CursorScope(self.boot_id, client, casefold(query["name"]), query.get("status", ""),
-                            int(query.get("limit", "25")))
-        token = query.get("cursor")
-        self.prune_cursors(monotonic())
-        before = (SAFE_INTEGER + 1, "")
-        cursor = None
-        if token is not None:
-            cursor = self._cursors.get(token)
-            if cursor is None:
-                raise ObjectPageError("cursor_expired")
-            if cursor.scope != scope:
-                raise ObjectPageError("scope_mismatch")
-            self._cursors.move_to_end(token)
-            cursor.readers += 1
-            before = cursor.before
+    async def page(self, route: str, client: str, query: dict[str, str], parent: str | None) -> dict[str, object]:
+        scope = CursorScope(self.boot_id, client, casefold(query.get("name", "")), query.get("status", ""),
+                            int(query.get("limit", "25")), route, parent)
+        history: HistoryKind = "sessions" if route == "/objects/{id}/sessions" else "matches"
         try:
-            items, boundary = await asyncio.to_thread(
-                self.storage.read_objects, scope.name, scope.status, scope.limit, before, self.preparing(),
-            )
+            cursor = self.resolve_cursor(scope, query.get("cursor"))
+        except PageError:
+            if parent is not None:
+                await asyncio.to_thread(self.storage.check_history_parent, parent, history)
+            raise
+        before = cursor.before if cursor else (SAFE_INTEGER + 1, "")
+        if cursor is not None:
+            cursor.readers += 1
+        try:
+            if parent is None:
+                items, boundary = await asyncio.to_thread(
+                    self.storage.read_objects, scope.name, scope.status, scope.limit, before, self.preparing(),
+                )
+            else:
+                items, boundary = await asyncio.to_thread(
+                    self.storage.read_history, parent, history, scope.limit, before, self.preparing(),
+                )
         finally:
             if cursor is not None:
                 cursor.readers -= 1
         next_cursor = self.issue_cursor(scope, boundary) if boundary else None
         return {"items": items, "next_cursor": next_cursor}
+
+    def resolve_cursor(self, scope: CursorScope, token: str | None) -> Cursor | None:
+        self.prune_cursors(monotonic())
+        if token is None:
+            return None
+        if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
+            raise PageError("scope_mismatch")
+        cursor = self._cursors.get(token)
+        if cursor is None:
+            raise PageError("cursor_expired")
+        if cursor.scope != scope:
+            raise PageError("scope_mismatch")
+        self._cursors.move_to_end(token)
+        return cursor
 
     def prune_cursors(self, now: float) -> None:
         for token, cursor in tuple(self._cursors.items()):
@@ -187,7 +203,7 @@ class RecordsRuntime:
         self._expire_clients(now)
         self.prune_cursors(now)
         if scope.client not in self._clients:
-            raise ObjectPageError("client_expired")
+            raise PageError("client_expired")
         owned = [token for token, cursor in self._cursors.items() if cursor.scope.client == scope.client]
         # Polling and going back to a still-current page preserve its existing token and deadline.
         for token in owned:
@@ -208,7 +224,7 @@ class RecordsRuntime:
             if not self._cursors[token].readers:
                 del self._cursors[token]
                 return
-        raise ObjectPageError("capacity")
+        raise PageError("capacity")
 
     async def register(self, registration: Registration, authorize: Callable[[], None]) -> Receipt:
         try:

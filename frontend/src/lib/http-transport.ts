@@ -6,6 +6,9 @@ const responses = {
   "GET /health": "Health",
   "GET /objects": "ObjectPage",
   "GET /objects/{id}": "Object",
+  "GET /objects/{id}/sessions": "SessionPage",
+  "GET /sessions/{id}": "Session",
+  "GET /sessions/{id}/matches": "MatchPage",
   "GET /settings": "Settings",
   "GET /snapshot": "Snapshot",
 } as const satisfies Partial<Record<Endpoint, Definition>>;
