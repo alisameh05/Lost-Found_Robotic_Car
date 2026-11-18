@@ -22,10 +22,10 @@ export function RetentionSettingsScreen() {
 
 function SettingsEditor() {
   const state = useRetention();
-  const { recordsMode, recordSnapshot } = useRuntimeView();
+  const { recordSnapshot } = useRuntimeView();
   const refresh = useRefreshRuntime();
   const { read, blocked, active, ready, reviewing, busy, held } = state;
-  const saved = state.saved ?? (recordsMode ? recordSnapshot?.retention.settings : undefined);
+  const saved = state.saved ?? recordSnapshot?.retention.settings;
   const confirmationTitle = useId();
   const confirmationDescription = useId();
   const review = useRef<HTMLButtonElement>(null);
@@ -42,16 +42,6 @@ function SettingsEditor() {
     }
     previousReview.current = reviewing;
   }, [blocked, held, ready, reviewing]);
-
-  if (recordsMode && saved) return <div className={support.page}>
-    <PageHeader title="Settings" description="View how long registered objects and evidence are kept." />
-    <section aria-label="Saved retention" className={styles.policy}>
-      <h2>Current saved retention</h2>
-      <p className={styles.saved}>{count(saved.retention_days, "day")}</p>
-      <p>Retention starts at the original registration time. Changes are unavailable in this build.</p>
-    </section>
-    <Deletion status={recordSnapshot?.retention.deletion} />
-  </div>;
 
   return <div className={support.page}>
     <PageHeader title="Settings" description="Manage how long registered objects and their evidence are kept." />

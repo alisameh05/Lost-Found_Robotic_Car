@@ -34,7 +34,7 @@ npm.cmd run build
 npm.cmd start
 ```
 
-Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Dashboard and Objects show an empty history on first use. Register Object saves a JPEG or PNG reference and selected rectangle to a new Lost record. Settings shows the saved seven-day retention period. Devices shows the records service and unqualified search paths. Shutdown uses Ctrl+C in each terminal. Running the installed application uses local assets and loopback HTTP.
+Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Dashboard and Objects show an empty history on first use. Register Object saves a JPEG or PNG reference and selected rectangle to a new Lost record. Settings starts at seven days and previews the immediate impact before you confirm a change. Devices shows the records service and unqualified search paths. Shutdown uses Ctrl+C in each terminal. Running the installed application uses local assets and loopback HTTP.
 
 | Environment variable | Default | Where to set it |
 | --- | --- | --- |
@@ -49,7 +49,7 @@ The backend checks expiry at startup and in the running service. Expiry uses the
 
 Settings, Devices and Object Details report cleanup progress. A cleanup fault keeps expired records inaccessible and blocks new registration. The backend retries cleanup after managed storage is repaired and resumes incomplete work on restart. Health stays available with the current capability. If a save response is interrupted, use Retry Same Request to recover the result.
 
-Object Details links to saved sessions and their captured matches. Startup ends unfinished sessions as Interrupted and keeps durable pending captures as Not reviewed. Missing or corrupt evidence leaves the saved outcome intact. Fresh installations have empty histories. Retention edits, events and search controls have later implementation slices.
+Object Details links to saved sessions and their captured matches. Startup ends unfinished sessions as Interrupted and keeps durable pending captures as Not reviewed. Missing or corrupt evidence leaves the saved outcome intact. Fresh installations have empty histories. Records views revalidate over HTTP on focus, reconnect and visible-tab polling. Ordered events and live search controls follow in later phases.
 
 ## Verify
 

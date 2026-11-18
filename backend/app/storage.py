@@ -14,7 +14,8 @@ from uuid import uuid4
 from .http import HttpError
 from .managed_media import GENERATED_ID, STAGING_NAME, ManagedMedia, sync_directory
 from .reference_image import Reference
-from .registration_input import Registration, canonical_json
+from .registration_input import SAFE_INTEGER, Registration, canonical_json
+from .retention_input import RetentionChange, RetentionProposal
 from .unicode_search import casefold
 
 DAY_MS = 86_400_000
@@ -54,10 +55,18 @@ class Inspection:
     remaining_objects: int = 0
     remaining_files: int = 0
     recovery_pending: bool = False
+    active_session_state: str | None = None
 
     @property
     def cleanup_pending(self) -> bool:
         return self.deletion_status != "Complete"
+
+    def deletion(self) -> dict[str, object]:
+        return {
+            "status": self.deletion_status, "remaining_objects": self.remaining_objects,
+            "remaining_files": self.remaining_files,
+            "error_code": "STORAGE_UNAVAILABLE" if self.deletion_status == "Failed" else None,
+        }
 
 
 class IncompatibleStorage(Exception):
@@ -73,6 +82,24 @@ class Receipt:
     body: str
     status: int
     location: str | None
+
+
+@dataclass(frozen=True)
+class RetentionImpact:
+    digest: str
+    counts: dict[str, int]
+
+
+@dataclass(frozen=True)
+class RetentionPreview:
+    client: str
+    proposal: RetentionProposal
+    deadline: float
+    impact: RetentionImpact
+
+
+def preview_stale() -> HttpError:
+    return HttpError(409, "PREVIEW_STALE", "The retention preview is outdated. Preview the current impact again.")
 
 
 def storage_unavailable(message: str = "Records storage is unavailable. Check local storage and retry.") -> HttpError:
@@ -329,23 +356,21 @@ class RecordsStorage:
                 paths.append(f"staging/{media}.part")
         return sorted(paths)
 
-    def journal_expired(self, db: sqlite3.Connection, now: int) -> None:
-        with write_transaction(db):
-            owners = db.execute(f"""
-                SELECT id FROM objects AS o
-                WHERE (o.deletion_pending OR {EXPIRED})
-                  AND NOT EXISTS (SELECT 1 FROM storage_operations
-                                  WHERE kind = 'Purge' AND owner_object_id = o.id)
-            """, (self.cutoff(db, now),)).fetchall()
-            if owners:
-                self.checkpoint("purge_before_journal")
-            for owner, in owners:
-                db.execute("UPDATE objects SET deletion_pending = 1 WHERE id = ?", (owner,))
-                db.execute("""
-                    INSERT INTO storage_operations VALUES (?, 'Purge', ?, ?, 'Pending', ?, NULL)
-                """, (uuid4().hex, owner, canonical_json(self.owned_paths(db, owner)), now))
+    def journal_expired(self, db: sqlite3.Connection, now: int) -> bool:
+        owners = db.execute(f"""
+            SELECT id FROM objects AS o
+            WHERE (o.deletion_pending OR {EXPIRED})
+              AND NOT EXISTS (SELECT 1 FROM storage_operations
+                              WHERE kind = 'Purge' AND owner_object_id = o.id)
+        """, (self.cutoff(db, now),)).fetchall()
         if owners:
-            self.checkpoint("purge_journaled")
+            self.checkpoint("purge_before_journal")
+        for owner, in owners:
+            db.execute("UPDATE objects SET deletion_pending = 1 WHERE id = ?", (owner,))
+            db.execute("""
+                INSERT INTO storage_operations VALUES (?, 'Purge', ?, ?, 'Pending', ?, NULL)
+            """, (uuid4().hex, owner, canonical_json(self.owned_paths(db, owner)), now))
+        return bool(owners)
 
     def purge_owner(self, db: sqlite3.Connection, operation: str, owner: str | None, encoded_paths: str) -> None:
         paths = json.loads(encoded_paths)
@@ -390,7 +415,10 @@ class RecordsStorage:
                 except (OSError, sqlite3.Error):
                     return  # Preparation recovery must finish before purging owners.
                 self._repair_needed = False
-            self.journal_expired(db, now)
+            with write_transaction(db):
+                journaled = self.journal_expired(db, now)
+            if journaled:
+                self.checkpoint("purge_journaled")
             for operation, owner, paths in db.execute("""
                 SELECT id, owner_object_id, generated_paths FROM storage_operations WHERE kind = 'Purge'
             """).fetchall():
@@ -439,6 +467,7 @@ class RecordsStorage:
 
     def _inspect(self, db: sqlite3.Connection, now: int, preparing: Collection[str]) -> Inspection:
         settings = self.settings(db)
+        active = self.active_session_state(db)
         owners = db.execute(f"SELECT id FROM objects AS o WHERE {DELETING} OR {EXPIRED}",
                             (now - retention_ms(settings["retention_days"]),)).fetchall()
         journals = db.execute("SELECT generated_paths, phase FROM storage_operations WHERE kind = 'Purge'").fetchall()
@@ -463,10 +492,129 @@ class RecordsStorage:
                     remaining += 1
             failed = self._purge_fault or needs_recovery or any(phase == "Failed" for _, phase in journals)
             return Inspection(settings, CLEANUP_FAILED if failed else CLEANUP_PENDING, "Failed" if failed else "Pending",
-                              len(owners), remaining, needs_recovery)
+                              len(owners), remaining, needs_recovery, active)
         if needs_recovery:
-            return Inspection(settings, RECONCILE_ERROR, recovery_pending=True)
-        return Inspection(settings)
+            return Inspection(settings, RECONCILE_ERROR, recovery_pending=True, active_session_state=active)
+        return Inspection(settings, active_session_state=active)
+
+    @staticmethod
+    def active_session_state(db: sqlite3.Connection) -> str | None:
+        row = db.execute("SELECT state FROM sessions WHERE state IN ('Searching', 'Paused')").fetchone()
+        return str(row[0]) if row else None
+
+    def require_inactive(self, db: sqlite3.Connection) -> None:
+        if self.active_session_state(db):
+            raise HttpError(409, "ACTIVE_SESSION_EXISTS", "End the active search before changing retention.")
+
+    def retention_impact(self, db: sqlite3.Connection, now: int, current: int, proposed: int) -> RetentionImpact:
+        # Keep the preview cache bounded independently of the number of affected records.
+        digest = hashlib.sha256()
+        counts = {"objects": 0, "sessions": 0, "matches": 0, "managed_image_bytes": 0}
+        for row in db.execute(f"""
+            WITH affected AS (
+                SELECT o.id FROM objects AS o WHERE {ELIGIBLE} AND {EXPIRED}
+            )
+            SELECT 'objects' AS kind, id, id, '', 0 FROM affected
+            UNION ALL
+            SELECT 'sessions', s.object_id, s.id, '', 0 FROM sessions AS s JOIN affected AS a ON a.id = s.object_id
+            UNION ALL
+            SELECT 'matches', m.object_id, m.id, m.session_id, 0
+            FROM match_events AS m JOIN affected AS a ON a.id = m.object_id
+            UNION ALL
+            SELECT 'managed_image_bytes', m.object_id, m.id, m.relative_path, m.byte_length
+            FROM media AS m JOIN affected AS a ON a.id = m.object_id
+            ORDER BY 1, 2, 3
+        """, (now - retention_ms(current), now - retention_ms(proposed))):
+            kind, _, _, path, _ = row
+            size = None
+            if kind == "managed_image_bytes":
+                try:
+                    size = self.files.size(path)
+                except OSError as exc:
+                    raise storage_unavailable("The affected managed files could not be inspected.") from exc
+            digest.update(canonical_json([*row, size]).encode() + b"\n")
+            counts[kind] += (size or 0) if kind == "managed_image_bytes" else 1
+        if max(counts.values()) > SAFE_INTEGER:
+            raise HttpError(503, "COUNTER_EXHAUSTED", "The retention impact exceeds the supported count range.")
+        return RetentionImpact(digest.hexdigest(), counts)
+
+    def preview_retention(
+        self, proposal: RetentionProposal, preparing: Collection[str],
+    ) -> tuple[int, float, RetentionImpact]:
+        with self.connect() as db, read_transaction(db):
+            self.require_inactive(db)
+            now, _ = self.now()
+            evaluated_monotonic = self.monotonic()
+            inspection = self._inspect(db, now, preparing)
+            if inspection.problem:
+                raise storage_unavailable(inspection.problem)
+            settings = self.settings(db)
+            if proposal.expected_revision != settings["revision"]:
+                raise HttpError(409, "REVISION_CONFLICT", "The saved retention settings changed. Refresh and preview again.")
+            return now, evaluated_monotonic, self.retention_impact(db, now, settings["retention_days"], proposal.retention_days)
+
+    def save_retention(
+        self, client: str, change: RetentionChange, preview: RetentionPreview, fingerprint: str,
+    ) -> Receipt:
+        with self.mutation_connection() as db, write_transaction(db):
+            self.require_inactive(db)
+            recovered = self.find_receipt(db, change.action_id, fingerprint)
+            if recovered:
+                return recovered
+            now, _ = self.now()
+            settings = self.settings(db)
+            previous_days = settings["retention_days"]
+            proposal = change.proposal
+            if (preview.client != client or preview.proposal != proposal
+                    or proposal.expected_revision != settings["revision"] or self.monotonic() >= preview.deadline):
+                raise preview_stale()
+            inspection = self._inspect(db, now, ())
+            if inspection.problem and inspection.deletion_status != "Pending":
+                raise storage_unavailable(inspection.problem)
+            try:
+                impact = self.retention_impact(db, now, previous_days, proposal.retention_days)
+            except HttpError as exc:
+                if exc.code in ("STORAGE_UNAVAILABLE", "COUNTER_EXHAUSTED"):
+                    raise preview_stale() from exc
+                raise
+            if impact != preview.impact or self.monotonic() >= preview.deadline:
+                raise preview_stale()
+            if inspection.problem:
+                raise storage_unavailable(inspection.problem)
+            if proposal.retention_days != previous_days:
+                if settings["revision"] >= SAFE_INTEGER:
+                    raise HttpError(503, "COUNTER_EXHAUSTED", "The settings revision limit was reached.")
+                db.execute("""
+                    UPDATE app_settings SET retention_days = ?, revision = revision + 1, updated_at_ms = ? WHERE id = 1
+                """, (proposal.retention_days, now))
+                settings = self.settings(db)
+                self.journal_expired(db, now)
+            self.persist_clock(db, now)
+            result = {
+                "settings": settings, "deletion": self._inspect(db, now, ()).deletion(),
+                "object": None, "session": None, "match": None,
+            }
+            receipt = Receipt(canonical_json({
+                "action_id": change.action_id, "persistence": "Committed", "result": result, "error": None,
+            }), 200, None)
+            db.execute("""
+                INSERT INTO action_receipts
+                VALUES (?, 'Settings', NULL, 1, NULL, 'retention', ?, ?, ?, 200, ?, NULL, ?)
+            """, (change.action_id, fingerprint, settings["revision"], now, receipt.body, change.canonical_request()))
+            self.checkpoint("retention_before_commit")
+            checked_at, _ = self.now()
+            if self.monotonic() >= preview.deadline:
+                raise preview_stale()
+            if checked_at > now:
+                # A deadline can be crossed under either policy while the transaction
+                # builds its journal. The storage gate ruled out pre-existing purges.
+                for days in {previous_days, min(previous_days, proposal.retention_days)}:
+                    duration = retention_ms(days)
+                    if db.execute("""
+                        SELECT 1 FROM objects WHERE registered_at_ms > ? AND registered_at_ms <= ? LIMIT 1
+                    """, (now - duration, checked_at - duration)).fetchone():
+                        raise preview_stale()
+            return receipt
 
     def require_new_registration(self, submitted_at: int, preparing: Collection[str]) -> None:
         now, clock_valid = self.now()
@@ -646,7 +794,17 @@ class RecordsStorage:
 
     def receipt(self, action_id: str, fingerprint: str) -> Receipt | None:
         with self.connect() as db, read_transaction(db):
-            db.row_factory = sqlite3.Row
+            return self.find_receipt(db, action_id, fingerprint)
+
+    def retention_receipt(self, action_id: str, fingerprint: str) -> tuple[Receipt | None, int]:
+        with self.connect() as db, read_transaction(db):
+            self.require_inactive(db)
+            return self.find_receipt(db, action_id, fingerprint), self.settings(db)["revision"]
+
+    def find_receipt(self, db: sqlite3.Connection, action_id: str, fingerprint: str) -> Receipt | None:
+        previous = db.row_factory
+        db.row_factory = sqlite3.Row
+        try:
             row = db.execute(f"""
                 SELECT r.*, o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting
                 FROM action_receipts AS r LEFT JOIN objects AS o ON o.id = r.object_id
@@ -660,6 +818,8 @@ class RecordsStorage:
             if row["request_fingerprint"] != fingerprint:
                 raise HttpError(409, "ACTION_ID_CONFLICT", "This action ID already belongs to a different request.")
             return Receipt(row["response_body"], row["response_status"], row["response_location"])
+        finally:
+            db.row_factory = previous
 
     def eligible_owners(self, owners: Collection[str | None]) -> set[str]:
         with self.connect() as db, read_transaction(db):
@@ -755,7 +915,7 @@ class RecordsStorage:
                     }), 201, f"/api/v1/objects/{owner}")
                     db.execute("""
                         INSERT INTO action_receipts
-                        VALUES (?, 'Object', ?, NULL, NULL, 'register', ?, 1, ?, ?, ?, ?)
+                        VALUES (?, 'Object', ?, NULL, NULL, 'register', ?, 1, ?, ?, ?, ?, NULL)
                     """, (request.action_id, owner, fingerprint, now, receipt.status, receipt.body, receipt.location))
                     self.persist_clock(db, now)
                     db.execute("DELETE FROM storage_operations WHERE id = ?", (request.action_id,))

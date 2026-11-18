@@ -12,13 +12,16 @@ from typing import Literal
 from .http import HttpError
 from .reference_image import Reference, prepare_reference
 from .registration_input import SAFE_INTEGER, Registration, canonical_json
+from .retention_input import RetentionChange, RetentionProposal
 from .storage import (
     HistoryKind,
     IncompatibleStorage,
     Inspection,
     Receipt,
     RecordsStorage,
+    RetentionPreview,
     StorageRecoveryRequired,
+    preview_stale,
     storage_unavailable,
 )
 from .unicode_search import casefold
@@ -28,6 +31,9 @@ CURSOR_LIFETIME_SECONDS = 30 * 60
 MAX_CLIENTS = 64
 MAX_CLIENT_CURSORS = 32
 MAX_CURSORS = 1024
+PREVIEW_SECONDS = 60
+MAX_CLIENT_PREVIEWS = 32
+MAX_PREVIEWS = 1024
 MAX_ORDINARY_PENDING = 62
 MAX_TERMINAL = 64
 MAX_QUEUED_REFERENCE_BYTES = 128 * 1024**2
@@ -65,6 +71,7 @@ class Operation:
     fingerprint: str
     response: Receipt
     owner: str | None = None
+    retention_client: str | None = None
 
     def payload(self) -> dict[str, object]:
         data: dict[str, object] = json.loads(self.response.body)
@@ -95,8 +102,11 @@ class RecordsRuntime:
     _pending: dict[str, tuple[Operation, asyncio.Task[Receipt]]] = field(default_factory=dict, repr=False)
     _terminal: OrderedDict[str, Operation] = field(default_factory=OrderedDict, repr=False)
     _cursors: OrderedDict[str, Cursor] = field(default_factory=OrderedDict, repr=False)
+    _previews: OrderedDict[str, RetentionPreview] = field(default_factory=OrderedDict, repr=False)
+    _reserved_previews: set[str] = field(default_factory=set, repr=False)
     _stopping: bool = False
     _stop_retention: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _retention_changed: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _retention_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _queued_reference_bytes: int = 0
 
@@ -141,10 +151,11 @@ class RecordsRuntime:
 
     async def maintain_retention(self) -> None:
         while not self._stop_retention.is_set():
+            self._retention_changed.clear()
             delay = await asyncio.to_thread(self.storage.service_retention)
             await self.prune_terminal()
             try:
-                await asyncio.wait_for(self._stop_retention.wait(), delay)
+                await asyncio.wait_for(self._retention_changed.wait(), delay)
             except TimeoutError:
                 pass
 
@@ -239,6 +250,123 @@ class RecordsRuntime:
                 return
         raise PageError("capacity")
 
+    def prune_previews(self, now: float) -> None:
+        for token, preview in tuple(self._previews.items()):
+            if preview.deadline <= now or preview.client not in self._clients:
+                del self._previews[token]
+
+    async def preview_retention(self, client: str, proposal: RetentionProposal) -> dict[str, object]:
+        self.check_started()
+        evaluated, started, impact = await asyncio.to_thread(self.storage.preview_retention, proposal, self.preparing())
+        if not self.touch_client(client):
+            raise HttpError(403, "CLIENT_INVALID", "Reconnect to obtain a current page identity.")
+        now = self.storage.monotonic()
+        self.prune_previews(now)
+        if started + PREVIEW_SECONDS <= now:
+            raise preview_stale()
+        owned = [token for token, preview in self._previews.items() if preview.client == client]
+        if len(owned) >= MAX_CLIENT_PREVIEWS:
+            self.reclaim_preview(owned)
+        if len(self._previews) >= MAX_PREVIEWS:
+            self.reclaim_preview(self._previews)
+        token = token_urlsafe(32)
+        self._previews[token] = RetentionPreview(client, proposal, started + PREVIEW_SECONDS, impact)
+        return {"preview_id": token, "settings_revision": proposal.expected_revision,
+                "retention_days": proposal.retention_days, "evaluated_at_ms": evaluated,
+                "expires_at_ms": evaluated + PREVIEW_SECONDS * 1000, "impact": impact.counts}
+
+    def reclaim_preview(self, candidates: Collection[str]) -> None:
+        oldest = next((token for token in candidates if token not in self._reserved_previews), None)
+        if oldest is None:
+            raise HttpError(503, "CAPACITY_REACHED", "All preview slots are in use. Retry when a save finishes.", True)
+        del self._previews[oldest]
+
+    async def commit_retention(self, client: str, change: RetentionChange, authorize: Callable[[], None]) -> Receipt:
+        self.check_started()
+        action = change.action_id
+        fingerprint = change.fingerprint()
+        async with self._admission:
+            receipt, revision = await self.find_retention_receipt(action, fingerprint, authorize)
+            if receipt:
+                return receipt
+            pending = self._pending.get(action)
+            previous = pending[0] if pending else self._terminal.get(action)
+            if previous and previous.fingerprint == fingerprint and (
+                (pending and previous.retention_client != client) or (not pending and previous.response.status == 200)
+            ):
+                # A save may have committed between the durable read and the in-memory lookup.
+                receipt, revision = await self.find_retention_receipt(action, fingerprint, authorize)
+                if receipt:
+                    return receipt
+            authorize()
+            if previous and previous.fingerprint != fingerprint:
+                raise HttpError(409, "ACTION_ID_CONFLICT", "This action ID already belongs to a different request.")
+            if pending:
+                if pending[0].retention_client != client:
+                    raise preview_stale()
+                return pending[0].response
+            self.prune_previews(self.storage.monotonic())
+            preview = self._previews.get(change.preview_id)
+            if (change.proposal.expected_revision != revision
+                    or preview is None or preview.client != client or preview.proposal != change.proposal
+                    or change.preview_id in self._reserved_previews):
+                raise preview_stale()
+            if self._stopping or len(self._pending) >= MAX_ORDINARY_PENDING:
+                raise HttpError(503, "CAPACITY_REACHED", "Settings are busy. Retry the same request shortly.", True)
+            operation = Operation(fingerprint, mutation(action, "Pending", 202), retention_client=client)
+            self._reserved_previews.add(change.preview_id)
+            task = asyncio.create_task(self.finish_retention(client, change, preview, fingerprint))
+            self._pending[action] = (operation, task)
+            self._terminal.pop(action, None)
+        done, _ = await asyncio.wait((task,), timeout=0.15)
+        return task.result() if done else operation.response
+
+    @staticmethod
+    def retention_unknown() -> HttpError:
+        return HttpError(500, "INTERNAL_ERROR", "The settings save outcome is unknown. Retry the same request.", True)
+
+    async def find_retention_receipt(
+        self, action: str, fingerprint: str, authorize: Callable[[], None],
+    ) -> tuple[Receipt | None, int]:
+        try:
+            return await asyncio.to_thread(self.storage.retention_receipt, action, fingerprint)
+        except HttpError as exc:
+            if exc.code == "ACTION_ID_CONFLICT":
+                authorize()
+            raise
+        except (OSError, sqlite3.Error) as exc:
+            raise self.retention_unknown() from exc
+
+    async def finish_retention(
+        self, client: str, change: RetentionChange, preview: RetentionPreview, fingerprint: str,
+    ) -> Receipt:
+        action = change.action_id
+        committed = False
+        try:
+            async with self._save:
+                receipt = await asyncio.to_thread(self.storage.save_retention, client, change, preview, fingerprint)
+            committed = True
+        except HttpError as error:
+            receipt = mutation(action, "Failed", error.status, error)
+        except (OSError, sqlite3.Error):
+            try:
+                recovered = await asyncio.to_thread(self.storage.receipt, action, fingerprint)
+            except (OSError, sqlite3.Error, HttpError):
+                unknown = self.retention_unknown()
+                return Receipt(bytes(unknown.response().body).decode(), unknown.status, None)
+            committed = recovered is not None
+            receipt = recovered or mutation(action, "Failed", 503, storage_unavailable())
+        finally:
+            self._pending.pop(action, None)
+            self._reserved_previews.discard(change.preview_id)
+        if committed:
+            self._previews.pop(change.preview_id, None)
+        self.publish_terminal(action, Operation(fingerprint, receipt))
+        if committed:
+            self._retention_changed.set()
+            await self.prune_terminal()
+        return receipt
+
     async def register(self, registration: Registration, authorize: Callable[[], None]) -> Receipt:
         try:
             self.check_started()
@@ -307,10 +435,13 @@ class RecordsRuntime:
         finally:
             self._pending.pop(action_id, None)
             self._queued_reference_bytes -= len(reference.data)
-        self._terminal[action_id] = Operation(fingerprint, receipt, owner)
+        self.publish_terminal(action_id, Operation(fingerprint, receipt, owner))
+        return receipt
+
+    def publish_terminal(self, action_id: str, operation: Operation) -> None:
+        self._terminal[action_id] = operation
         if len(self._terminal) > MAX_TERMINAL:
             self._terminal.popitem(last=False)
-        return receipt
 
     async def prune_terminal(self) -> None:
         records = {key: operation for key, operation in self._terminal.items() if operation.owner is not None}
@@ -332,6 +463,7 @@ class RecordsRuntime:
     async def stop(self) -> None:
         self._stopping = True
         self._stop_retention.set()
+        self._retention_changed.set()
         async with self._admission:
             await asyncio.gather(*(task for _, task in self._pending.values()), return_exceptions=True)
         if self._retention_task is not None:
@@ -360,17 +492,11 @@ class RecordsRuntime:
             "initialization": "Starting" if starting else "Failed" if self._startup_fault else "Ready",
             "storage_integrity": "Healthy" if healthy else "Reconciling" if starting else "Unavailable",
             "readiness": self.readiness(storage),
-            "active_session_state": None,
+            "active_session_state": storage.active_session_state if storage else None,
             "operational_state": "Idle" if healthy else "Reconciling" if starting else "Faulted",
         }
 
     async def snapshot(self, storage: Inspection) -> dict[str, object]:
-        deletion = {
-            "status": storage.deletion_status,
-            "remaining_objects": storage.remaining_objects,
-            "remaining_files": storage.remaining_files,
-            "error_code": "STORAGE_UNAVAILABLE" if storage.deletion_status == "Failed" else None,
-        }
         return {
             "protocol_version": 1, "backend_boot_id": self.boot_id, "event_seq": 1,
             "active_object": None, "active_session": None,
@@ -386,7 +512,7 @@ class RecordsRuntime:
             },
             "retention": {
                 "settings": storage.settings, "active_object_expires_at_ms": None,
-                "active_object_grace": False, "deletion": deletion,
+                "active_object_grace": False, "deletion": storage.deletion(),
             },
             "operations": await self.operations(), "qualification_profile_id": None, "qualification_profile": None,
         }

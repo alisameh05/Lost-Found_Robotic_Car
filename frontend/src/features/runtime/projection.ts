@@ -203,6 +203,9 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
           ...(view.connected && { authority: (view.authority ?? 0) + 1 }) });
         return;
       }
+      const retentionChanged = recordsMode && next && view.recordSnapshot &&
+        view.recordSnapshot.retention.settings.revision !== next.retention.settings.revision;
+      if (retentionChanged) resetProtectedScope();
       const refreshRecords = !recordsMode || (next && (
         view.recordSnapshot?.event_seq !== next.event_seq || recordsChanged(view.recordSnapshot, next)
       ));
@@ -212,6 +215,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
         failedRead: next || view.workspace?.eventsLive ? undefined : status.kind === "ok" ? unavailable() : status,
         health: diagnostics,
         ...(recordsMode && { connected: true }),
+        ...(retentionChanged && { authority: (view.authority ?? 0) + 1 }),
         ...(recordsMode && background && { recordPoll: (view.recordPoll ?? 0) + 1 }),
         loading: false,
         ...(next && !ordered && { recovering: false, reconnectingSessionId: undefined }),
@@ -463,12 +467,20 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       return result;
     },
     async previewRetention(body: RetentionPreviewRequest, signal: AbortSignal) {
-      if (!context) return { kind: "unavailable" } as const;
-      return transport.request("POST /settings/retention-preview", { body, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+      return protectedRead(signal, (request) => transport.request("POST /settings/retention-preview", { ...request, body }));
     },
     async applyRetention(body: RetentionChange, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;
-      return transport.request("PUT /settings/retention", { body, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+      const result = await transport.request("PUT /settings/retention", { body, context,
+        signal: AbortSignal.any([signal, lifetime.signal]) });
+      if (recordsMode && invalidAuthority(result)) {
+        loseRecordsAuthority();
+        void refresh();
+      } else if (recordsMode && result.kind === "ok" && result.data.persistence === "Committed" &&
+          result.data.action_id === body.action_id) {
+        void refresh({ revalidate: true });
+      }
+      return result;
     },
     async get<Path extends ProtectedPath>(path: Path, id: string | undefined, signal: AbortSignal) {
       return protectedRead(signal, (request) => transport.get(path, { ...request, id }));

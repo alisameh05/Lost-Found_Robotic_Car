@@ -1413,7 +1413,7 @@
             "Capability": []
           }
         ],
-        "x-laf-records-runtime": false,
+        "x-laf-records-runtime": true,
         "requestBody": {
           "required": true,
           "content": {
@@ -1455,7 +1455,14 @@
             "content": {
               "application/json": {
                 "schema": {
-                  "$ref": "#/components/schemas/Error"
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    },
+                    {
+                      "$ref": "#/components/schemas/MutationResponse"
+                    }
+                  ]
                 }
               }
             },
@@ -1507,7 +1514,7 @@
             "Capability": []
           }
         ],
-        "x-laf-records-runtime": false,
+        "x-laf-records-runtime": true,
         "requestBody": {
           "required": true,
           "content": {

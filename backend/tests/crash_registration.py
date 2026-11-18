@@ -1,4 +1,4 @@
-"""Registration process test controls for persistence boundaries and clock changes."""
+"""Records process test controls for persistence boundaries, cleanup failures and clock changes."""
 import os
 import sys
 from pathlib import Path
@@ -42,6 +42,16 @@ def test_app(config: Config, *, held_owner: bool = False):
                 os._exit(84)
 
         storage = RecordsStorage(config.data_root, clock=clock, checkpoint=crash_with_clock)
+        if len(sys.argv) == 5 and sys.argv[3] == "deny-purge":
+            blocked = Path(sys.argv[4])
+            discard = storage.files.discard
+
+            def deny_media_deletion(relative: str) -> None:
+                if relative.startswith("media/") and blocked.exists():
+                    raise PermissionError("Test repair gate blocks managed media deletion")
+                discard(relative)
+
+            storage.files.discard = deny_media_deletion
     else:
         storage = RecordsStorage(config.data_root, checkpoint=crash_at_checkpoint)
     return create_app(config, held_owner=held_owner, storage=storage)

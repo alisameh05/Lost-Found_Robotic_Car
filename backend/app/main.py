@@ -13,6 +13,7 @@ from .http import (
     HEADER_LIMIT,
     LIST_QUERIES,
     RECORDS_ROUTES,
+    RETENTION_ROUTES,
     HttpError,
     authorize_address,
     authorize_capability,
@@ -26,6 +27,7 @@ from .http import (
 )
 from .owner import own_data_root
 from .registration_input import NAME_LIMIT, normalize_name, parse_registration
+from .retention_input import parse_retention
 from .runtime import PageError, RecordsRuntime
 from .storage import RecordsStorage, storage_unavailable
 
@@ -100,14 +102,17 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
                     authorize_capability(request, runtime)
                 if request.method not in RECORDS_ROUTES.get(path, ()):
                     raise HttpError(404, "NOT_FOUND", "The requested operation is unavailable.")
-                registering = request.method == "POST"
-                if registering:
+                registering = path == "/objects" and request.method == "POST"
+                if path == "/settings/retention":
+                    if not header(request, "x-app-client-id", 403, "CLIENT_INVALID"):
+                        raise HttpError(403, "CLIENT_INVALID", "Provide a page identity for the retention request.")
+                elif registering:
                     header(request, "x-app-client-id", 403, "CLIENT_INVALID")
-                if not registering and path != "/bootstrap":
+                elif path != "/bootstrap":
                     authorize_client(request, runtime, required=path in CLIENT_ROUTES)
                 allowed = LIST_QUERIES.get(path, ()) if not registering else ()
                 query = parse_query(request.scope["query_string"], allowed)
-                if not registering:
+                if not registering and path not in RETENTION_ROUTES:
                     await require_empty_body(request)
                 if path == "/objects" and not registering:
                     validate_objects_query(query)
@@ -204,5 +209,21 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
         if request.scope["path"] == API_PREFIX + "/settings":
             return JSONResponse(storage.settings)
         return JSONResponse(await runtime.snapshot(storage))
+
+    @app.post(API_PREFIX + "/settings/retention-preview")
+    async def retention_preview(request: Request) -> JSONResponse:
+        runtime: RecordsRuntime = request.app.state.runtime
+        proposal, _ = await parse_retention(request, commit=False)
+        return JSONResponse(await runtime.preview_retention(request.headers["x-app-client-id"], proposal))
+
+    @app.put(API_PREFIX + "/settings/retention")
+    async def retention_commit(request: Request) -> Response:
+        runtime: RecordsRuntime = request.app.state.runtime
+        _, change = await parse_retention(request, commit=True)
+        assert change is not None
+        receipt = await runtime.commit_retention(
+            request.headers["x-app-client-id"], change, lambda: authorize_client(request, runtime, required=True),
+        )
+        return Response(receipt.body, status_code=receipt.status, media_type="application/json")
 
     return app
