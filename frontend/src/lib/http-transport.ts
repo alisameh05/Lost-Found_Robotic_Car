@@ -1,5 +1,5 @@
-import type { BootstrapResponse, Error as ApiError, HttpResponses, MutationResponse } from "@/generated/api-v1";
-import { protectedHeaders, type ApplicationTransport, type Endpoint, type HttpRequest, type ProtectedMedia, type ReadResult } from "./transport";
+import type { BootstrapResponse, Error as ApiError, EventEnvelope, HttpResponses, MutationResponse } from "@/generated/api-v1";
+import { protectedHeaders, type ApplicationTransport, type Endpoint, type HttpRequest, type ProtectedMedia, type ProtectedRequest, type ReadResult, type SocketObserver, type SocketOffer } from "./transport";
 import { conforms, type Definition } from "./wire-contracts";
 
 const responses = {
@@ -77,12 +77,12 @@ export function createHttpTransport(base: string): ApplicationTransport {
         method: "POST", headers: protectedHeaders("POST /objects", registration), body: form,
       });
     }
-    if (route === "POST /settings/retention-preview" || route === "PUT /settings/retention") {
+    if (route === "POST /websocket-tickets" || route === "POST /settings/retention-preview" || route === "PUT /settings/retention") {
       const request = input as HttpRequest<typeof route>;
       const headers = protectedHeaders(route, request);
       headers.set("Content-Type", "application/json");
       return readJson(route.slice(route.indexOf(" ") + 1),
-        route === "PUT /settings/retention" ? "MutationResponse" : "RetentionPreview", input.signal, {
+        route === "PUT /settings/retention" ? "MutationResponse" : route === "POST /websocket-tickets" ? "TicketResponse" : "RetentionPreview", input.signal, {
           method: route === "PUT /settings/retention" ? "PUT" : "POST", body: JSON.stringify(request.body), headers,
         });
     }
@@ -96,13 +96,75 @@ export function createHttpTransport(base: string): ApplicationTransport {
     return readJson(path + (query.size ? "?" + query.toString() : ""), definition, input.signal, { headers: protectedHeaders(route, input) });
   }
 
+  function connect<Message>(
+    input: ProtectedRequest, offer: SocketOffer, observer: SocketObserver<Message>, parse: (value: unknown) => Message | undefined,
+  ) {
+    const signal = AbortSignal.any([lifetime.signal, ...(input.signal ? [input.signal] : [])]);
+    if (signal.aborted) return unavailable;
+    const url = new URL(base + offer.path);
+    url.protocol = "ws:";
+    const socket = new WebSocket(url, [...offer.protocols]);
+    socket.binaryType = "arraybuffer";
+    const timeout = setTimeout(failed, 5_000);
+    let disposed = false;
+
+    function close() {
+      if (disposed) return;
+      disposed = true;
+      clearTimeout(timeout);
+      signal.removeEventListener("abort", close);
+      socket.close();
+    }
+    function failed() {
+      if (disposed) return;
+      close();
+      observer.closed();
+    }
+
+    signal.addEventListener("abort", close, { once: true });
+    socket.onopen = () => {
+      clearTimeout(timeout);
+      if (socket.protocol !== "laf.v1") failed();
+    };
+    socket.onerror = failed;
+    socket.onclose = failed;
+    socket.onmessage = ({ data }) => {
+      if (disposed) return;
+      const message = parse(data);
+      if (message === undefined) failed();
+      else observer.message(message);
+    };
+    return { kind: "ok", status: 200, data: {
+      protocol: "laf.v1",
+      close,
+      heartbeat: () => false,
+    } } as const;
+  }
+
   return {
     request,
     bootstrap: (signal) => readJson<BootstrapResponse>("/bootstrap", "BootstrapResponse", signal),
     get: (path, input) => request(`GET ${path}`, input as HttpRequest<`GET ${typeof path}`>),
     snapshot: (input) => request("GET /snapshot", input),
-    connectEvents: () => deferred,
-    connectFrames: () => deferred,
+    connectEvents: (input, offer, observer) => {
+      const limit = input.context.qualification_profile?.max_event_message_bytes;
+      if (!limit) return deferred;
+      return connect(input, offer, observer, (value) => {
+        if (typeof value !== "string" || value.length > limit || new TextEncoder().encode(value).length > limit) return;
+        try {
+          const event: unknown = JSON.parse(value);
+          return conforms("EventEnvelope", event) ? event as EventEnvelope : undefined;
+        } catch {
+          return;
+        }
+      });
+    },
+    connectFrames: (input, _source, offer, observer) => {
+      const limit = input.context.qualification_profile?.max_frame_bytes;
+      if (!limit) return deferred;
+      return connect(input, offer, observer, (value) =>
+        value instanceof ArrayBuffer && value.byteLength <= limit ? new Uint8Array(value) : undefined);
+    },
     async media(id, input): Promise<ReadResult<ProtectedMedia>> {
       try {
         const response = await localFetch("/media/" + encodeURIComponent(id), input.signal, {

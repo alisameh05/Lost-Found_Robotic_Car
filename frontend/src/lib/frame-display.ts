@@ -1,5 +1,5 @@
 import type { FrameMetadata, FrontendProfile } from "@/generated/api-v1";
-import { conforms } from "./fixture-contracts";
+import { conforms } from "./wire-contracts";
 
 type Source = FrameMetadata["source"];
 type Frame = { metadata: FrameMetadata; jpeg: Uint8Array<ArrayBuffer> };
@@ -113,7 +113,7 @@ export function openFrameDisplay<Image extends DecodedFrame>({
     try {
       image = await decode(job.frame.jpeg);
       const { width, height } = job.frame.metadata;
-      if (generation !== lifetime || monotonic() >= job.expires ||
+      if (generation !== lifetime || waiting || monotonic() >= job.expires ||
           image.width !== width || image.height !== height || !present(image)) return;
       displayed = { metadata: job.frame.metadata, expires: job.expires };
       expire();

@@ -1,0 +1,8 @@
+{
+  "version": 1,
+  "kind": "Fixture",
+  "video": "JPEG static scene, distinct acquisition sequence per observation, backend monotonic source in microseconds",
+  "device_status": "Deterministic command and controller availability observations, no command sink",
+  "inference_status": "Deterministic availability observation, no model execution",
+  "transport": "API v1 event and binary frame envelopes"
+}

@@ -115,7 +115,7 @@
             "Capability": []
           }
         ],
-        "x-laf-records-runtime": false,
+        "x-laf-records-runtime": true,
         "requestBody": {
           "required": true,
           "content": {

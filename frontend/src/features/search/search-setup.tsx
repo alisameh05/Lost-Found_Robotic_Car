@@ -25,8 +25,8 @@ const modes = [
 ] as const;
 
 export function SearchSetupScreen({ objectId, mode = "Gestures" }: { objectId: string; mode?: ControlMode }) {
-  const { recordsMode } = useRuntimeView();
-  return recordsMode ? <SearchUnavailable title="Search Setup" /> : <SavedSearchSetup objectId={objectId} mode={mode} />;
+  const { recordsMode, profile } = useRuntimeView();
+  return recordsMode && !profile ? <SearchUnavailable title="Search Setup" /> : <SavedSearchSetup objectId={objectId} mode={mode} />;
 }
 
 function SavedSearchSetup({ objectId, mode }: { objectId: string; mode: ControlMode }) {
@@ -54,12 +54,13 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   const view = useRuntimeView();
   const refresh = useRefreshRuntime();
   const router = useRouter();
-  const { snapshot, health, workspace, profile } = view;
+  const { snapshot, health, workspace, profile, recordsMode } = view;
+  const showPreview = !recordsMode || (object.status === "Lost" && !object.retention_grace && referenceDisplayed === true);
   const canvas = useRef<HTMLDivElement>(null);
   const requestedStart = useRef(false);
   useEffect(() => {
-    if (canvas.current && profile) return runtime?.mountWorkspace(canvas.current);
-  }, [runtime, profile]);
+    if (canvas.current && profile && showPreview) return runtime?.mountWorkspace(canvas.current);
+  }, [runtime, profile, showPreview]);
 
   const context = { objectId: object.id, mode };
   const expiry = runtime?.serverTime();
@@ -83,7 +84,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   const required = describeDeviceReadiness(readiness, mode);
   const blockedPaths = [...required.shared, ...(required.selected ? [required.selected] : [])]
     .filter(({ component, status }) => status !== "Ready" && component !== "Workspace" && component !== "DisplayedRobotVideo");
-  const ready = eligible && !!workspace?.eventsLive && workspace.usable && workspace.controlling && workspace.previewLive &&
+  const ready = !recordsMode && eligible && !!workspace?.eventsLive && workspace.usable && workspace.controlling && workspace.previewLive &&
     snapshot?.readiness.can_start[mode] === true;
   const spectator = snapshot?.lease.state === "Owned" && !workspace?.controlling && !workspace?.acquiring && !workspace?.retryAcquisition;
   const acquisitionBlocked = recordBlock ?? (referenceDisplayed === false ? "The reference image is unavailable."
@@ -110,14 +111,14 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
           <ReferenceImage object={object} target="both" onDisplay={setReferenceDisplayed} />
           <p className={styles.muted}>Selected target · {object.roi.width} × {object.roi.height} px</p>
         </Panel>
-        <Panel className={styles.card} aria-labelledby="robot-preview-title">
+        {showPreview && <Panel className={styles.card} aria-labelledby="robot-preview-title">
           <div className={styles.row}>
-            <h2 id="robot-preview-title">Robot preview</h2>
+            <h2 id="robot-preview-title">{recordsMode ? "Simulated robot preview" : "Robot preview"}</h2>
             <StatusBadge tone={workspace?.previewLive ? "success" : "warning"}>{workspace?.previewLive ? "Live preview" : "Not live"}</StatusBadge>
           </div>
           <div ref={canvas} className={styles.preview} />
-          <p className={styles.muted}>{workspace?.controlling ? "This workspace holds control." : "Read-only preview."}</p>
-        </Panel>
+          <p className={styles.muted}>{recordsMode ? "Backend simulation · Disarmed" : workspace?.controlling ? "This workspace holds control." : "Read-only preview."}</p>
+        </Panel>}
       </div>
 
       <div className={styles.column}>
@@ -166,7 +167,8 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
     </div>
     <footer className={styles.footer}>
       <div role="status" className={styles.feedback}>
-        {ready ? <Notice tone="success" title="Ready to start">Required paths are ready and the robot preview is live.</Notice>
+        {recordsMode ? <Notice title="Read-only setup">Control and Start Search are unavailable in this preview.</Notice>
+          : ready ? <Notice tone="success" title="Ready to start">Required paths are ready and the robot preview is live.</Notice>
           : notice ? <Notice tone="warning" title="Start blocked">{notice}</Notice>
           : <Notice title={spectator ? "Spectator" : workspace?.controlling ? "Checking the displayed frame" : "Preview only"}>
             {spectator ? "Another workspace holds control." : workspace?.controlling
@@ -181,7 +183,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
       <div className={styles.actions}>
         <Link className="button button--secondary" href={objectHref(object.id)}>Back to Object Details</Link>
         {!workspace?.controlling && <Button variant="primary" pending={workspace?.acquiring}
-          disabledReason={acquisitionBlocked} onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
+          disabledReason={recordsMode ? "Control is unavailable in this preview." : acquisitionBlocked} onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
         <Button variant="primary" pending={starting?.stage === "sending"} disabled={!ready || busy}
           onClick={() => {
             if (!ready) return;

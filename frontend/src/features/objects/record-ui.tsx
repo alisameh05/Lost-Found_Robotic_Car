@@ -58,7 +58,8 @@ export function ReferenceImage({ object, thumbnail = false, target, onDisplay }:
 }
 
 export function StartSearch({ object }: { object: ObjectRecord }) {
-  const reason = searchSetupBlockReason(object, useRuntimeView());
+  const view = useRuntimeView();
+  const reason = searchSetupBlockReason(object, view);
   return reason ? <div className={styles.blockedAction}><Button disabledReason={reason}>Start Search</Button></div>
-    : <Link className="button button--primary" href={`${objectHref(object.id)}/search`}>Start Search</Link>;
+    : <Link className="button button--primary" href={`${objectHref(object.id)}/search`}>{view.recordsMode && view.profile ? "Open Search Setup" : "Start Search"}</Link>;
 }

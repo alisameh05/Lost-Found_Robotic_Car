@@ -41,7 +41,10 @@ Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Dashboard and Objects show 
 | `LAF_FRONTEND_PORT` | `3000` | Both terminals. The backend derives the allowed browser Origin from this value. |
 | `LAF_BACKEND_PORT` | `8000` | Both terminals. Browse to the frontend port. |
 | `LAF_DATA_ROOT` | `%LOCALAPPDATA%\LostAndFound` | Backend terminal. Use an absolute application directory under `LOCALAPPDATA`. |
-| `LAF_MODE` | Disconnected | Frontend terminal. Use `records` for protected HTTP or `fixture` for labeled previews. |
+| `LAF_MODE` | Disconnected | Frontend terminal. Use `records` for the local backend or `fixture` for the browser-only sample application. |
+| `LAF_SIMULATION_PROFILE` | Unset | Backend terminal. Set `fixture-v1` before starting to enable the protected simulated preview. |
+
+With the profile enabled, open an eligible saved Lost object and select **Open Search Setup**. The robot preview displays **Backend simulation · Disarmed** and its current readiness. Other tabs can observe independently. The versioned profile and its sample provenance are in [preview_fixture](app/preview_fixture). Stop and restart the backend to change profiles.
 
 Each service reports an occupied port and exits. Only one backend owns a data root, even across different ports. Close the owner before changing its configuration. The OS releases the lock on process exit. Keep the database, its SQLite sidecars and the managed media together under the local root. SQLite uses WAL and synchronous FULL, enables foreign keys on every connection, and applies migration SQL and its receipt in one immediate transaction. Registration flushes the normalized reference into staging, journals the preparation, and promotes the file before committing the object, Ready media and receipt together. Restart rolls back interrupted preparations and preserves committed references.
 
@@ -49,7 +52,7 @@ The backend checks expiry at startup and in the running service. Expiry uses the
 
 Settings, Devices and Object Details report cleanup progress. A cleanup fault keeps expired records inaccessible and blocks new registration. The backend retries cleanup after managed storage is repaired and resumes incomplete work on restart. Health stays available with the current capability. If a save response is interrupted, use Retry Same Request to recover the result.
 
-Object Details links to saved sessions and their captured matches. Startup ends unfinished sessions as Interrupted and keeps durable pending captures as Not reviewed. Missing or corrupt evidence leaves the saved outcome intact. Fresh installations have empty histories. Records views revalidate over HTTP on focus, reconnect and visible-tab polling. Ordered events and live search controls follow in later phases.
+Object Details links to saved sessions and their captured matches. Startup ends unfinished sessions as Interrupted and keeps durable pending captures as Not reviewed. Missing or corrupt evidence leaves the saved outcome intact. Fresh installations have empty histories. Records views revalidate over HTTP on focus, reconnect and visible-tab polling. Live search controls remain unavailable.
 
 ## Verify
 

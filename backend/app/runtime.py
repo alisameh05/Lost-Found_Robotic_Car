@@ -10,9 +10,11 @@ from time import monotonic
 from typing import Literal
 
 from .http import HttpError
+from .realtime import Channel, Realtime
 from .reference_image import Reference, prepare_reference
 from .registration_input import SAFE_INTEGER, Registration, canonical_json
 from .retention_input import RetentionChange, RetentionProposal
+from .simulation import Simulation
 from .storage import (
     HistoryKind,
     IncompatibleStorage,
@@ -109,10 +111,22 @@ class RecordsRuntime:
     _retention_changed: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _retention_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _queued_reference_bytes: int = 0
+    realtime: Realtime | None = field(default=None, init=False, repr=False)
+
+    def enable_realtime(self, simulation: Simulation | None, unavailable_code: str,
+                        invalidate: Callable[[str, Channel], None]) -> Realtime:
+        self.realtime = Realtime(simulation, unavailable_code, self.boot_id, self.storage.monotonic,
+                                 self.storage.clock, self.touch_client, self.realtime_projection, invalidate)
+        return self.realtime
+
+    def frontend_profile(self) -> dict[str, int | str] | None:
+        profile = self.realtime.profile if self.realtime else None
+        return dict(profile.frontend) if profile else None
 
     def _expire_clients(self, now: float) -> None:
         for client, touched in list(self._clients.items()):
-            if now - touched >= CLIENT_IDLE_SECONDS:
+            connected = self.realtime and self.realtime.client_has_events(client)
+            if now - touched >= CLIENT_IDLE_SECONDS and not connected:
                 del self._clients[client]
 
     def bootstrap(self) -> dict[str, object] | None:
@@ -124,7 +138,7 @@ class RecordsRuntime:
         self._clients[client] = now
         return {
             "client_id": client, "backend_boot_id": self.boot_id, "capability": self.capability,
-            "server_time_ms": self.storage.clock(), "qualification_profile": None,
+            "server_time_ms": self.storage.clock(), "qualification_profile": self.frontend_profile(),
         }
 
     def touch_client(self, client: str) -> bool:
@@ -150,9 +164,16 @@ class RecordsRuntime:
             self._retention_task = asyncio.create_task(self.maintain_retention())
 
     async def maintain_retention(self) -> None:
+        loop = asyncio.get_running_loop()
+        realtime = self.realtime
+
+        def removed(owner: str) -> None:
+            if realtime:
+                loop.call_soon_threadsafe(realtime.object_removed, owner)
+
         while not self._stop_retention.is_set():
             self._retention_changed.clear()
-            delay = await asyncio.to_thread(self.storage.service_retention)
+            delay = await asyncio.to_thread(self.storage.service_retention, removed)
             await self.prune_terminal()
             try:
                 await asyncio.wait_for(self._retention_changed.wait(), delay)
@@ -476,8 +497,10 @@ class RecordsRuntime:
             "components": [
                 {"component": "Backend", "status": "Ready", "cause_codes": []},
                 {"component": "Storage", "status": status, "cause_codes": cause},
-                *({"component": name, "status": "Unavailable", "cause_codes": ["NOT_READY"]}
-                  for name in DEFERRED_COMPONENTS),
+                *({"component": name, "status": "Unavailable" if code else "Ready",
+                   "cause_codes": [code] if code else []}
+                  for name in DEFERRED_COMPONENTS
+                  for code in [self.realtime.component_cause(name) if self.realtime else "NOT_READY"]),
             ],
             "can_start": {"Gestures": False, "Controller": False},
             "can_resume": False,
@@ -496,9 +519,17 @@ class RecordsRuntime:
             "operational_state": "Idle" if healthy else "Reconciling" if starting else "Faulted",
         }
 
+    async def realtime_projection(self) -> dict[str, object] | None:
+        storage = await self.inspect()
+        if storage is None:
+            return None
+        return {**await self.snapshot(storage), "storage_problem": bool(storage.problem)}
+
     async def snapshot(self, storage: Inspection) -> dict[str, object]:
+        profile = self.frontend_profile()
+        operations = await self.operations()
         return {
-            "protocol_version": 1, "backend_boot_id": self.boot_id, "event_seq": 1,
+            "protocol_version": 1, "backend_boot_id": self.boot_id, "event_seq": self.realtime.sequence if self.realtime else 1,
             "active_object": None, "active_session": None,
             "runtime": {
                 "effective_session_state": None, "motion_permission": "Disarmed", "control_generation": 1,
@@ -514,5 +545,6 @@ class RecordsRuntime:
                 "settings": storage.settings, "active_object_expires_at_ms": None,
                 "active_object_grace": False, "deletion": storage.deletion(),
             },
-            "operations": await self.operations(), "qualification_profile_id": None, "qualification_profile": None,
+            "operations": operations, "qualification_profile_id": profile["profile_id"] if profile else None,
+            "qualification_profile": profile,
         }

@@ -1,13 +1,10 @@
 import hashlib
-import json
 import re
 from dataclasses import dataclass
-from typing import NoReturn
 
 from fastapi import Request
-from starlette.requests import ClientDisconnect
 
-from .http import BODY_LIMIT, DOMAIN_ID, REQUEST_ID, HttpError, body_length, header
+from .http import DOMAIN_ID, REQUEST_ID, HttpError, read_json
 from .registration_input import SAFE_INTEGER, canonical_json
 
 
@@ -34,46 +31,13 @@ class RetentionChange:
         return hashlib.sha256(self.canonical_request().encode()).hexdigest()
 
 
-def bad_json() -> HttpError:
-    return HttpError(400, "INVALID_JSON", "Use a valid UTF-8 JSON request.")
-
-
 def invalid(path: str, code: str) -> HttpError:
     return HttpError(422, "VALIDATION_FAILED", "Use the required retention request fields and values.",
                      field=(path, code))
 
 
-def fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
-    result: dict[str, object] = {}
-    for key, value in pairs:
-        if key in result:
-            raise invalid("/", "DUPLICATE_FIELD")
-        result[key] = value
-    return result
-
-
-def reject_nonfinite(_: str) -> NoReturn:
-    raise bad_json()
-
-
 async def parse_retention(request: Request, *, commit: bool) -> tuple[RetentionProposal, RetentionChange | None]:
-    length = body_length(request, BODY_LIMIT)
-    content = header(request, "content-type", 415, "UNSUPPORTED_MEDIA_TYPE") or ""
-    if not re.fullmatch(r'application/json(?:[ \t]*;[ \t]*charset=(?:utf-8|"utf-8"))?[ \t]*',
-                        content, re.IGNORECASE):
-        raise HttpError(415, "UNSUPPORTED_MEDIA_TYPE", "Use application/json with UTF-8 encoding.")
-    raw = bytearray()
-    try:
-        async for chunk in request.stream():
-            if len(raw) + len(chunk) > BODY_LIMIT:
-                raise HttpError(413, "PAYLOAD_TOO_LARGE", "The request body exceeds the supported size.")
-            raw.extend(chunk)
-        if length is not None and length != len(raw):
-            raise bad_json()
-        data = json.loads(raw.decode("utf-8"), object_pairs_hook=fields, parse_constant=reject_nonfinite,
-                          parse_int=lambda value: int(value) if len(value) <= 17 else SAFE_INTEGER + 1)
-    except (ValueError, RecursionError, ClientDisconnect) as exc:
-        raise bad_json() from exc
+    data = await read_json(request)
 
     required = {"expected_revision", "retention_days"}
     if commit:

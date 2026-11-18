@@ -2,6 +2,7 @@ import json
 import re
 from pathlib import Path
 
+from fastapi.routing import APIRoute, APIWebSocketRoute
 from jsonschema import Draft202012Validator
 
 from backend.app.config import Config
@@ -108,14 +109,18 @@ def test_approved_models_and_route_catalogue_match_the_backend_exports(tmp_path:
 
     health_error = operations["get", "/health"]["responses"]["503"]["content"]["application/json"]["schema"]["oneOf"]
     assert [definition_of(ref) for ref in health_error] == ["Health", "Error"]
+    app = create_app(Config(tmp_path))
     actual_routes = {(method.lower(), route.path.removeprefix("/api/v1"))
-                     for route in create_app(Config(tmp_path)).routes for method in route.methods}
+                     for route in app.routes if isinstance(route, APIRoute) for method in route.methods}
     assert actual_routes == {key for key, operation in operations.items() if operation["x-laf-records-runtime"]}
     events = read_contract("events.json")
     frames = read_contract("frames.json")
     event_socket = events["x-laf-websocket"]
     frame_socket = frames["x-laf-websocket"]
     assert approved_sockets == {event_socket["path"], *frame_socket["paths"]}
+    assert approved_sockets == {
+        route.path.removeprefix("/api/v1") for route in app.routes if isinstance(route, APIWebSocketRoute)
+    }
     assert event_socket["protocol"] == frame_socket["protocol"] == "laf.v1"
     assert event_socket["ticket_offer_prefix"] == frame_socket["ticket_offer_prefix"] == "laf.ticket."
     assert event_socket["initial_message_type"] == "snapshot"

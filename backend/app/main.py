@@ -3,8 +3,9 @@ import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 
-from fastapi import FastAPI, Request
+from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
+from PIL import Image
 
 from .config import Config
 from .http import (
@@ -26,9 +27,11 @@ from .http import (
     route_path,
 )
 from .owner import own_data_root
+from .realtime import CHANNELS, Channel, ticket_request
 from .registration_input import NAME_LIMIT, normalize_name, parse_registration
 from .retention_input import parse_retention
 from .runtime import PageError, RecordsRuntime
+from .simulation import IncompatibleProfile, Simulation, load_simulation
 from .storage import RecordsStorage, storage_unavailable
 
 PAGE_ERRORS = {
@@ -59,19 +62,45 @@ def validate_page_limit(query: dict[str, str]) -> None:
         query["limit"] = significant
 
 
-def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStorage | None = None) -> FastAPI:
+def _ignore_invalidation(_: str, __: Channel) -> None:
+    # The preview has no owner. Subsequent authority gates can attach at this boundary.
+    pass
+
+
+def create_app(
+    config: Config, *, held_owner: bool = False, storage: RecordsStorage | None = None,
+    simulation: Simulation | None = None, on_channel_invalidated: Callable[[str, Channel], None] = _ignore_invalidation,
+) -> FastAPI:
+    unavailable_code = "NOT_READY"
+    if simulation is None:
+        try:
+            simulation = load_simulation(config.simulation_profile)
+        except IncompatibleProfile:
+            unavailable_code = "PROTOCOL_UNSUPPORTED"
+        except (OSError, ValueError, KeyError, Image.DecompressionBombError):
+            # Records/diagnostics remain available if fixture evidence could not be validated.
+            pass
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owner: AbstractContextManager[None] = nullcontext() if held_owner else own_data_root(config.data_root)
         with owner:
             runtime = RecordsRuntime(storage or RecordsStorage(config.data_root))
             app.state.runtime = runtime
+            realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated)
             startup = asyncio.create_task(runtime.initialize())
+            tasks = (
+                asyncio.create_task(realtime.capture()), asyncio.create_task(realtime.maintain_projection()),
+            ) if simulation else ()
             try:
                 yield
             finally:
                 # Keep ownership until startup and admitted registrations have finished.
                 try:
+                    realtime.stop()
+                    for task in tasks:
+                        task.cancel()
+                    await asyncio.gather(*tasks, return_exceptions=True)
                     await startup
                     await runtime.stop()
                 finally:
@@ -80,6 +109,8 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
     app = FastAPI(
         lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False,
     )
+
+    app.state.socket_message_limit = simulation.profile.bound("max_client_message_bytes") if simulation else 4096
 
     @app.middleware("http")
     async def protect(request: Request, next_route: Callable[[Request], Awaitable[Response]]) -> Response:
@@ -112,7 +143,7 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
                     authorize_client(request, runtime, required=path in CLIENT_ROUTES)
                 allowed = LIST_QUERIES.get(path, ()) if not registering else ()
                 query = parse_query(request.scope["query_string"], allowed)
-                if not registering and path not in RETENTION_ROUTES:
+                if not registering and path not in RETENTION_ROUTES and path != "/websocket-tickets":
                     await require_empty_body(request)
                 if path == "/objects" and not registering:
                     validate_objects_query(query)
@@ -145,6 +176,21 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
         if context is None:
             return HttpError(503, "CAPACITY_REACHED", "Page capacity reached. Retry after a client expires.", True).response()
         return JSONResponse(context)
+
+    @app.post(API_PREFIX + "/websocket-tickets")
+    async def websocket_ticket(request: Request) -> JSONResponse:
+        runtime: RecordsRuntime = request.app.state.runtime
+        assert runtime.realtime is not None
+        return JSONResponse(await ticket_request(request, runtime.realtime))
+
+    @app.websocket(API_PREFIX + "/events")
+    @app.websocket(API_PREFIX + "/video/robot")
+    @app.websocket(API_PREFIX + "/video/webcam")
+    async def realtime_channel(socket: WebSocket) -> None:
+        runtime: RecordsRuntime = socket.app.state.runtime
+        assert runtime.realtime is not None
+        path = socket.scope["path"].removeprefix(API_PREFIX)
+        await runtime.realtime.serve(socket, CHANNELS[path], config)
 
     @app.get(API_PREFIX + "/health")
     async def health(request: Request) -> JSONResponse:
@@ -208,6 +254,10 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
             return error.response()
         if request.scope["path"] == API_PREFIX + "/settings":
             return JSONResponse(storage.settings)
+        if runtime.realtime and runtime.realtime.profile:
+            snapshot = await runtime.realtime.snapshot()
+            if snapshot is not None:
+                return JSONResponse(snapshot)
         return JSONResponse(await runtime.snapshot(storage))
 
     @app.post(API_PREFIX + "/settings/retention-preview")
