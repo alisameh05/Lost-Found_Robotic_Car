@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lost and Found event envelope v1",
+  "$ref": "./schemas.json#/$defs/EventEnvelope",
+  "x-laf-websocket": {
+    "path": "/events",
+    "protocol": "laf.v1",
+    "ticket_offer_prefix": "laf.ticket.",
+    "initial_message_type": "snapshot",
+    "incoming": {
+      "$ref": "./schemas.json#/$defs/WorkspaceHeartbeat"
+    }
+  }
+}

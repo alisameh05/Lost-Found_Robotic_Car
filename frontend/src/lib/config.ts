@@ -14,6 +14,7 @@ export function readConfig() {
   }
   return {
     fixtureEnabled: isFixtureMode(),
+    recordsEnabled: process.env.LAF_MODE === "records",
     backendBaseUrl: `http://127.0.0.1:${port}/api/v1`,
   };
 }

@@ -19,7 +19,7 @@ const filters = ["All", "Lost", "Found"] as const;
 type Filter = (typeof filters)[number];
 
 export function ObjectLibraryScreen() {
-  const { disconnected, removedOwners } = useRuntimeView();
+  const { disconnected, recordsMode, removedOwners } = useRuntimeView();
   const [name, setName] = useState("");
   const [filter, setFilter] = useState<Filter>("All");
   const normalizedName = normalizeObjectName(name);
@@ -58,7 +58,7 @@ export function ObjectLibraryScreen() {
             <Button onClick={clear}>Clear Search and Filters</Button>
           </Panel> : <Panel>
             <div role="status"><h2>No objects registered</h2></div>
-            <p>Register a belonging and select its reference target to begin.</p>
+            {!recordsMode && <p>Register a belonging and select its reference target to begin.</p>}
           </Panel>}
       </>)}
     {!tooLong && <div className={styles.paging} hidden={!showPaging}>

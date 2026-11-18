@@ -26,7 +26,7 @@ export function DashboardScreen() {
     <div className={styles.layout}>
       <div className={styles.dashboard}>
         <SearchStatus view={view} readiness={readiness} retry={refresh} />
-        <RecentObjects recent={recent} disconnected={view.disconnected} />
+        <RecentObjects recent={recent} disconnected={view.disconnected} recordsMode={view.recordsMode} />
         <DeviceReadiness view={view} readiness={readiness} refresh={refresh} />
         <RecentSearches recent={recent} disconnected={view.disconnected} />
       </div>
@@ -56,6 +56,9 @@ function SearchStatus({ view, readiness: { snapshot, active, mode }, retry }: {
         <p>{sessionState === "Paused" ? "The search stays active until you end it." : "End this session before starting another."}</p>
       </div>
     </> : view.loading ? <LoadingState label="Loading search status" />
+      : snapshot && view.recordsMode ? <Notice title="Search unavailable">
+        <Link href="/devices">Check device and qualification status</Link>
+      </Notice>
       : snapshot ? <p role="status">No active search</p>
       : <>
         <Notice title="Search status unavailable" tone="warning" role="status">
@@ -111,8 +114,8 @@ function DeviceReadiness({ view, readiness, refresh }: {
   </section>;
 }
 
-function RecentObjects({ recent: { objectPage, objects, retry }, disconnected }: {
-  recent: RecentRecords; disconnected?: boolean;
+function RecentObjects({ recent: { objectPage, objects, retry }, disconnected, recordsMode }: {
+  recent: RecentRecords; disconnected?: boolean; recordsMode?: boolean;
 }) {
   return <section className={styles.objects} aria-labelledby="dashboard-objects">
     <div className={styles.sectionHeading}>
@@ -124,8 +127,10 @@ function RecentObjects({ recent: { objectPage, objects, retry }, disconnected }:
         <Notice title="Recent objects unavailable" tone="warning" role="status">Saved registrations could not be retrieved.</Notice>
         {!disconnected && <Button onClick={retry}>Retry recent objects</Button>}
       </div> : objectPage.data.items.length === 0 ? <div className="feedback-stack">
-        <Notice title="Register your first object" role="status">Recent registrations will appear here.</Notice>
-        <div><RegisterLink /></div>
+        {recordsMode ? <Notice title="No objects registered" role="status" /> : <>
+          <Notice title="Register your first object" role="status">Recent registrations will appear here.</Notice>
+          <div><RegisterLink /></div>
+        </>}
       </div> : objects.length === 0 ? <div className="feedback-stack">
         <Notice title="Recent records are no longer available" role="status" tone="warning" />
         <Button onClick={retry}>Refresh recent objects</Button>

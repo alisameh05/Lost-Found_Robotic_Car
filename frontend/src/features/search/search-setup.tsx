@@ -17,6 +17,7 @@ import { searchSetupBlockReason, supportHref } from "@/lib/search-setup-context"
 import styles from "./search-setup.module.css";
 import { ActionFeedback } from "./action-feedback";
 import { SearchSaveControls } from "./search-fixture-controls";
+import { SearchUnavailable } from "./search-unavailable";
 
 const modes = [
   { value: "Gestures", label: "Gestures", detail: "Laptop webcam required.", icon: Hand },
@@ -24,6 +25,11 @@ const modes = [
 ] as const;
 
 export function SearchSetupScreen({ objectId, mode = "Gestures" }: { objectId: string; mode?: ControlMode }) {
+  const { recordsMode } = useRuntimeView();
+  return recordsMode ? <SearchUnavailable title="Search Setup" /> : <SavedSearchSetup objectId={objectId} mode={mode} />;
+}
+
+function SavedSearchSetup({ objectId, mode }: { objectId: string; mode: ControlMode }) {
   const { object, result, absence, retry } = useObjectRecord(objectId);
   return <div className={styles.page}>
     <PageHeader title="Search Setup" description="Review the saved target, choose a control mode, and check readiness." />

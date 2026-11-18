@@ -1,8 +1,8 @@
 import type { ReactNode } from "react";
 import { Sidebar } from "./sidebar";
 
-export function AppShell({ fixtureEnabled, activeSearch, priorityAction, children }: {
-  fixtureEnabled: boolean; activeSearch?: ReactNode; priorityAction?: ReactNode; children: ReactNode;
+export function AppShell({ fixtureEnabled, modeLabel, activeSearch, priorityAction, children }: {
+  fixtureEnabled: boolean; modeLabel?: string; activeSearch?: ReactNode; priorityAction?: ReactNode; children: ReactNode;
 }) {
   return (
     <div className="app-shell">
@@ -13,7 +13,7 @@ export function AppShell({ fixtureEnabled, activeSearch, priorityAction, childre
         <Sidebar />
         {activeSearch}
         <p className="mode-label">
-          {fixtureEnabled ? "Fixture mode · Sample data · No robot connected" : "Backend unavailable · No robot connected"}
+          {modeLabel ?? (fixtureEnabled ? "Fixture mode · Sample data · No robot connected" : "Backend unavailable · No robot connected")}
         </p>
       </aside>
       <main id="main-content" tabIndex={-1}>{priorityAction}{children}</main>

@@ -1,6 +1,7 @@
 "use client";
 
 import { createContext, useCallback, useContext, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
+import { usePathname } from "next/navigation";
 import type { ApplicationTransport, ProtectedPath, ReadResult } from "@/lib/transport";
 import type { createFixtureHarness } from "@/lib/create-transport";
 import { openRuntimeProjection, type RuntimeProjection, type RuntimeView } from "./projection";
@@ -25,9 +26,10 @@ const disconnected: RuntimeView = { ...unavailable, disconnected: true };
 const noSubscription = () => () => {};
 const initialView = () => loading;
 
-export function RuntimeProvider({ openTransport, harnessEnabled = false, children }: {
-  openTransport?: OpenTransport; harnessEnabled?: boolean; children: ReactNode;
+export function RuntimeProvider({ openTransport, harnessEnabled = false, recordsMode = false, children }: {
+  openTransport?: OpenTransport; harnessEnabled?: boolean; recordsMode?: boolean; children: ReactNode;
 }) {
+  const pathname = usePathname();
   const [selection, setSelection] = useState<Selection>({ id: "idle", generation: 0 });
   const [current, setCurrent] = useState<Connection>();
   const [harness, setHarness] = useState<Harness>();
@@ -45,30 +47,39 @@ export function RuntimeProvider({ openTransport, harnessEnabled = false, childre
         transport.dispose();
         return;
       }
-      runtime = openRuntimeProjection(transport);
+      runtime = openRuntimeProjection(transport, recordsMode);
       setHarness(harness);
       setCurrent({ runtime, fixture, generation: selection.generation });
       void runtime.refresh();
     }).catch(() => { if (!disposed) setFailed(selection.generation); });
     return () => { disposed = true; runtime?.dispose(); };
-  }, [openTransport, selection]);
+  }, [openTransport, recordsMode, selection]);
 
   const connection = current?.generation === selection.generation ? current : undefined;
   const runtime = connection?.runtime;
   useEffect(() => {
     if (!runtime) return;
     const wake = () => {
-      if (document.visibilityState === "visible" && !runtime.getView().loading) void runtime.refresh({ readBootstrap: true });
+      if (document.visibilityState === "visible" && !runtime.getView().loading) {
+        void runtime.refresh(recordsMode ? { revalidate: true } : { readBootstrap: true });
+      }
     };
+    const poll = recordsMode ? setInterval(() => {
+      if (document.visibilityState === "visible" && !runtime.getView().loading) void runtime.refresh();
+    }, 4_000) : undefined;
     window.addEventListener("focus", wake);
     window.addEventListener("online", wake);
     document.addEventListener("visibilitychange", wake);
     return () => {
+      clearInterval(poll);
       window.removeEventListener("focus", wake);
       window.removeEventListener("online", wake);
       document.removeEventListener("visibilitychange", wake);
     };
-  }, [runtime]);
+  }, [recordsMode, runtime]);
+  useEffect(() => {
+    if (recordsMode && pathname && runtime && !runtime.getView().loading) void runtime.refresh();
+  }, [pathname, recordsMode, runtime]);
   const view = useSyncExternalStore(
     connection?.runtime.subscribe ?? noSubscription,
     connection?.runtime.getView ?? (!openTransport ? () => disconnected : failed === selection.generation ? () => unavailable : initialView),
@@ -77,7 +88,7 @@ export function RuntimeProvider({ openTransport, harnessEnabled = false, childre
 
   return (
     <RuntimeContext value={{ connection, harnessEnabled, harness, selection, select }}>
-      <RuntimeViewContext value={view}>{children}</RuntimeViewContext>
+      <RuntimeViewContext value={recordsMode && !view.recordsMode ? { ...view, recordsMode } : view}>{children}</RuntimeViewContext>
     </RuntimeContext>
   );
 }

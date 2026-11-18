@@ -8,7 +8,7 @@ import support from "@/components/layout/support-page.module.css";
 import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { LoadingState, Notice } from "@/components/ui/feedback";
-import { useRefreshRuntime, useRuntime } from "@/features/runtime";
+import { useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import type { DeletionProgress, RetentionPreview } from "@/generated/api-v1";
 import { useRetention } from "./use-retention";
 import styles from "./settings.module.css";
@@ -22,6 +22,7 @@ export function RetentionSettingsScreen() {
 
 function SettingsEditor() {
   const state = useRetention();
+  const { recordsMode, failedRead } = useRuntimeView();
   const refresh = useRefreshRuntime();
   const { read, saved, blocked, active, ready, reviewing, busy, held } = state;
   const confirmationTitle = useId();
@@ -41,11 +42,23 @@ function SettingsEditor() {
     previousReview.current = reviewing;
   }, [blocked, held, ready, reviewing]);
 
+  if (recordsMode && saved) return <div className={support.page}>
+    <PageHeader title="Settings" description="View how long registered objects and evidence are kept." />
+    <section aria-label="Saved retention" className={styles.policy}>
+      <h2>Current saved retention</h2>
+      <p className={styles.saved}>{count(saved.retention_days, "day")}</p>
+      <p>Retention starts at the original registration time. Changes are unavailable in this build.</p>
+    </section>
+    <Deletion status={state.deletion} />
+  </div>;
+
   return <div className={support.page}>
     <PageHeader title="Settings" description="Manage how long registered objects and their evidence are kept." />
     {!saved ? read.result && read.result.kind !== "ok" ? <div className={styles.feedback}>
       <Notice role="alert" title="Settings unavailable" tone="danger">The saved retention period could not be read.</Notice>
       <Button onClick={read.retry}>Retry settings</Button>
+      {recordsMode && failedRead?.kind === "api-error" && failedRead.error.snapshot?.retention.deletion.status === "Failed" &&
+        <Deletion status={failedRead.error.snapshot.retention.deletion} />}
     </div> : <LoadingState label="Loading saved retention" /> : <>
       <div className={`${support.columns} ${styles.columns}`}>
         <div className={styles.editor}>

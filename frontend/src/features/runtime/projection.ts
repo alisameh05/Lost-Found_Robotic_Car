@@ -13,6 +13,7 @@ type EmergencyFeedback =
 
 type RuntimeView = {
   disconnected?: boolean;
+  recordsMode?: boolean;
   snapshot?: Snapshot;
   recordSnapshot?: Snapshot;
   failedRead?: Exclude<ReadResult<never>, { kind: "ok" }>;
@@ -32,10 +33,10 @@ type RuntimeView = {
 
 export type RegistrationAction = Pick<HttpRequest<"POST /objects">, "body" | "actionCreatedAtMs">;
 
-export function openRuntimeProjection(transport: ApplicationTransport) {
+export function openRuntimeProjection(transport: ApplicationTransport, recordsMode = false) {
   const lifetime = new AbortController();
   const subscribers = new Set<() => void>();
-  let view: RuntimeView = { loading: true };
+  let view: RuntimeView = { loading: true, recordsMode };
   let context: ProtectedRequest["context"] | undefined;
   let clock: { server: number; received: number } | undefined;
   let readRequest: AbortController | undefined;
@@ -88,14 +89,18 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     }
   }
 
-  async function refresh({ readBootstrap = false } = {}) {
+  async function refresh({ readBootstrap = false, revalidate = false } = {}) {
     if (lifetime.signal.aborted) return;
     readRequest?.abort();
     readRequest = new AbortController();
     const signal = AbortSignal.any([lifetime.signal, readRequest.signal]);
-    update({ loading: true });
+    if (recordsMode && revalidate) {
+      resetProtectedScope();
+      update({ connected: false, snapshot: undefined, recordSnapshot: undefined, failedRead: undefined, loading: true,
+        authority: (view.authority ?? 0) + 1 });
+    } else if (!recordsMode || !view.connected) update({ loading: true });
     try {
-      if (!context || readBootstrap) {
+      if (!context || (readBootstrap && !recordsMode)) {
         const bootstrapStarted = performance.now();
         const bootstrap = await transport.bootstrap(signal);
         if (signal.aborted) return;
@@ -132,7 +137,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         }
         context = bootstrap.data;
         clock = { server: bootstrap.data.server_time_ms, received: bootstrapStarted };
-        update({ connected: true, profile: sameProfile ? view.profile : profile,
+        update({ connected: !recordsMode, profile: sameProfile ? view.profile : profile,
           ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined,
             removedOwners: undefined, removedSessionId: undefined,
             emergency: undefined, authority: (view.authority ?? 0) + 1 }),
@@ -146,6 +151,15 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         transport.request("GET /health", request).catch(unavailable),
       ]);
       if (signal.aborted) return;
+      if (recordsMode && (invalidAuthority(status) || invalidAuthority(health))) {
+        resetProtectedScope();
+        context = undefined;
+        clock = undefined;
+        update({ loading: false, connected: false, health: undefined, snapshot: undefined, recordSnapshot: undefined,
+          failedRead: { kind: "unavailable" }, authority: (view.authority ?? 0) + 1 });
+        retryBootstrap();
+        return;
+      }
       const ordered = workspace !== undefined;
       const next = status.kind === "ok" && validSnapshot(status.data, request.context.backend_boot_id)
         ? withoutRemovedOwners(status.data, view.removedOwners) : undefined;
@@ -154,11 +168,21 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         searchActions.synchronize(next, request.context);
         reconcileEmergency(next);
       }
+      const diagnostics = health.kind === "ok" && health.data.backend_boot_id === request.context.backend_boot_id
+        ? health.data : undefined;
+      if (recordsMode && (!next || diagnostics?.storage_integrity !== "Healthy")) {
+        if (view.connected) resetProtectedScope();
+        update({ connected: false, snapshot: undefined, recordSnapshot: undefined, health: diagnostics, loading: false,
+          failedRead: status.kind === "api-error" ? status : unavailable(),
+          ...(view.connected && { authority: (view.authority ?? 0) + 1 }) });
+        return;
+      }
       update({
-        snapshot: ordered ? view.snapshot : next ? withoutRemovedOwners(next, view.removedOwners) : view.snapshot,
-        recordSnapshot: ordered ? view.recordSnapshot : next ? withoutRemovedOwners(next, view.removedOwners) : view.recordSnapshot,
+        snapshot: ordered ? view.snapshot : next ?? view.snapshot,
+        recordSnapshot: ordered ? view.recordSnapshot : next ?? view.recordSnapshot,
         failedRead: next || view.workspace?.eventsLive ? undefined : status.kind === "ok" ? unavailable() : status,
-        health: health.kind === "ok" ? health.data : undefined,
+        health: diagnostics,
+        ...(recordsMode && { connected: true }),
         loading: false,
         ...(next && !ordered && { recovering: false, reconnectingSessionId: undefined }),
       });
@@ -170,6 +194,10 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         if (view.recovering) retryBootstrap();
       }
     }
+  }
+
+  function invalidAuthority(result: ReadResult<unknown>) {
+    return result.kind === "api-error" && (result.error.code === "CAPABILITY_INVALID" || result.error.code === "CLIENT_INVALID");
   }
 
   function retryBootstrap() {
@@ -237,6 +265,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     const scoped = AbortSignal.any([signal, scope, protectedScope.signal, lifetime.signal]);
     const result = await load({ context, signal: scoped });
     scoped.throwIfAborted();
+    if (recordsMode && invalidAuthority(result)) void refresh();
     return result;
   }
 
