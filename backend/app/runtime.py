@@ -57,6 +57,10 @@ def mutation(action_id: str, persistence: str, status: int, error: HttpError | N
     }), status, None)
 
 
+def registration_unknown() -> HttpError:
+    return HttpError(500, "INTERNAL_ERROR", "The registration outcome is unknown. Retry the same request.", True)
+
+
 @dataclass
 class RecordsRuntime:
     storage: RecordsStorage
@@ -159,10 +163,15 @@ class RecordsRuntime:
         return {"items": items, "next_cursor": next_cursor}
 
     async def register(self, registration: Registration, authorize: Callable[[], None]) -> Receipt:
-        self.check_started()
+        try:
+            self.check_started()
+        except HttpError as exc:
+            if exc.code == "STORAGE_UNAVAILABLE":
+                raise registration_unknown() from exc
+            raise
         fingerprint = await asyncio.to_thread(registration.fingerprint)
         async with self._admission:
-            receipt = await asyncio.to_thread(self.storage.receipt, registration.action_id, fingerprint)
+            receipt = await self.find_registration_receipt(registration.action_id, fingerprint)
             if receipt:
                 return receipt
             action_id = registration.action_id
@@ -174,7 +183,7 @@ class RecordsRuntime:
                 return pending[0].response
             if previous and previous.owner:
                 # The writer may have committed between the receipt read and the pending check.
-                receipt = await asyncio.to_thread(self.storage.receipt, action_id, fingerprint)
+                receipt = await self.find_registration_receipt(action_id, fingerprint)
                 if receipt:
                     return receipt
             authorize()
@@ -193,6 +202,12 @@ class RecordsRuntime:
         done, _ = await asyncio.wait((task,), timeout=0.15)
         return task.result() if done else operation.response
 
+    async def find_registration_receipt(self, action_id: str, fingerprint: str) -> Receipt | None:
+        try:
+            return await asyncio.to_thread(self.storage.receipt, action_id, fingerprint)
+        except (OSError, sqlite3.Error) as exc:
+            raise registration_unknown() from exc
+
     async def finish_registration(self, registration: Registration, reference: Reference, fingerprint: str) -> Receipt:
         action_id = registration.action_id
         owner = None
@@ -204,7 +219,7 @@ class RecordsRuntime:
             try:
                 recovered = await asyncio.to_thread(self.storage.receipt, action_id, fingerprint)
             except (OSError, sqlite3.Error, HttpError):
-                unknown = HttpError(500, "INTERNAL_ERROR", "The registration outcome is unknown. Retry the same request.", True)
+                unknown = registration_unknown()
                 return Receipt(bytes(unknown.response().body).decode(), unknown.status, None)
             if recovered is not None:
                 receipt = recovered

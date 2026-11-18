@@ -1,4 +1,4 @@
-"""Process test entry point that exits at a registration persistence boundary."""
+"""Registration process test controls for persistence boundaries and clock changes."""
 import os
 import sys
 from pathlib import Path
@@ -7,7 +7,7 @@ from time import monotonic, sleep
 from backend.app import __main__ as entry
 from backend.app.config import Config
 from backend.app.main import create_app
-from backend.app.storage import RecordsStorage
+from backend.app.storage import RecordsStorage, utc_ms
 
 
 def crash_at_checkpoint(name: str) -> None:
@@ -24,9 +24,12 @@ def crash_at_checkpoint(name: str) -> None:
 
 
 def test_app(config: Config, *, held_owner: bool = False):
-    return create_app(config, held_owner=held_owner, storage=RecordsStorage(
-        config.data_root, checkpoint=crash_at_checkpoint,
-    ))
+    if sys.argv[1] == "clock":
+        source = Path(sys.argv[2])
+        storage = RecordsStorage(config.data_root, clock=lambda: utc_ms() + int(source.read_text()))
+    else:
+        storage = RecordsStorage(config.data_root, checkpoint=crash_at_checkpoint)
+    return create_app(config, held_owner=held_owner, storage=storage)
 
 
 if __name__ == "__main__":

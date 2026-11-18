@@ -20,6 +20,7 @@ from PIL import Image
 
 from backend.app.config import Config
 from backend.app.main import create_app
+from backend.app.managed_media import ManagedEntry
 from backend.app.storage import DAY_MS, SUBMISSION_WINDOW, RecordsStorage
 from backend.tests.test_process import connect, free_port, launch, raw_http
 from backend.tests.test_records import BASE, credentials, wait_for_health
@@ -68,6 +69,13 @@ def image_bytes(
 
 def png_chunk(kind: bytes, payload: bytes) -> bytes:
     return struct.pack(">I", len(payload)) + kind + payload + struct.pack(">I", zlib.crc32(kind + payload))
+
+
+def incomplete_jpeg_scan() -> bytes:
+    source = image_bytes("RGB", "JPEG", (64, 64))
+    scan = source.index(b"\xff\xda")
+    start = scan + 2 + int.from_bytes(source[scan + 2:scan + 4], "big")
+    return source[:start + 2] + b"\xff\xd9"
 
 
 def test_registration_reopens_managed_reference(tmp_path: Path) -> None:
@@ -207,10 +215,31 @@ def test_storage_failure_rolls_back_and_same_action_can_retry(tmp_path: Path, fa
         assert submit(browser, headers, action=action, submitted=anchor).status_code == 201
 
 
+@pytest.mark.parametrize("failure", [errno.EACCES, errno.ENOSPC])
+def test_staging_write_failure_keeps_records_empty(
+    tmp_path: Path, failure: int, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    def deny_stage(_: ManagedEntry) -> None:
+        raise OSError(failure, "Injected staging filesystem failure")
+
+    with TestClient(create_app(Config(tmp_path)), base_url=BASE) as browser:
+        headers = credentials(browser)
+        wait_for_health(browser, headers)
+        action, anchor = str(uuid4()), now_ms()
+        with monkeypatch.context() as faults:
+            faults.setattr(ManagedEntry, "open_stage", deny_stage)
+            denied = submit(browser, headers, action=action, submitted=anchor)
+        assert denied.status_code == 503 and denied.json()["persistence"] == "Failed"
+        assert browser.get(OBJECTS, headers=headers).json()["items"] == []
+        assert not list((tmp_path / "media").iterdir())
+        assert submit(browser, headers, action=action, submitted=anchor).status_code == 201
+
+
 @pytest.mark.parametrize(("image", "status"), [
     (lambda: b"not a photograph", 422),
     (lambda: PNG[:-7], 422),
     (lambda: PNG.replace(b"\xa5\xf6", b"\x00\x01"), 422),
+    (incomplete_jpeg_scan, 422),
     (lambda: image_bytes("CMYK", "JPEG"), 422),
     (lambda: image_bytes("I;16", "PNG"), 422),
     (lambda: PNG[:33] + png_chunk(b"acTL", struct.pack(">II", 2, 0)) + PNG[33:], 422),
@@ -341,6 +370,81 @@ def test_clock_and_receipt_replay_across_authority_and_age(tmp_path: Path) -> No
                 break
         assert browser.get(response.headers["location"], headers=headers).status_code == 410
         assert submit(browser, headers, submitted=wall).status_code == 503
+
+
+def test_backward_clock_fault_survives_restart_before_clock_is_restored(tmp_path: Path) -> None:
+    anchor = wall = now_ms()
+    mono = 0.0
+    config = Config(tmp_path)
+
+    def application():
+        return create_app(config, storage=RecordsStorage(tmp_path, clock=lambda: wall, monotonic=lambda: mono))
+
+    with TestClient(application(), base_url=BASE) as browser:
+        headers = credentials(browser)
+        wait_for_health(browser, headers)
+        mono += 700
+        wall += 50
+        rejected = submit(browser, headers, submitted=anchor)
+        assert rejected.status_code == 503 and rejected.json()["code"] == "NOT_READY"
+    with TestClient(application(), base_url=BASE) as browser:
+        headers = credentials(browser)
+        wait_for_health(browser, headers)
+        assert submit(browser, headers, submitted=anchor).json()["code"] == "NOT_READY"
+        wall = anchor + 700_000
+        assert submit(browser, headers, submitted=anchor).json()["code"] == "ACTION_EXPIRED"
+        assert submit(browser, headers, submitted=wall).status_code == 201
+
+
+def test_backward_clock_during_commit_survives_rollback_and_restart(tmp_path: Path) -> None:
+    wall = now_ms()
+    mono = 0.0
+
+    def jump_during_write(boundary: str) -> None:
+        nonlocal wall, mono
+        if boundary == "promoted":
+            mono += 700
+            wall += 50
+
+    config = Config(tmp_path)
+    with TestClient(create_app(config, storage=RecordsStorage(
+        tmp_path, clock=lambda: wall, monotonic=lambda: mono, checkpoint=jump_during_write,
+    )), base_url=BASE) as browser:
+        headers = credentials(browser)
+        wait_for_health(browser, headers)
+        rejected = submit(browser, headers, submitted=wall)
+        assert rejected.status_code == 503
+        assert rejected.json()["error"]["code"] == "NOT_READY"
+        assert browser.get(OBJECTS, headers=headers).json()["items"] == []
+    with TestClient(create_app(config, storage=RecordsStorage(
+        tmp_path, clock=lambda: wall, monotonic=lambda: mono,
+    )), base_url=BASE) as browser:
+        headers = credentials(browser)
+        wait_for_health(browser, headers)
+        assert submit(browser, headers, submitted=wall).json()["code"] == "NOT_READY"
+
+
+def test_receipt_query_failure_remains_an_unknown_outcome(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    with TestClient(create_app(Config(tmp_path)), base_url=BASE) as browser:
+        headers = credentials(browser)
+        wait_for_health(browser, headers)
+        action, anchor = str(uuid4()), now_ms()
+        first = submit(browser, headers, action=action, submitted=anchor)
+        assert first.status_code == 201
+        receipt = RecordsStorage.receipt
+
+        def unreadable(*args: object) -> None:
+            raise sqlite3.OperationalError("Injected receipt read failure")
+
+        with monkeypatch.context() as faults:
+            faults.setattr(RecordsStorage, "receipt", unreadable)
+            uncertain = submit(browser, headers, action=action, submitted=anchor)
+            assert uncertain.status_code == 500 and uncertain.json()["code"] == "INTERNAL_ERROR"
+            assert "outcome is unknown" in uncertain.json()["message"]
+        assert RecordsStorage.receipt is receipt
+        replay = submit(browser, headers, action=action, submitted=anchor)
+        assert replay.content == first.content
+        assert len(browser.get(OBJECTS, headers=headers).json()["items"]) == 1
 
 
 def test_found_records_media_errors_and_independent_duplicate(tmp_path: Path) -> None:

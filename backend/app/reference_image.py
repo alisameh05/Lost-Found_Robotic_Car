@@ -5,6 +5,7 @@ from dataclasses import dataclass
 from io import BytesIO
 
 from PIL import Image, ImageOps, UnidentifiedImageError
+from simplejpeg import decode_jpeg  # type: ignore[import-untyped]
 
 from .http import HttpError
 from .registration_input import Registration, invalid
@@ -171,6 +172,21 @@ def inspect_png(source: bytes) -> tuple[bytes, int]:
     raise ValueError
 
 
+def decode_reference(source: bytes, kind: str) -> Image.Image:
+    if kind == "PNG":
+        return Image.open(BytesIO(source), formats=[kind])
+    # Pillow tolerates some incomplete entropy scans. Strict libjpeg warnings must fail admission.
+    with Image.open(BytesIO(source), formats=[kind]) as metadata:
+        image = Image.fromarray(decode_jpeg(source, strict=True))
+        if image.size != metadata.size:
+            image.close()
+            raise ValueError
+        exif = metadata.info.get("exif")
+        if exif:
+            image.info["exif"] = exif
+        return image
+
+
 def prepare_reference(registration: Registration) -> Reference:
     source = registration.image
     palette = 0
@@ -183,7 +199,7 @@ def prepare_reference(registration: Registration) -> Reference:
             kind = "JPEG"
         else:
             raise invalid("/reference_image", "Choose a JPEG or PNG reference image.")
-        with Image.open(BytesIO(source), formats=[kind]) as image:
+        with decode_reference(source, kind) as image:
             image.load()
             if palette:
                 extrema = image.getextrema()

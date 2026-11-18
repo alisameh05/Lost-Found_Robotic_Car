@@ -2,7 +2,11 @@ import hashlib
 import os
 import re
 import stat
+from collections.abc import Iterator
+from contextlib import ExitStack, contextmanager
+from dataclasses import dataclass
 from pathlib import Path
+from typing import BinaryIO
 
 from .http import DOMAIN_ID
 
@@ -20,27 +24,121 @@ def sync_directory(path: Path) -> None:
             os.close(handle)
 
 
-def move_durable(source: Path, target: Path) -> None:
+def redirected(entry: os.stat_result) -> bool:
+    return stat.S_ISLNK(entry.st_mode) or bool(
+        getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT,
+    )
+
+
+def close_windows_handle(handle: int) -> None:
+    from ctypes import WinDLL, wintypes
+
+    close = WinDLL("kernel32", use_last_error=True).CloseHandle
+    close.argtypes = (wintypes.HANDLE,)
+    close.restype = wintypes.BOOL
+    close(handle)
+
+
+def open_windows_entry(path: Path, *, directory: bool) -> int:
+    from ctypes import WinDLL, WinError, get_last_error, sizeof, wintypes
+
+    kernel = WinDLL("kernel32", use_last_error=True)
+    create = kernel.CreateFileW
+    create.argtypes = (wintypes.LPCWSTR, wintypes.DWORD, wintypes.DWORD, wintypes.LPVOID,
+                       wintypes.DWORD, wintypes.DWORD, wintypes.HANDLE)
+    create.restype = wintypes.HANDLE
+    # Keep directory entries pinned by denying write/delete sharing. Open the entry itself,
+    # rather than letting a junction or symbolic link select the target of the operation.
+    access = 0x80 if directory else 0x80000000  # FILE_READ_ATTRIBUTES / GENERIC_READ
+    flags = 0x00200000 | (0x02000000 if directory else 0)  # OPEN_REPARSE_POINT / BACKUP_SEMANTICS
+    handle = create(str(path), access, 1, None, 3, flags, None)  # FILE_SHARE_READ / OPEN_EXISTING
+    if handle is None or handle == wintypes.HANDLE(-1).value:
+        raise WinError(get_last_error())
+    attributes = (wintypes.DWORD * 2)()
+    inspect = kernel.GetFileInformationByHandleEx
+    inspect.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD)
+    inspect.restype = wintypes.BOOL
+    if not inspect(handle, 9, attributes, sizeof(attributes)):  # FileAttributeTagInfo
+        error = WinError(get_last_error())
+        close_windows_handle(handle)
+        raise error
+    if attributes[0] & stat.FILE_ATTRIBUTE_REPARSE_POINT or bool(attributes[0] & 0x10) != directory:
+        close_windows_handle(handle)
+        raise OSError("Invalid managed filesystem entry")
+    return int(handle)
+
+
+@dataclass(frozen=True)
+class ManagedEntry:
+    path: Path
+    parent_fd: int | None
+
+    def stat(self) -> os.stat_result:
+        if self.parent_fd is None:
+            return self.path.lstat()
+        return os.stat(self.path.name, dir_fd=self.parent_fd, follow_symlinks=False)
+
+    def sync_parent(self) -> None:
+        if self.parent_fd is not None:
+            os.fsync(self.parent_fd)
+
+    def check(self) -> None:
+        try:
+            entry = self.stat()
+        except FileNotFoundError:
+            return
+        if redirected(entry) or not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
+            raise OSError("Unsafe managed media file")
+
+    def open_read(self) -> BinaryIO:
+        if self.parent_fd is None:
+            from msvcrt import open_osfhandle
+
+            handle = open_windows_entry(self.path, directory=False)
+            try:
+                fd = open_osfhandle(handle, os.O_RDONLY | os.O_BINARY)
+            except BaseException:
+                close_windows_handle(handle)
+                raise
+        else:
+            fd = os.open(self.path.name, os.O_RDONLY | getattr(os, "O_NOFOLLOW", 0), dir_fd=self.parent_fd)
+        return os.fdopen(fd, "rb")
+
+    def open_stage(self) -> BinaryIO:
+        if self.parent_fd is None:
+            return self.path.open("xb")
+        fd = os.open(self.path.name, os.O_CREAT | os.O_EXCL | os.O_WRONLY, 0o600, dir_fd=self.parent_fd)
+        return os.fdopen(fd, "wb")
+
+    def discard(self) -> None:
+        try:
+            if self.parent_fd is None:
+                self.path.unlink()
+            else:
+                os.unlink(self.path.name, dir_fd=self.parent_fd)
+        except FileNotFoundError:
+            pass
+        self.sync_parent()
+
+
+def move_durable(source: ManagedEntry, target: ManagedEntry) -> None:
     if os.name == "nt":
         from ctypes import WinDLL, WinError, get_last_error, wintypes
 
         move = WinDLL("kernel32", use_last_error=True).MoveFileExW
         move.argtypes = (wintypes.LPCWSTR, wintypes.LPCWSTR, wintypes.DWORD)
         move.restype = wintypes.BOOL
-        if not move(str(source), str(target), 0x8):  # MOVEFILE_WRITE_THROUGH without replacement
+        if not move(str(source.path), str(target.path), 0x8):  # MOVEFILE_WRITE_THROUGH without replacement
             raise WinError(get_last_error())
     else:
-        if target.exists():
-            raise FileExistsError(target)
-        os.rename(source, target)
-        sync_directory(target.parent)
-        sync_directory(source.parent)
-
-
-def redirected(entry: os.stat_result) -> bool:
-    return stat.S_ISLNK(entry.st_mode) or bool(
-        getattr(entry, "st_file_attributes", 0) & stat.FILE_ATTRIBUTE_REPARSE_POINT,
-    )
+        try:
+            target.stat()
+        except FileNotFoundError:
+            os.rename(source.path.name, target.path.name, src_dir_fd=source.parent_fd, dst_dir_fd=target.parent_fd)
+        else:
+            raise FileExistsError(target.path)
+        target.sync_parent()
+        source.sync_parent()
 
 
 class ManagedMedia:
@@ -60,46 +158,54 @@ class ManagedMedia:
             raise OSError("Unsafe managed storage directory")
         return directory
 
-    def path(self, relative: str) -> Path:
+    @contextmanager
+    def entry(self, relative: str) -> Iterator[ManagedEntry]:
         folder, separator, name = relative.partition("/")
         pattern = STAGING_NAME if folder == "staging" else MEDIA_NAME if folder == "media" else None
         if not separator or pattern is None or not pattern.fullmatch(name):
             raise OSError("Invalid managed relative path")
-        path = self.directory(folder) / name
-        try:
-            entry = path.lstat()
-        except FileNotFoundError:
-            return path
-        if redirected(entry) or not stat.S_ISREG(entry.st_mode) or entry.st_nlink != 1:
-            raise OSError("Unsafe managed media file")
-        return path
+        parent = self.root / folder
+        with ExitStack() as directories:
+            parent_fd = None
+            if os.name == "nt":
+                for directory in (*reversed(parent.parents), parent):
+                    handle = open_windows_entry(directory, directory=True)
+                    directories.callback(close_windows_handle, handle)
+            else:
+                flags = os.O_RDONLY | getattr(os, "O_DIRECTORY", 0) | getattr(os, "O_NOFOLLOW", 0)
+                for directory_name in parent.parts:
+                    parent_fd = os.open(directory_name, flags, dir_fd=parent_fd)
+                    directories.callback(os.close, parent_fd)
+            entry = ManagedEntry(parent / name, parent_fd)
+            entry.check()
+            yield entry
 
     def stage(self, relative: str, data: bytes) -> str:
-        path = self.path(relative)
         checksum = hashlib.sha256(data).hexdigest()
-        with path.open("xb") as handle:
-            handle.write(data)
-            handle.flush()
-            os.fsync(handle.fileno())
-        sync_directory(path.parent)
+        with self.entry(relative) as entry:
+            with entry.open_stage() as handle:
+                handle.write(data)
+                handle.flush()
+                os.fsync(handle.fileno())
+            entry.sync_parent()
         availability, _ = self.read(relative, len(data), checksum)
         if availability != "Available":
             raise OSError("Cannot verify staged reference")
         return checksum
 
     def promote(self, staging: str, final: str) -> None:
-        move_durable(self.path(staging), self.path(final))
+        with self.entry(staging) as source, self.entry(final) as target:
+            move_durable(source, target)
 
     def discard(self, relative: str) -> None:
-        path = self.path(relative)
-        path.unlink(missing_ok=True)
-        sync_directory(path.parent)
+        with self.entry(relative) as entry:
+            entry.discard()
 
     def read(
         self, relative: str, byte_length: int, checksum: str, *, metadata_only: bool = False,
     ) -> tuple[str, bytes | None]:
         try:
-            with self.path(relative).open("rb") as handle:
+            with self.entry(relative) as entry, entry.open_read() as handle:
                 info = os.fstat(handle.fileno())
                 if (redirected(info) or not stat.S_ISREG(info.st_mode)
                         or info.st_nlink != 1 or info.st_size != byte_length):
@@ -108,8 +214,10 @@ class ManagedMedia:
                 if byte_length > 100_000_000:
                     return "Corrupt", None
                 if metadata_only:
-                    digest = hashlib.file_digest(handle, "sha256").hexdigest()
-                    return ("Available" if digest == checksum else "Corrupt"), None
+                    digest = hashlib.sha256()
+                    for chunk in iter(lambda: handle.read(128 * 1024), b""):
+                        digest.update(chunk)
+                    return ("Available" if digest.hexdigest() == checksum else "Corrupt"), None
                 data = handle.read(byte_length + 1)
         except FileNotFoundError:
             return "Missing", None

@@ -70,6 +70,8 @@ def test_approved_models_and_route_catalogue_match_the_backend_exports(tmp_path:
         if key == ("post", "/objects"):
             parts = operation["requestBody"]["content"]["multipart/form-data"]["schema"]
             assert set(parts["required"]) == {"action_id", "name", "reference_image", "roi"}
+            failures = operation["responses"]["default"]["content"]["application/json"]["schema"]["oneOf"]
+            assert [definition_of(ref) for ref in failures] == ["Error", "MutationResponse"]
         elif key[0] != "get":
             request_type = re.search(r"`(\w+)`", request)
             assert request_type

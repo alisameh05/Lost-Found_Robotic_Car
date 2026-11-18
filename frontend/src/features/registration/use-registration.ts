@@ -73,7 +73,7 @@ export function useRegistration(runtime?: RuntimeProjection) {
       signal.throwIfAborted();
       if (result.kind === "api-error" && (!result.error.action_id || result.error.action_id === action.body.action_id)) {
         if (result.error.code === "CAPABILITY_INVALID" || result.error.code === "CLIENT_INVALID" ||
-            result.error.code === "INTERNAL_ERROR") {
+            result.error.code === "INITIALIZING" || result.error.code === "INTERNAL_ERROR") {
           setSave({ kind: "uncertain" });
         } else {
           fail(result.error);

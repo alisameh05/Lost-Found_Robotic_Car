@@ -15,10 +15,13 @@ let backendProcess: ChildProcess | undefined;
 
 test.use({ baseURL: frontend });
 
-async function startBackend(options: { initializationGate?: string; crashAfterCommit?: boolean; registrationGate?: string } = {}) {
+async function startBackend(options: {
+  initializationGate?: string; crashAfterCommit?: boolean; registrationGate?: string; clockOffset?: string;
+} = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
     : options.registrationGate ? ["backend.tests.crash_registration", "journaled", options.registrationGate]
+    : options.clockOffset ? ["backend.tests.crash_registration", "clock", options.clockOffset]
     : ["backend.app"];
   const child = spawn(python, ["-m", ...entry], {
     cwd: repo, windowsHide: true, env: {
@@ -223,12 +226,10 @@ test("registers an oriented reference and reopens its target after actual proces
 
 test("recovers a lost committed response with the same request after restart", async ({ page }) => {
   await startBackend({ crashAfterCommit: true });
-  const observations: { time: string; action: string }[] = [];
+  const submissionTimes: string[] = [];
   page.on("request", (request) => {
     if (request.method() !== "POST" || request.url() !== backend + "/objects") return;
-    const payload = request.postDataBuffer()?.toString("latin1") ?? "";
-    const action = /name="action_id"\r\n\r\n([0-9a-f-]{36})/.exec(payload)?.[1] ?? "";
-    observations.push({ time: request.headers()["x-action-created-at-ms"], action });
+    submissionTimes.push(request.headers()["x-action-created-at-ms"]);
   });
   await selectTarget(page, sourceImage(), "Restart recovery card");
   await setTargetCoordinates(page);
@@ -237,6 +238,11 @@ test("recovers a lost committed response with the same request after restart", a
   await expect(page).toHaveURL(/\/objects\/new$/);
   const reopenedHealth = page.waitForResponse((reply) => reply.url() === backend + "/health" && reply.status() === 200);
   await stopBackend();
+  const committedReceipt = execFileSync(python, [
+    "-c", "import sqlite3,sys; db = sqlite3.connect(sys.argv[1]); " +
+      "print(db.execute('SELECT response_body FROM action_receipts').fetchone()[0])",
+    join(parent, "records", "records.sqlite3"),
+  ], { windowsHide: true });
   await startBackend();
   await reopenedHealth;
   await expect(page.getByText("Records connected · Search unavailable")).toBeVisible();
@@ -244,11 +250,12 @@ test("recovers a lost committed response with the same request after restart", a
   await page.getByRole("button", { name: "Retry Same Request" }).click();
   await expect(page.getByRole("heading", { name: "Object Details" })).toBeVisible();
   await expect(page.getByRole("img", { name: "Reference for Restart recovery card", exact: true })).toBeVisible();
-  expect((await response).status()).toBe(201);
-  expect(observations).toHaveLength(2);
-  expect(observations[0].action).toMatch(/^[0-9a-f-]{36}$/);
-  expect(observations[0].time).toMatch(/^[0-9]+$/);
-  expect(observations[0]).toEqual(observations[1]);
+  const replay = await response;
+  expect(replay.status()).toBe(201);
+  expect(await replay.json()).toEqual(JSON.parse(committedReceipt.toString()));
+  expect(submissionTimes).toHaveLength(2);
+  expect(submissionTimes[0]).toMatch(/^[0-9]+$/);
+  expect(submissionTimes[1]).toBe(submissionTimes[0]);
   await page.getByRole("link", { name: "Back to Objects" }).click();
   await expect(page.getByRole("link", { name: "View details for Restart recovery card" })).toHaveCount(1);
 });
@@ -287,4 +294,22 @@ test("opens a known expired object directly without retrieving its image", async
   await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
   await expect(page.getByText("Expired reference", { exact: true })).toHaveCount(0);
   expect(requests.some((request) => request.includes("/media/"))).toBe(false);
+});
+
+test("starts a new submission from the backend clock after an expired action", async ({ page }) => {
+  const offset = join(parent, "clock-offset");
+  writeFileSync(offset, "0");
+  await startBackend({ clockOffset: offset });
+  await selectTarget(page, sourceImage(), "Clock recovery card");
+  await setTargetCoordinates(page);
+  await expect(page.getByText("Records connected · Search unavailable")).toBeVisible();
+  writeFileSync(offset, "700000");
+  const submit = page.getByRole("button", { name: "Register Object", exact: true });
+  const expired = page.waitForResponse((reply) => reply.url() === backend + "/objects" && reply.request().method() === "POST");
+  await submit.click();
+  expect((await expired).status()).toBe(410);
+  await expect(page.getByText("Registration expired", { exact: true })).toBeVisible();
+  await expect(page.getByRole("textbox", { name: "Width · px" })).toHaveValue("30");
+  await submit.click();
+  await expect(page.getByRole("heading", { name: "Object Details", exact: true })).toBeVisible();
 });

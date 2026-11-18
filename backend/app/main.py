@@ -43,6 +43,7 @@ def validate_objects_query(query: dict[str, str]) -> None:
         significant = limit.lstrip("0")
         if not significant or len(significant) > 3 or int(significant) > 100:
             raise invalid_query("OUT_OF_RANGE", "/query/limit")
+        query["limit"] = significant
 
 
 def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStorage | None = None) -> FastAPI:
@@ -56,9 +57,12 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
             try:
                 yield
             finally:
-                # Keep the lock until background initialization has finished.
-                await startup
-                await runtime.stop()
+                # Keep ownership until startup and admitted registrations have finished.
+                try:
+                    await startup
+                    await runtime.stop()
+                finally:
+                    await asyncio.to_thread(runtime.storage.close)
 
     app = FastAPI(
         lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False,

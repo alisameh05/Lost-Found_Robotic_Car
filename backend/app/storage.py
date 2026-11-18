@@ -25,6 +25,8 @@ GRACE = """EXISTS (SELECT 1 FROM sessions AS active
                    WHERE active.object_id = o.id AND active.state IN ('Searching', 'Paused'))"""
 DELETING = """(o.deletion_pending OR EXISTS (
                SELECT 1 FROM storage_operations AS purge WHERE purge.kind = 'Purge' AND purge.owner_object_id = o.id))"""
+EXPIRED = f"(o.registered_at_ms <= ? AND NOT {GRACE})"
+ELIGIBLE = f"(NOT {DELETING} AND NOT {EXPIRED})"
 OBJECT_ROWS = f"""
     SELECT o.*, m.relative_path, m.format, m.byte_length, m.checksum, m.created_at_ms,
            {GRACE} AS grace, {DELETING} AS deleting
@@ -45,6 +47,7 @@ class Inspection:
     cleanup_pending: bool = False
     remaining_objects: int = 0
     remaining_files: int = 0
+    recovery_pending: bool = False
 
 
 class IncompatibleStorage(Exception):
@@ -147,6 +150,7 @@ class RecordsStorage:
         self.path = root / "records.sqlite3"
         self.files = ManagedMedia(root)
         self.writer = Lock()
+        self._writer_connection: sqlite3.Connection | None = None
         self.clock = clock
         self.monotonic = monotonic
         self.checkpoint = checkpoint or (lambda _: None)
@@ -155,48 +159,78 @@ class RecordsStorage:
         self._repair_needed = False
         self._anchor = (clock(), monotonic())
 
-    @contextmanager
-    def connect(self, *, initialize: bool = False, write: bool = False) -> Iterator[sqlite3.Connection]:
+    def open_database(self, mode: str) -> sqlite3.Connection:
         if self.path.is_symlink():
             raise OSError
-        mode = "rwc" if initialize else "rw" if write else "ro"
-        with closing(sqlite3.connect(f"{self.path.as_uri()}?mode={mode}", uri=True, isolation_level=None)) as db:
+        db = sqlite3.connect(f"{self.path.as_uri()}?mode={mode}", uri=True, isolation_level=None,
+                             check_same_thread=mode == "ro")
+        try:
             db.execute("PRAGMA foreign_keys = ON")
             db.execute("PRAGMA synchronous = FULL")
+        except BaseException:
+            db.close()
+            raise
+        return db
+
+    @contextmanager
+    def connect(self) -> Iterator[sqlite3.Connection]:
+        with closing(self.open_database("ro")) as db:
             yield db
 
+    @contextmanager
+    def mutation_connection(self) -> Iterator[sqlite3.Connection]:
+        with self.writer:
+            if self._writer_connection is None:
+                raise OSError("Records writer is closed")
+            yield self._writer_connection
+
     def initialize(self) -> None:
-        with self.writer, self.connect(initialize=True) as db:
-            # Detect incompatible manifests before making durability changes to an existing database.
-            migrate(db)
-            if db.execute("PRAGMA journal_mode = WAL").fetchone() != ("wal",):
-                raise IncompatibleStorage
-            row = db.execute("""
-                SELECT MAX(observed_at_ms, COALESCE((SELECT MAX(registered_at_ms) FROM objects), 0))
-                FROM registration_clock WHERE id = 1
-            """).fetchone()
-            if row is None:
-                raise IncompatibleStorage
-            self._wall_floor = row[0]
-            self.persist_clock(db, self.now()[0])
-            self.files.directory("media", create=True)
-            self.files.directory("staging", create=True)
-            sync_directory(self.files.root)
+        with self.writer:
+            db = self.open_database("rwc")
             try:
-                self.recover_preparations(db)
-            except (OSError, sqlite3.Error) as exc:
-                raise StorageRecoveryRequired(RECONCILE_ERROR) from exc
-            if db.execute("SELECT 1 FROM sessions WHERE state <> 'Ended' LIMIT 1").fetchone() or db.execute(
-                "SELECT 1 FROM match_events WHERE disposition = 'Pending' LIMIT 1"
-            ).fetchone():
-                raise StorageRecoveryRequired("Interrupted search records need recovery. Keep the data intact.")
+                self.recover_database(db)
+            except BaseException:
+                db.close()
+                raise
+            self._writer_connection = db
+
+    def recover_database(self, db: sqlite3.Connection) -> None:
+        # Detect incompatible manifests before making durability changes to an existing database.
+        migrate(db)
+        if db.execute("PRAGMA journal_mode = WAL").fetchone() != ("wal",):
+            raise IncompatibleStorage
+        row = db.execute("""
+            SELECT MAX(observed_at_ms, COALESCE((SELECT MAX(registered_at_ms) FROM objects), 0))
+            FROM registration_clock WHERE id = 1
+        """).fetchone()
+        if row is None:
+            raise IncompatibleStorage
+        self._wall_floor = row[0]
+        self.persist_clock(db, self.now()[0])
+        self.files.directory("media", create=True)
+        self.files.directory("staging", create=True)
+        sync_directory(self.files.root)
+        try:
+            self.recover_preparations(db)
+        except (OSError, sqlite3.Error) as exc:
+            raise StorageRecoveryRequired(RECONCILE_ERROR) from exc
+        if db.execute("SELECT 1 FROM sessions WHERE state <> 'Ended' LIMIT 1").fetchone() or db.execute(
+            "SELECT 1 FROM match_events WHERE disposition = 'Pending' LIMIT 1"
+        ).fetchone():
+            raise StorageRecoveryRequired("Interrupted search records need recovery. Keep the data intact.")
+
+    def close(self) -> None:
+        with self.writer:
+            if self._writer_connection is not None:
+                self._writer_connection.close()
+                self._writer_connection = None
 
     def inspect(self, preparing: Collection[str] = ()) -> Inspection:
         try:
             with self.connect() as db, read_transaction(db):
-                now, _ = self.now()
+                now, clock_valid = self.now()
                 result = self._inspect(db, now, preparing)
-            if result.cleanup_pending:
+            if result.cleanup_pending or not clock_valid:
                 # Preserve an observed expiry if the wall clock moves backwards across a restart.
                 self.observe_clock(now)
             return result
@@ -222,7 +256,7 @@ class RecordsStorage:
         db.execute("UPDATE registration_clock SET observed_at_ms = MAX(observed_at_ms, ?) WHERE id = 1", (now,))
 
     def observe_clock(self, now: int) -> None:
-        with self.writer, self.connect(write=True) as db:
+        with self.mutation_connection() as db:
             self.persist_clock(db, now)
 
     @staticmethod
@@ -239,7 +273,7 @@ class RecordsStorage:
         needs_purge, count, files = db.execute(
             f"""WITH due AS (
                    SELECT id FROM objects AS o
-                   WHERE deletion_pending = 1 OR (registered_at_ms <= ? AND NOT {GRACE})
+                   WHERE deletion_pending = 1 OR {EXPIRED}
                ), purge AS (
                    SELECT owner_object_id, generated_paths FROM storage_operations WHERE kind = 'Purge'
                ), pending_owners AS (
@@ -252,19 +286,23 @@ class RecordsStorage:
                       (SELECT COUNT(*) FROM pending_owners), (SELECT COUNT(*) FROM pending_paths)""",
             (cutoff,),
         ).fetchone()
-        if needs_purge:
-            return Inspection(settings, "Retention cleanup is incomplete. Keep the data intact for recovery.",
-                              True, count, files)
-        if self._repair_needed or any(
+        needs_recovery = self._repair_needed or any(
             row[0] not in preparing or row[1] != "Pending"
-            for row in db.execute("SELECT id, phase FROM storage_operations")
-        ) or db.execute("SELECT 1 FROM media WHERE lifecycle = 'Staging' LIMIT 1").fetchone():
-            return Inspection(settings, RECONCILE_ERROR)
+            for row in db.execute("SELECT id, phase FROM storage_operations WHERE kind = 'Prepare'")
+        ) or db.execute("SELECT 1 FROM media WHERE lifecycle = 'Staging' LIMIT 1").fetchone() is not None
+        if needs_purge:
+            message = "Retention cleanup is incomplete. Keep the data intact for recovery."
+            if needs_recovery:
+                message = "Retention cleanup and a storage operation need recovery. Keep the data intact."
+            return Inspection(settings, message, True, count, files, needs_recovery)
+        if needs_recovery:
+            return Inspection(settings, RECONCILE_ERROR, recovery_pending=True)
         return Inspection(settings)
 
     def require_new_registration(self, submitted_at: int, preparing: Collection[str]) -> None:
         now, clock_valid = self.now()
         if not clock_valid:
+            self.observe_clock(now)
             raise HttpError(503, "NOT_READY", "Restore the system clock before registering a belonging.", True)
         inspection = self.inspect(preparing)
         if inspection.problem:
@@ -324,7 +362,7 @@ class RecordsStorage:
             if inspection.problem:
                 raise storage_unavailable(inspection.problem)
             rows = db.execute(OBJECT_ROWS + f"""
-                WHERE NOT o.deletion_pending AND (o.registered_at_ms > ? OR {GRACE})
+                WHERE {ELIGIBLE}
                 AND (? = '' OR o.status = ?) AND instr(unicode_casefold(o.name), ?) > 0
                 AND (o.registered_at_ms, o.id) < (?, ?)
                 ORDER BY o.registered_at_ms DESC, o.id DESC LIMIT ?
@@ -350,7 +388,7 @@ class RecordsStorage:
 
     def check_read_storage(self, db: sqlite3.Connection, now: int, preparing: Collection[str]) -> None:
         inspection = self._inspect(db, now, preparing)
-        if inspection.problem and not inspection.cleanup_pending:
+        if inspection.problem and (not inspection.cleanup_pending or inspection.recovery_pending):
             raise storage_unavailable(inspection.problem)
 
     def receipt(self, action_id: str, fingerprint: str) -> Receipt | None:
@@ -375,8 +413,7 @@ class RecordsStorage:
             now, _ = self.now()
             days = self.settings(db)["retention_days"]
             return db.execute(f"""
-                SELECT 1 FROM objects AS o WHERE id = ? AND NOT {DELETING}
-                AND (registered_at_ms > ? OR {GRACE})
+                SELECT 1 FROM objects AS o WHERE id = ? AND {ELIGIBLE}
             """, (owner, now - days * DAY_MS)).fetchone() is not None
 
     def recover_preparations(self, db: sqlite3.Connection) -> None:
@@ -410,7 +447,8 @@ class RecordsStorage:
         extension = "jpg" if reference.content_type == "image/jpeg" else "png"
         staging = f"staging/{media_id}.part"
         final = f"media/{media_id}.{extension}"
-        with self.writer, self.connect(write=True) as db:
+        with self.mutation_connection() as db:
+            invalid_clock_at = None
             try:
                 checksum = self.files.stage(staging, reference.data)
                 self.checkpoint("staged")
@@ -425,6 +463,7 @@ class RecordsStorage:
                 with write_transaction(db):
                     now, valid = self.now()
                     if not valid:
+                        invalid_clock_at = now
                         raise HttpError(503, "NOT_READY", "Restore the system clock before registering a belonging.", True)
                     inspection = self._inspect(db, now, (request.action_id,))
                     if inspection.problem:
@@ -443,8 +482,10 @@ class RecordsStorage:
                     """, (media_id, owner, final, reference.content_type, reference.width, reference.height,
                           len(reference.data), checksum, now))
                     db.row_factory = sqlite3.Row
-                    row = db.execute(OBJECT_ROWS + " WHERE o.id = ?", (owner,)).fetchone()
-                    db.row_factory = None
+                    try:
+                        row = db.execute(OBJECT_ROWS + " WHERE o.id = ?", (owner,)).fetchone()
+                    finally:
+                        db.row_factory = None
                     record = self.object_payload(row, days, now)
                     media = record["reference_media"]
                     if not isinstance(media, dict) or media["availability"] != "Available":
@@ -463,6 +504,8 @@ class RecordsStorage:
             except (OSError, sqlite3.Error, HttpError):
                 # A committed reference is excluded by recovery's Ready-media ownership check.
                 try:
+                    if invalid_clock_at is not None:
+                        self.persist_clock(db, invalid_clock_at)
                     self.recover_preparation(db, request.action_id, owner, [staging, final])
                 except (OSError, sqlite3.Error):
                     self._repair_needed = True
