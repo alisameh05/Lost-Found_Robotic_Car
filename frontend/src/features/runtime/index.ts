@@ -1,5 +1,6 @@
 export { readFixtureShell, readRecordsShell } from "./read-application";
 export { DashboardFixtureControls } from "./dashboard-fixture-controls";
+export { DeletionNotice } from "./deletion-notice";
 export { RuntimeProvider, useApplicationRead, useRefreshRuntime, useRuntime, useRuntimeRead, useRuntimeView } from "./runtime-provider";
 export type { RegistrationAction, RuntimeProjection, RuntimeView } from "./projection";
 export { searchActionKey, unresolved } from "./search-actions";

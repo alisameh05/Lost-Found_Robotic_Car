@@ -8,7 +8,7 @@ import support from "@/components/layout/support-page.module.css";
 import { Button } from "@/components/ui/button";
 import { Field } from "@/components/ui/field";
 import { LoadingState, Notice } from "@/components/ui/feedback";
-import { useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
+import { DeletionNotice, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import type { DeletionProgress, RetentionPreview } from "@/generated/api-v1";
 import { useRetention } from "./use-retention";
 import styles from "./settings.module.css";
@@ -22,9 +22,10 @@ export function RetentionSettingsScreen() {
 
 function SettingsEditor() {
   const state = useRetention();
-  const { recordsMode, failedRead } = useRuntimeView();
+  const { recordsMode, recordSnapshot } = useRuntimeView();
   const refresh = useRefreshRuntime();
-  const { read, saved, blocked, active, ready, reviewing, busy, held } = state;
+  const { read, blocked, active, ready, reviewing, busy, held } = state;
+  const saved = state.saved ?? (recordsMode ? recordSnapshot?.retention.settings : undefined);
   const confirmationTitle = useId();
   const confirmationDescription = useId();
   const review = useRef<HTMLButtonElement>(null);
@@ -49,7 +50,7 @@ function SettingsEditor() {
       <p className={styles.saved}>{count(saved.retention_days, "day")}</p>
       <p>Retention starts at the original registration time. Changes are unavailable in this build.</p>
     </section>
-    <Deletion status={state.deletion} />
+    <Deletion status={recordSnapshot?.retention.deletion} />
   </div>;
 
   return <div className={support.page}>
@@ -57,8 +58,6 @@ function SettingsEditor() {
     {!saved ? read.result && read.result.kind !== "ok" ? <div className={styles.feedback}>
       <Notice role="alert" title="Settings unavailable" tone="danger">The saved retention period could not be read.</Notice>
       <Button onClick={read.retry}>Retry settings</Button>
-      {recordsMode && failedRead?.kind === "api-error" && failedRead.error.snapshot?.retention.deletion.status === "Failed" &&
-        <Deletion status={failedRead.error.snapshot.retention.deletion} />}
     </div> : <LoadingState label="Loading saved retention" /> : <>
       <div className={`${support.columns} ${styles.columns}`}>
         <div className={styles.editor}>
@@ -144,11 +143,7 @@ function Deletion({ status }: { status?: DeletionProgress }) {
   return <Panel aria-label="Deletion progress" className={styles.impact}>
     <h2>Deletion progress</h2>
     <div role="status">
-      {!status ? <p>Deletion status unavailable.</p> : status.status === "Complete" ? <Notice tone="success" title="Deletion complete" />
-        : <Notice tone={status.status === "Failed" ? "danger" : "warning"}
-          title={status.status === "Failed" ? "Deletion failed" : "Deletion pending"}>
-          Access to expired records has ended. Cleanup still has {count(status.remaining_objects, "object")} and {count(status.remaining_files, "file")} remaining.
-        </Notice>}
+      {status ? <DeletionNotice status={status} /> : <p>Deletion status unavailable.</p>}
     </div>
   </Panel>;
 }

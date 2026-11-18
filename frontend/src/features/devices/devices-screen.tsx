@@ -7,7 +7,7 @@ import { PageHeader } from "@/components/layout/page-header";
 import layout from "@/components/layout/support-page.module.css";
 import { Button } from "@/components/ui/button";
 import { LoadingState, Notice } from "@/components/ui/feedback";
-import { useEligibleSearchSetup, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
+import { DeletionNotice, useEligibleSearchSetup, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import type { Component, ControlMode, Health } from "@/generated/api-v1";
 import { searchSetupHref, supportHref, type SearchSetupContext } from "@/lib/search-setup-context";
 import { InactiveInput, PathRow, paths, ProximityAdvisory } from "./device-observations";
@@ -78,6 +78,7 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
   const setupMode = context?.mode ?? (checking ? setup?.mode : undefined);
   const { snapshot, active, activeModeUnavailable, mode, readiness, summary } = deviceReadinessView(view, setupMode ?? inspectedMode);
   const canRefresh = !view.disconnected && runtimeState;
+  const deletion = view.recordsMode ? view.recordSnapshot?.retention.deletion : undefined;
 
   return (
     <div className={layout.page}>
@@ -122,6 +123,7 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
           </Button>
         )}
       </div>
+      {deletion && <div role="status"><DeletionNotice status={deletion} /></div>}
       <div className={layout.columns}>
         {activeModeUnavailable && readiness && (
           <section aria-labelledby="reported-readiness-title">

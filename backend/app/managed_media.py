@@ -45,7 +45,7 @@ def close_windows_handle(handle: int) -> None:
     close(handle)
 
 
-def open_windows_entry(path: Path, *, directory: bool) -> int:
+def open_windows_entry(path: Path, *, directory: bool, deleting: bool = False) -> int:
     from ctypes import WinDLL, WinError, create_unicode_buffer, get_last_error, sizeof, wintypes
 
     kernel = WinDLL("kernel32", use_last_error=True)
@@ -56,6 +56,8 @@ def open_windows_entry(path: Path, *, directory: bool) -> int:
     # Keep directory entries pinned by denying write/delete sharing. Open the entry itself,
     # rather than letting a junction or symbolic link select the target of the operation.
     access = 0x80 if directory else 0x80000000  # FILE_READ_ATTRIBUTES / GENERIC_READ
+    if deleting:
+        access = 0x10080  # DELETE | FILE_READ_ATTRIBUTES
     flags = 0x00200000 | (0x02000000 if directory else 0)  # OPEN_REPARSE_POINT / BACKUP_SEMANTICS
     handle = create(str(path), access, 1, None, 3, flags, None)  # FILE_SHARE_READ / OPEN_EXISTING
     if handle is None or handle == wintypes.HANDLE(-1).value:
@@ -131,7 +133,19 @@ class ManagedEntry:
     def discard(self) -> None:
         try:
             if self.parent_fd is None:
-                self.path.unlink()
+                from ctypes import WinDLL, WinError, byref, get_last_error, sizeof, wintypes
+
+                handle = open_windows_entry(self.path, directory=False, deleting=True)
+                try:
+                    self.check()
+                    mark = WinDLL("kernel32", use_last_error=True).SetFileInformationByHandle
+                    mark.argtypes = (wintypes.HANDLE, wintypes.DWORD, wintypes.LPVOID, wintypes.DWORD)
+                    mark.restype = wintypes.BOOL
+                    delete = wintypes.BOOL(True)
+                    if not mark(handle, 4, byref(delete), sizeof(delete)):  # FileDispositionInfo
+                        raise WinError(get_last_error())
+                finally:
+                    close_windows_handle(handle)
             else:
                 os.unlink(self.path.name, dir_fd=self.parent_fd)
         except FileNotFoundError:
@@ -218,6 +232,14 @@ class ManagedMedia:
     def discard(self, relative: str) -> None:
         with self.entry(relative) as entry:
             entry.discard()
+
+    def exists(self, relative: str) -> bool:
+        try:
+            with self.entry(relative) as entry:
+                entry.stat()
+        except FileNotFoundError:
+            return False
+        return True
 
     def read(
         self, relative: str, byte_length: int, checksum: str, *,

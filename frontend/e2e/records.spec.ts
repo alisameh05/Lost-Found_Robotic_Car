@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -390,11 +390,11 @@ test("recovers interrupted history after a process restart and revokes the captu
   expect(existsSync(join(parent, "records", "staging", "a".repeat(32) + ".part"))).toBe(false);
   expect(existsSync(join(parent, "records", "media", "a".repeat(32) + ".png"))).toBe(false);
   const expiry = page.waitForResponse((response) =>
-    response.url() === `${backend}/sessions/session-interrupted` && response.status() === 410);
+    response.url() === `${backend}/sessions/session-interrupted` && [404, 410].includes(response.status()));
   writeFileSync(offset, String(7 * 86_400_000));
   await page.evaluate(() => window.dispatchEvent(new Event("focus")));
-  expect(await (await expiry).json()).toMatchObject({ code: "EXPIRED" });
-  await expect(page.getByText("Session expired", { exact: true })).toBeVisible();
+  expect(["EXPIRED", "NOT_FOUND"]).toContain((await (await expiry).json()).code);
+  await expect(page.getByText(/^(Session expired|Session not found)$/)).toBeVisible();
   await expect(image).toHaveCount(0);
   expect(await page.evaluate(async (url) => {
     try { await fetch(url!); return true; } catch { return false; }
@@ -487,9 +487,9 @@ test("revokes an expired reference and keeps browsing the eligible page against 
   }, localUrl)).toBe(false);
   await page.getByRole("button", { name: "Previous", exact: true }).click();
   await expect(objectRows(page)).toHaveCount(25);
-  await expect(page.getByText("Local records storage unavailable", { exact: true })).toBeVisible();
+  await expect.poll(() => existsSync(join(parent, "records", "media", "old-reference.png"))).toBe(false);
   await page.goto("/objects/old");
-  await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
+  await expect(page.getByText("Object not found", { exact: true })).toBeVisible();
 });
 
 test("registers an oriented reference and reopens its target after actual process restart", async ({ page }) => {
@@ -581,7 +581,7 @@ test("keeps the user in the editor while a real registration is pending", async 
   await expect(page.getByRole("img", { name: "Reference for Pending card", exact: true })).toBeVisible();
 });
 
-test("opens a known expired object directly without retrieving its image", async ({ page }) => {
+test("purges an expired object on startup before a direct link can fetch its image", async ({ page }) => {
   await startBackend();
   await page.goto("/objects");
   await expect(page.getByText("Records connected · Search unavailable")).toBeVisible();
@@ -598,9 +598,110 @@ test("opens a known expired object directly without retrieving its image", async
   await startBackend();
   const { requests } = observe(page);
   await page.goto("/objects/old");
-  await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
+  await expect(page.getByText("Object not found", { exact: true })).toBeVisible();
   await expect(page.getByText("Expired reference", { exact: true })).toHaveCount(0);
   expect(requests.some((request) => request.includes("/media/"))).toBe(false);
+});
+
+test("clears expired media on wake and reports failed cleanup through restart and repair", async ({ page }) => {
+  test.setTimeout(60_000);
+  await loopbackOnly(page);
+  const clock = join(parent, "retention-clock");
+  writeFileSync(clock, "0");
+  await startBackend({ clockOffset: clock });
+  await seedLibrary([["old", "Due reference", "Lost", Date.now() - 7 * 86_400_000 + 120_000]], ["old"]);
+
+  await page.goto("/objects/old");
+  const reference = page.getByRole("img", { name: "Reference for Due reference", exact: true });
+  await expect(reference).toHaveAttribute("src", /^blob:/);
+  const url = await reference.getAttribute("src");
+  await expect(page.getByText("7 days from registration")).toBeVisible();
+
+  const managed = join(parent, "records", "media", "old-reference.png");
+  const source = sourceImage();
+  const original = readFileSync(source);
+  unlinkSync(managed);
+  linkSync(source, managed);
+  await page.evaluate(() => dispatchEvent(new PageTransitionEvent("pagehide", { persisted: true })));
+  await expect(reference).toHaveCount(0);
+  expect(await page.evaluate(async (url) => {
+    try { await fetch(url!); return true; } catch { return false; }
+  }, url)).toBe(false);
+
+  writeFileSync(clock, "180000");
+  await page.evaluate(() => dispatchEvent(new PageTransitionEvent("pageshow", { persisted: true })));
+  await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
+  await expect(page.getByText("Deletion failed", { exact: true })).toBeVisible();
+  await expect(page.getByText(/1 object and 1 file remaining/)).toBeVisible();
+  await expect(reference).toHaveCount(0);
+  await page.goto("/settings");
+  await expect(page.getByText("Deletion failed", { exact: true })).toBeVisible();
+  await expect(page.getByText("7 days", { exact: true })).toBeVisible();
+
+  await stopBackend();
+  await startBackend({ clockOffset: clock });
+  await page.goto("/devices");
+  await expect(page.getByText("Deletion failed", { exact: true })).toBeVisible();
+  expect(existsSync(managed)).toBe(true);
+  unlinkSync(managed);
+  await expect(page.getByText("Deletion complete", { exact: true })).toBeVisible({ timeout: 12_000 });
+  expect(readFileSync(source)).toEqual(original);
+  await page.goto("/objects/old");
+  await expect(page.getByText("Object not found", { exact: true })).toBeVisible();
+  await expect(reference).toHaveCount(0);
+});
+
+test("preserves grace during a slow refresh and rejects its stale response after session end", async ({ page }) => {
+  test.setTimeout(60_000);
+  const clock = join(parent, "grace-clock");
+  writeFileSync(clock, "0");
+  await startBackend({ clockOffset: clock });
+  await loopbackOnly(page);
+  const started = Date.now() - 1000;
+  await seedLibrary([["old", "Graced reference", "Lost", started - 7 * 86_400_000 + 120_000]], ["old"]);
+  const database = join(parent, "records", "records.sqlite3");
+  execFileSync(python, [
+    "-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
+      "db.execute(\"INSERT INTO sessions VALUES ('paused','old','Controller','Paused',?,NULL,NULL,?,1)\", " +
+      "(int(sys.argv[2]), '[{\"cause\":\"ManualPause\",\"failure_id\":null}]')); db.commit()",
+    database, String(started),
+  ], { windowsHide: true });
+  writeFileSync(clock, "180000");
+  await page.goto("/objects/old");
+  const image = page.getByRole("img", { name: "Reference for Graced reference", exact: true });
+  await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Search" })).toBeDisabled();
+  await expect(image).toHaveAttribute("src", /^blob:/);
+  const url = await image.getAttribute("src");
+
+  let readHeld = false;
+  let releaseRead = () => {};
+  const held = new Promise<void>((resolve) => { releaseRead = resolve; });
+  await page.route(`${backend}/objects/old`, async (route) => {
+    const response = await route.fetch();
+    readHeld = response.ok();
+    await held;
+    await route.fulfill({ response }).catch(() => {});
+  }, { times: 1 });
+  try {
+    await expect.poll(() => readHeld, { timeout: 12_000 }).toBe(true);
+    await expect(image).toHaveAttribute("src", url!);
+    await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();
+
+    execFileSync(python, [
+      "-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
+        "db.execute(\"UPDATE sessions SET state='Ended', end_reason='Stopped', ended_at_ms=?, pause_causes='[]' " +
+        "WHERE id='paused'\", (int(sys.argv[2]),)); db.commit()",
+      database, String(Date.now() + 180_000),
+    ], { windowsHide: true });
+    await expect(page.getByText(/^(Record expired|Object not found)$/)).toBeVisible({ timeout: 12_000 });
+  } finally {
+    releaseRead();
+  }
+  await expect(image).toHaveCount(0);
+  expect(await page.evaluate(async (url) => {
+    try { await fetch(url!); return true; } catch { return false; }
+  }, url)).toBe(false);
 });
 
 test("starts a new submission from the backend clock after an expired action", async ({ page }) => {

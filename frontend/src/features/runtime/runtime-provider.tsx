@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
 import type { ApplicationTransport, ProtectedPath, ReadResult } from "@/lib/transport";
 import type { createFixtureHarness } from "@/lib/create-transport";
@@ -68,20 +68,40 @@ export function RuntimeProvider({ openTransport, harnessEnabled = false, records
       if (recordsMode && document.visibilityState === "hidden") runtime.suspendRecords();
       else wake();
     };
+    const suspend = () => runtime.suspendRecords();
     const restore = (event: PageTransitionEvent) => { if (event.persisted) wake(); };
+    let lastPoll = Date.now();
+    let lastTick = performance.now();
     const poll = recordsMode ? setInterval(() => {
-      if (document.visibilityState === "visible") void runtime.refresh({ background: true });
+      const wall = Date.now();
+      const tick = performance.now();
+      const clockChanged = Math.abs((wall - lastPoll) - (tick - lastTick)) > 2_000;
+      const resumed = tick - lastTick > 8_000;
+      lastPoll = wall;
+      lastTick = tick;
+      if (document.visibilityState === "visible") {
+        if (clockChanged || resumed) wake();
+        else void runtime.refresh({ background: true });
+      }
     }, 4_000) : undefined;
     window.addEventListener("focus", wake);
     window.addEventListener("online", wake);
     document.addEventListener("visibilitychange", visibility);
-    if (recordsMode) window.addEventListener("pageshow", restore);
+    if (recordsMode) {
+      window.addEventListener("pageshow", restore);
+      window.addEventListener("pagehide", suspend);
+      document.addEventListener("freeze", suspend);
+      document.addEventListener("resume", wake);
+    }
     return () => {
       clearInterval(poll);
       window.removeEventListener("focus", wake);
       window.removeEventListener("online", wake);
       document.removeEventListener("visibilitychange", visibility);
       window.removeEventListener("pageshow", restore);
+      window.removeEventListener("pagehide", suspend);
+      document.removeEventListener("freeze", suspend);
+      document.removeEventListener("resume", wake);
     };
   }, [recordsMode, runtime]);
   useEffect(() => {
@@ -141,11 +161,13 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
   enabled = true, waitForRuntime = false, allowCleanupRead = false) {
   const runtime = useRuntime()?.connection?.runtime;
   const refresh = useRefreshRuntime();
-  const { authority, recordSnapshot: snapshot, connected, failedRead, loading, removedOwners } = useRuntimeView();
+  const { authority, recordSnapshot: snapshot, recordPoll, connected, failedRead, loading, removedOwners } = useRuntimeView();
   const cleanupDiagnostic = allowCleanupRead && failedRead?.kind === "api-error" &&
-    failedRead.error.snapshot?.retention.deletion.status === "Failed";
+    failedRead.error.snapshot !== null && failedRead.error.snapshot !== undefined &&
+    failedRead.error.snapshot.retention.deletion.status !== "Complete";
   const ready = (connected || cleanupDiagnostic) && (!waitForRuntime || snapshot !== undefined || !loading);
   const [attempt, setAttempt] = useState(0);
+  const pollRead = useRef<() => void>(null);
   const [read, setRead] = useState<{
     runtime: RuntimeProjection; load: typeof load; attempt: number; result: ReadResult<T>;
     snapshot: RuntimeView["snapshot"]; authority: RuntimeView["authority"]; removedOwners: RuntimeView["removedOwners"];
@@ -162,17 +184,41 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
     if (!runtime || !ready || !enabled) return;
     const currentRuntime = runtime;
     const lifetime = new AbortController();
-    function publish(result: ReadResult<T>) {
+    let inFlight = 0;
+    let issued = 0;
+    let accepted = 0;
+    let lastPoll = -1;
+    function publish(result: ReadResult<T>, request: number) {
       const eligible = eligibleRead(result, removedOwners);
-      if (!lifetime.signal.aborted && eligible) {
+      const currentView = currentRuntime.getView();
+      if (request > accepted && !lifetime.signal.aborted && eligible &&
+          currentView.authority === authority && currentView.removedOwners === removedOwners &&
+          currentView.recordSnapshot === snapshot) {
+        accepted = request;
         setRead({ runtime: currentRuntime, load, attempt, result: eligible, snapshot, authority, removedOwners });
       }
     }
-    void load(currentRuntime, lifetime.signal).then(publish).catch((error: unknown) => {
-      if (!(error instanceof DOMException && error.name === "AbortError")) publish({ kind: "unavailable" });
-    });
-    return () => lifetime.abort();
+    function readCurrent() {
+      const poll = currentRuntime.getView().recordPoll ?? 0;
+      if (inFlight >= 2 || poll === lastPoll || lifetime.signal.aborted) return;
+      lastPoll = poll;
+      inFlight += 1;
+      const request = ++issued;
+      void load(currentRuntime, lifetime.signal).then((result) => publish(result, request)).catch((error: unknown) => {
+        if (!(error instanceof DOMException && error.name === "AbortError")) publish({ kind: "unavailable" }, request);
+      }).finally(() => { inFlight -= 1; });
+    }
+    pollRead.current = readCurrent;
+    readCurrent();
+    return () => {
+      pollRead.current = null;
+      lifetime.abort();
+    };
   }, [runtime, load, attempt, snapshot, authority, removedOwners, ready, enabled]);
+  // A poll can overtake one slow read. Only newer results can replace a published result.
+  useEffect(() => {
+    if (allowCleanupRead && recordPoll !== undefined) pollRead.current?.();
+  }, [allowCleanupRead, recordPoll]);
 
   const current = ready && enabled && visibleRead && visibleRead.runtime === runtime && visibleRead.load === load &&
     visibleRead.attempt === attempt ? visibleRead : undefined;

@@ -60,19 +60,19 @@ def test_continuation_rechecks_eligibility_and_excludes_the_binary_boundary(tmp_
         assert page.status_code == 200
         assert [item["id"] for item in page.json()["items"]] == ["earlier"]
         assert page.json()["next_cursor"] is None
-        assert browser.get("/api/v1/objects/due", headers=headers).status_code == 410
-        assert browser.get("/api/v1/media/due-reference", headers=headers).status_code == 410
+        assert browser.get("/api/v1/objects/due", headers=headers).status_code in (410, 404)
+        assert browser.get("/api/v1/media/due-reference", headers=headers).status_code in (410, 404)
         assert browser.get("/api/v1/objects/earlier", headers=headers).json() == page.json()["items"][0]
 
     with TestClient(create_app(Config(tmp_path), storage=RecordsStorage(tmp_path, clock=lambda: now)), base_url=BASE) as browser:
         headers = credentials(browser)
-        wait_for_health(browser, headers, status=503)
+        wait_for_health(browser, headers)
         page = browser.get("/api/v1/objects", headers=headers)
-        assert page.status_code == 503 and page.json()["code"] == "STORAGE_UNAVAILABLE"
-        assert browser.get("/api/v1/objects/earlier", headers=headers).status_code == 503
-        assert browser.get("/api/v1/objects/due", headers=headers).status_code == 410
-        assert browser.get("/api/v1/snapshot", headers=headers).json()["snapshot"]["retention"]["deletion"] == {
-            "status": "Failed", "remaining_objects": 1, "remaining_files": 1, "error_code": "STORAGE_UNAVAILABLE",
+        assert [record["id"] for record in page.json()["items"]] == ["a", "Z", "earlier"]
+        assert browser.get("/api/v1/objects/earlier", headers=headers).status_code == 200
+        assert browser.get("/api/v1/objects/due", headers=headers).status_code == 404
+        assert browser.get("/api/v1/snapshot", headers=headers).json()["retention"]["deletion"] == {
+            "status": "Complete", "remaining_objects": 0, "remaining_files": 0, "error_code": None,
         }
 
 
