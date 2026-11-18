@@ -19,13 +19,6 @@ const labels = { x: "X", y: "Y", width: "Width", height: "Height" };
 
 export function RegistrationScreen() {
   const state = useRuntime();
-  const { recordsMode } = useRuntimeView();
-  if (recordsMode) return <>
-    <PageHeader title="Register Object" />
-    <Notice title="Registration unavailable" tone="warning">
-      This records build supports browsing and viewing saved settings. <Link href="/objects">Return to Objects</Link>.
-    </Notice>
-  </>;
   return <RegistrationForm key={state?.selection.generation} runtime={state?.connection?.runtime} />;
 }
 
@@ -57,6 +50,7 @@ function RegistrationForm({ runtime }: { runtime?: RuntimeProjection }) {
   const rect = result?.rect ?? null;
   const hasSelection = coordinates.some((key) => selection[key] !== "");
   const error = save?.kind === "failed" ? save.error : undefined;
+  const expired = error?.code === "ACTION_EXPIRED" || error?.code === "EXPIRED";
   const fieldError = (path: string) => error?.field_errors?.find((field) => field.path === path)?.message;
   const referenceError = imageError || dropError || fieldError("/reference_image") ||
     (validate && !file ? "Choose a reference image." : undefined);
@@ -94,17 +88,17 @@ function RegistrationForm({ runtime }: { runtime?: RuntimeProjection }) {
         <li className={styles.separator} aria-hidden="true"><ChevronRight size={18} /></li>
         <li aria-current={target ? "step" : undefined}><span>2</span>Select target</li>
       </ol>
-      {error && <Notice title={error.code === "ACTION_EXPIRED" ? "Registration expired"
+      {error && <Notice title={expired ? "Registration expired"
         : error.code === "ACTION_ID_CONFLICT" ? "Registration conflict" : "Registration failed"} tone="danger" role="alert">
         {error.message}
-        {error.code === "ACTION_EXPIRED" || error.code === "ACTION_ID_CONFLICT" ? " Review the draft and select Register Object to start a new request." : ""}
+        {expired || error.code === "ACTION_ID_CONFLICT" ? " Review the draft and select Register Object to start a new request." : ""}
         {fieldError("/name") && <p>Object name · {fieldError("/name")}</p>}
         {fieldError("/reference_image") && <p>Reference image · {fieldError("/reference_image")}</p>}
         {fieldError("/roi") && <p>Selection · {fieldError("/roi")}</p>}
       </Notice>}
       <div role="status" aria-live="polite">
         {save?.kind === "sending" && <Notice title="Saving registration…" />}
-        {save?.kind === "pending" && <Notice title="Registration pending">The fixture is still processing this request.</Notice>}
+        {save?.kind === "pending" && <Notice title="Registration pending">The application is still saving this request.</Notice>}
         {save?.kind === "uncertain" && <Notice title="Registration outcome unknown" tone="warning">Retry the same request to recover its result.</Notice>}
       </div>
       <form className={styles.form} onSubmit={advance} noValidate>

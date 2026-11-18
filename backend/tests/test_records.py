@@ -100,7 +100,8 @@ def test_address_capability_client_and_preflight(tmp_path: Path) -> None:
         assert result.headers["cache-control"] == "no-store"
         assert "access-control-allow-credentials" not in result.headers
         assert browser.options("/api/v1/control-lease", headers=preflight).status_code == 404
-        assert browser.options("/api/v1/objects", headers={**preflight, "Access-Control-Request-Method": "POST"}).status_code == 404
+        register = browser.options("/api/v1/objects", headers={**preflight, "Access-Control-Request-Method": "POST"})
+        assert register.status_code == 204 and register.headers["access-control-allow-methods"] == "POST"
         assert browser.options("/api/v1/snapshot", headers={
             **preflight, "Access-Control-Request-Headers": "X-Unknown",
         }).status_code == 422

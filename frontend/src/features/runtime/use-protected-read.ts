@@ -9,7 +9,7 @@ import { useApplicationRead, useRuntime } from "./runtime-provider";
 export function useProtectedRead<Route extends ReadEndpoint>(route: Route, params: ReadParams<Route>, enabled = true) {
   const load = useCallback((runtime: RuntimeProjection, signal: AbortSignal) =>
     runtime.read(route, params, signal), [params, route]);
-  return useApplicationRead(load, enabled, true);
+  return useApplicationRead(load, enabled, true, route === "GET /objects/{id}");
 }
 
 type PageRoute = {

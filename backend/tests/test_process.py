@@ -17,9 +17,9 @@ def free_port() -> int:
         return int(sock.getsockname()[1])
 
 
-def launch(root: Path, port: int) -> subprocess.Popen[str]:
+def launch(root: Path, port: int, entry: tuple[str, ...] = ("backend.app",)) -> subprocess.Popen[str]:
     return subprocess.Popen(
-        [sys.executable, "-m", "backend.app"],
+        [sys.executable, "-m", *entry],
         env={**os.environ, "LOCALAPPDATA": str(root.parent), "LAF_DATA_ROOT": str(root),
              "LAF_FRONTEND_PORT": "3000", "LAF_BACKEND_PORT": str(port)},
         stdout=subprocess.PIPE, stderr=subprocess.STDOUT, text=True,

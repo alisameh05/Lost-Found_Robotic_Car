@@ -72,7 +72,12 @@ export function useRegistration(runtime?: RuntimeProjection) {
       const result = await runtime.register(action, AbortSignal.any([signal, AbortSignal.timeout(8000)]));
       signal.throwIfAborted();
       if (result.kind === "api-error" && (!result.error.action_id || result.error.action_id === action.body.action_id)) {
-        fail(result.error);
+        if (result.error.code === "CAPABILITY_INVALID" || result.error.code === "CLIENT_INVALID" ||
+            result.error.code === "INTERNAL_ERROR") {
+          setSave({ kind: "uncertain" });
+        } else {
+          fail(result.error);
+        }
         return;
       }
       if (result.kind !== "ok") {

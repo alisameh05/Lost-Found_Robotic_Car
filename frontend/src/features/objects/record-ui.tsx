@@ -26,8 +26,6 @@ export function ObjectStatus({ status }: { status: ObjectRecord["status"] }) {
 }
 
 export function RegisterLink({ another = false }: { another?: boolean }) {
-  const { recordsMode } = useRuntimeView();
-  if (recordsMode) return <Button disabledReason="Registration is unavailable in this build.">Register Object</Button>;
   return <Link href="/objects/new" className="button button--primary">
     <Plus size={18} aria-hidden="true" />{another ? "Register Another Object" : "Register Object"}
   </Link>;

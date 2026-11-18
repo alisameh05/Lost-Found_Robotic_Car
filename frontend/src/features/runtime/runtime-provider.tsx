@@ -138,11 +138,13 @@ function eligibleRead<T>(result: ReadResult<T>, removed?: ReadonlySet<string>): 
 }
 
 export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal: AbortSignal) => Promise<ReadResult<T>>,
-  enabled = true, waitForRuntime = false) {
+  enabled = true, waitForRuntime = false, allowCleanupRead = false) {
   const runtime = useRuntime()?.connection?.runtime;
   const refresh = useRefreshRuntime();
   const { authority, recordSnapshot: snapshot, connected, failedRead, loading, removedOwners } = useRuntimeView();
-  const ready = connected && (!waitForRuntime || snapshot !== undefined || !loading);
+  const cleanupDiagnostic = allowCleanupRead && failedRead?.kind === "api-error" &&
+    failedRead.error.snapshot?.retention.deletion.status === "Failed";
+  const ready = (connected || cleanupDiagnostic) && (!waitForRuntime || snapshot !== undefined || !loading);
   const [attempt, setAttempt] = useState(0);
   const [read, setRead] = useState<{
     runtime: RuntimeProjection; load: typeof load; attempt: number; result: ReadResult<T>;
@@ -175,11 +177,11 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
   const current = enabled && visibleRead && visibleRead.runtime === runtime && visibleRead.load === load &&
     visibleRead.attempt === attempt ? visibleRead : undefined;
   const retry = useCallback(() => {
-    if (connected) setAttempt((previous) => previous + 1);
+    if (ready) setAttempt((previous) => previous + 1);
     else refresh();
-  }, [connected, refresh]);
+  }, [ready, refresh]);
   return {
-    result: current?.result ?? (connected ? undefined : failedRead),
+    result: current?.result ?? (ready ? undefined : failedRead),
     snapshotAtRead: current?.snapshot,
     retry,
   };

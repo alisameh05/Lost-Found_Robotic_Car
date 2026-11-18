@@ -59,7 +59,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     } });
 
   function serverTime() {
-    if (clock && !lifetime.signal.aborted) return clock.server + Math.ceil(performance.now() - clock.received);
+    if (clock && !lifetime.signal.aborted) return clock.server + Math.floor(performance.now() - clock.received);
   }
 
   function acknowledgedSnapshot(response: EmergencyStopResponse) {
@@ -107,8 +107,8 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     } else if (!recordsMode || !view.connected) update({ loading: true });
     try {
       if (!context || (readBootstrap && !recordsMode)) {
-        const bootstrapStarted = performance.now();
         const bootstrap = await transport.bootstrap(signal);
+        const bootstrapReceived = performance.now();
         if (signal.aborted) return;
         if (bootstrap.kind !== "ok") {
           if (view.recovering) {
@@ -142,7 +142,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
           lastActiveSearch = undefined;
         }
         context = bootstrap.data;
-        clock = { server: bootstrap.data.server_time_ms, received: bootstrapStarted };
+        clock = { server: bootstrap.data.server_time_ms, received: bootstrapReceived };
         update({ connected: !recordsMode, profile: sameProfile ? view.profile : profile,
           ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined,
             removedOwners: undefined, removedSessionId: undefined,
@@ -430,7 +430,9 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     },
     async register(action: RegistrationAction, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;
-      return transport.request("POST /objects", { ...action, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+      const result = await transport.request("POST /objects", { ...action, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+      if (recordsMode && invalidAuthority(result)) void refresh({ readBootstrap: true });
+      return result;
     },
     async previewRetention(body: RetentionPreviewRequest, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;

@@ -110,7 +110,7 @@ def operation(
     item: dict[str, object] = {
         "parameters": parameters, "responses": responses(path, result, statuses),
         "security": [] if path == "/bootstrap" else [{"Capability": []}],
-        "x-laf-records-runtime": method == "get" and path in RECORDS_ROUTES,
+        "x-laf-records-runtime": method.upper() in RECORDS_ROUTES.get(path, ()),
     }
     if body == "RegistrationFields":
         parameters.append(parameter("X-Action-Created-At-Ms", "header", component("UtcMs"), True))
