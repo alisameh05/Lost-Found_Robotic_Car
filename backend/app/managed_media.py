@@ -40,7 +40,7 @@ def close_windows_handle(handle: int) -> None:
 
 
 def open_windows_entry(path: Path, *, directory: bool) -> int:
-    from ctypes import WinDLL, WinError, get_last_error, sizeof, wintypes
+    from ctypes import WinDLL, WinError, create_unicode_buffer, get_last_error, sizeof, wintypes
 
     kernel = WinDLL("kernel32", use_last_error=True)
     create = kernel.CreateFileW
@@ -65,6 +65,18 @@ def open_windows_entry(path: Path, *, directory: bool) -> int:
     if attributes[0] & stat.FILE_ATTRIBUTE_REPARSE_POINT or bool(attributes[0] & 0x10) != directory:
         close_windows_handle(handle)
         raise OSError("Invalid managed filesystem entry")
+    resolve = kernel.GetFinalPathNameByHandleW
+    resolve.argtypes = (wintypes.HANDLE, wintypes.LPWSTR, wintypes.DWORD, wintypes.DWORD)
+    resolve.restype = wintypes.DWORD
+    actual_name = create_unicode_buffer(32768)
+    length = resolve(handle, actual_name, len(actual_name), 0)
+    if not length or length >= len(actual_name):
+        error = WinError(get_last_error())
+        close_windows_handle(handle)
+        raise error
+    if Path(actual_name.value.removeprefix("\\\\?\\")) != path:
+        close_windows_handle(handle)
+        raise OSError("Managed filesystem entry resolves outside its configured path")
     return int(handle)
 
 
@@ -168,7 +180,7 @@ class ManagedMedia:
         with ExitStack() as directories:
             parent_fd = None
             if os.name == "nt":
-                for directory in (*reversed(parent.parents), parent):
+                for directory in (self.root, parent):
                     handle = open_windows_entry(directory, directory=True)
                     directories.callback(close_windows_handle, handle)
             else:
