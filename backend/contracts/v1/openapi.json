@@ -374,6 +374,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           }
@@ -439,6 +441,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           },
@@ -468,7 +472,7 @@
             "required": false,
             "schema": {
               "type": "string",
-              "maxLength": 120
+              "description": "At most 120 code points after trimming Unicode whitespace and normalizing to NFC."
             }
           },
           {
@@ -542,6 +546,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           },
@@ -678,6 +684,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           }
@@ -743,6 +751,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           },
@@ -752,6 +762,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           },
@@ -925,6 +937,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           }
@@ -990,6 +1004,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           },
@@ -999,6 +1015,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           },
@@ -1084,6 +1102,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           }
@@ -1339,6 +1359,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           }
@@ -1414,6 +1436,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           }
@@ -1506,6 +1530,8 @@
             "required": true,
             "schema": {
               "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
               "pattern": "^[A-Za-z0-9_-]+$"
             }
           }
@@ -1779,6 +1805,31 @@
         "in": "header",
         "name": "X-App-Capability"
       }
+    }
+  },
+  "x-laf-local-protection": {
+    "default_frontend_origin": "http://127.0.0.1:3000",
+    "no_origin_requires_capability": true,
+    "preflight": {
+      "status": 204,
+      "credentials": false,
+      "request_headers": [
+        "content-type",
+        "x-app-capability",
+        "x-app-client-id",
+        "x-action-created-at-ms"
+      ],
+      "vary": [
+        "Origin",
+        "Access-Control-Request-Method",
+        "Access-Control-Request-Headers"
+      ]
+    },
+    "body_limits_bytes": {
+      "json": 65536,
+      "multipart": 11534336,
+      "multipart_text": 65536,
+      "reference_image": 10485760
     }
   }
 }

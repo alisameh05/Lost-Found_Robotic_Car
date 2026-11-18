@@ -59,6 +59,6 @@ $recordsPython = '.local-runtime/records/Scripts/python.exe'
 & $recordsPython -m backend.contracts.export --check
 ```
 
-Run `npm.cmd run verify` from `frontend` with the same PowerShell npm script setting above. The browser suite starts temporary backends and uses temporary SQLite roots. Its frontend ports are 3100–3103 and its records backend port is 8110. Set `LAF_TEST_PYTHON` to an absolute path when using a different Python environment with the locked dependencies.
+Run `npm.cmd run verify` from `frontend` with the same PowerShell npm script setting above. The browser suite starts temporary backends and uses temporary SQLite roots. The initialization journey holds the actual storage initialization in its test process until the browser reads the live 503 diagnostic. Its frontend ports are 3100–3103 and its records backend port is 8110. Set `LAF_TEST_PYTHON` to an absolute path when using a different Python environment with the locked dependencies.
 
 Refresh exports with `python -m backend.contracts.export` using the installed environment, then run `npm.cmd run contracts:generate` in `frontend`. The [wire manifest](contracts/v1/openapi.json) includes later operations. Its `x-laf-records-runtime` flag identifies the five mounted HTTP operations. Backend tests compare the exports with the approved API and verify that the mounted routes agree. Frontend contract checks validate existing fixture payloads and frame vectors against the generated definitions.

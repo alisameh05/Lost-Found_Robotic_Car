@@ -18,7 +18,11 @@ END;
 
 CREATE TABLE objects (
     id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128 AND id NOT GLOB '*[^A-Za-z0-9_-]*'),
-    name TEXT NOT NULL CHECK (length(name) BETWEEN 1 AND 120 AND length(trim(name)) > 0),
+    name TEXT NOT NULL CHECK (
+        length(name) BETWEEN 1 AND 120
+        AND length(trim(name, char(9,10,11,12,13,32,133,160,5760,8192,8193,8194,8195,8196,8197,
+            8198,8199,8200,8201,8202,8232,8233,8239,8287,12288))) > 0
+    ),
     status TEXT NOT NULL CHECK (status IN ('Lost', 'Found')),
     registered_at_ms INTEGER NOT NULL CHECK (registered_at_ms BETWEEN 0 AND 9007199254740991),
     found_at_ms INTEGER CHECK (found_at_ms BETWEEN registered_at_ms AND 9007199254740991),
@@ -67,6 +71,38 @@ CREATE TABLE sessions (
 CREATE UNIQUE INDEX one_active_session ON sessions ((1)) WHERE state IN ('Searching', 'Paused');
 CREATE INDEX sessions_by_owner ON sessions (object_id, started_at_ms DESC, id DESC);
 
+CREATE VIEW invalid_session_pause_causes AS
+WITH causes AS (
+    SELECT sessions.id, CASE entry.type WHEN 'object' THEN entry.value ELSE '{}' END AS item
+    FROM sessions, json_each(sessions.pause_causes) AS entry
+)
+SELECT id FROM causes
+WHERE json_type(item, '$.cause') IS NOT 'text'
+   OR json_extract(item, '$.cause') NOT IN ('ManualPause', 'CandidateReview', 'ReviewRejected', 'RecoveryRequired')
+   OR (SELECT COUNT(*) FROM json_each(item)) <> 2
+   OR CASE json_extract(item, '$.cause')
+        WHEN 'RecoveryRequired' THEN json_type(item, '$.failure_id') IS NOT 'text'
+            OR length(json_extract(item, '$.failure_id')) NOT BETWEEN 1 AND 128
+            OR json_extract(item, '$.failure_id') GLOB '*[^A-Za-z0-9_-]*'
+        ELSE json_type(item, '$.failure_id') IS NOT 'null'
+      END
+UNION
+SELECT id FROM causes
+GROUP BY id, json_extract(item, '$.cause'), json_extract(item, '$.failure_id')
+HAVING COUNT(*) > 1;
+
+CREATE TRIGGER validate_new_pause_causes AFTER INSERT ON sessions
+WHEN EXISTS (SELECT 1 FROM invalid_session_pause_causes WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid pause causes');
+END;
+
+CREATE TRIGGER validate_changed_pause_causes AFTER UPDATE OF pause_causes ON sessions
+WHEN EXISTS (SELECT 1 FROM invalid_session_pause_causes WHERE id = NEW.id)
+BEGIN
+    SELECT RAISE(ABORT, 'invalid pause causes');
+END;
+
 CREATE TRIGGER active_session_requires_lost_object BEFORE INSERT ON sessions
 WHEN NEW.state <> 'Ended' AND NOT EXISTS (
     SELECT 1 FROM objects WHERE id = NEW.object_id AND status = 'Lost' AND deletion_pending = 0
@@ -111,6 +147,16 @@ CREATE TABLE match_events (
 CREATE UNIQUE INDEX one_pending_candidate ON match_events (session_id) WHERE disposition = 'Pending';
 CREATE INDEX matches_by_session ON match_events (session_id, captured_at_ms DESC, id DESC);
 
+CREATE TRIGGER preserve_capture BEFORE UPDATE ON match_events
+WHEN NEW.session_id <> OLD.session_id OR NEW.object_id <> OLD.object_id
+    OR NEW.captured_at_ms <> OLD.captured_at_ms OR NEW.frame_id <> OLD.frame_id OR NEW.stream_epoch <> OLD.stream_epoch
+    OR NEW.box_x <> OLD.box_x OR NEW.box_y <> OLD.box_y OR NEW.box_width <> OLD.box_width OR NEW.box_height <> OLD.box_height
+    OR NEW.evidence_media_id <> OLD.evidence_media_id
+    OR NEW.evidence_width <> OLD.evidence_width OR NEW.evidence_height <> OLD.evidence_height
+BEGIN
+    SELECT RAISE(ABORT, 'captured evidence is immutable');
+END;
+
 CREATE TABLE media (
     id TEXT PRIMARY KEY CHECK (length(id) BETWEEN 1 AND 128 AND id NOT GLOB '*[^A-Za-z0-9_-]*'),
     object_id TEXT NOT NULL REFERENCES objects (id) ON DELETE CASCADE,
@@ -125,6 +171,7 @@ CREATE TABLE media (
     created_at_ms INTEGER NOT NULL CHECK (created_at_ms BETWEEN 0 AND 9007199254740991),
     lifecycle TEXT NOT NULL CHECK (lifecycle IN ('Staging', 'Ready')),
     CHECK ((role = 'Evidence') = (match_event_id IS NOT NULL)),
+    CHECK (role <> 'Evidence' OR format = 'image/png'),
     CHECK (relative_path = 'media/' || id || CASE format WHEN 'image/jpeg' THEN '.jpg' ELSE '.png' END),
     UNIQUE (id, object_id, role, lifecycle, width, height),
     UNIQUE (id, object_id, match_event_id, role, lifecycle, width, height),

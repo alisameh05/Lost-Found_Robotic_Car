@@ -87,11 +87,22 @@ const types = await compile({
 const requestMap = `export interface HttpBodies {\n${http.filter(({ requestType }) => requestType).map(({ route, requestType }) =>
   `  "${route}": ${requestType};`).join("\n")}\n}`;
 const componentNames = `export const componentNames = ${JSON.stringify(definitions.ComponentName.enum)} as const;`;
+const media = openapi.paths["/media/{id}"].get.responses["200"];
+const mediaResponse = `export interface HttpMediaResponses {
+  "GET /media/{id}": {
+    bytes: Uint8Array<ArrayBuffer>;
+    headers: {
+      "Content-Type": ${Object.keys(media.content).map((mime) => JSON.stringify(mime)).join(" | ")};
+${Object.entries(media.headers).map(([name, header]) =>
+  `      ${JSON.stringify(name)}: ${JSON.stringify(header.schema.const)};`).join("\n")}
+    };
+  };
+}`;
 
 const directory = new URL("../src/generated/", import.meta.url);
 const outputs = {
   "api-v1.seed.json": JSON.stringify(seed, null, 2) + "\n",
-  "api-v1.ts": `${types.trimEnd()}\n\n${requestMap}\n\n${componentNames}\n`,
+  "api-v1.ts": `${types.trimEnd()}\n\n${requestMap}\n\n${mediaResponse}\n\n${componentNames}\n`,
 };
 
 const check = process.argv.includes("--check");

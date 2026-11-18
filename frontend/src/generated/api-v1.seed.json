@@ -1,7 +1,7 @@
 {
   "$schema": "https://json-schema.org/draft/2020-12/schema",
   "title": "Lost and Found API v1",
-  "$comment": "{\"path\":\"backend/contracts/v1\",\"version\":\"1.1\",\"sha256\":\"c5e19b390988de692a88358ad0c0665c91c51a56d5a50e99142cb0cb3e4cfff7\"}",
+  "$comment": "{\"path\":\"backend/contracts/v1\",\"version\":\"1.1\",\"sha256\":\"40755a1b1fdf09f08b15678e12dc91e99598992ac15c6f7b1d6e1362ed89304c\"}",
   "$defs": {
     "Id": {
       "type": "string",

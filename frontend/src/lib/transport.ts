@@ -1,6 +1,6 @@
 import type {
   BootstrapResponse, Channel, EmergencyStopRequest, Error as ApiError, EventEnvelope, HttpBodies,
-  FrameMetadata, HttpResponses, Object as LostObject, Token, WorkspaceHeartbeat,
+  FrameMetadata, HttpMediaResponses, HttpResponses, Object as LostObject, Token, WorkspaceHeartbeat,
 } from "@/generated/api-v1";
 
 export type ClientContext = Pick<BootstrapResponse, "backend_boot_id" | "capability" | "client_id">;
@@ -32,15 +32,7 @@ export type HttpRequest<Route extends Endpoint> = ProtectedRequest & RouteParams
 export type ReadEndpoint = `GET ${ProtectedPath}`;
 export type ReadParams<Route extends ReadEndpoint> = RouteParams<Route> & RouteQuery<Route>;
 
-export type ProtectedMedia = {
-  bytes: Uint8Array<ArrayBuffer>;
-  headers: {
-    "Content-Type": "image/jpeg" | "image/png";
-    "Cache-Control": "no-store";
-    "X-Content-Type-Options": "nosniff";
-    "Accept-Ranges": "none";
-  };
-};
+export type ProtectedMedia = HttpMediaResponses["GET /media/{id}"];
 
 export type SocketOffer = { path: string; protocols: readonly string[] };
 export type ReadSocket = { protocol: "laf.v1"; close(): void };

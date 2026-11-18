@@ -4,7 +4,7 @@ from collections.abc import Mapping
 from pathlib import Path
 from typing import Any
 
-from backend.app.http import RECORDS_ROUTES
+from backend.app.http import APP_HEADERS, BODY_LIMIT, RECORDS_ROUTES
 
 DIRECTORY = Path(__file__).with_name("v1")
 PROTOCOL = "laf.v1"
@@ -87,11 +87,12 @@ def operation(
     method: str, path: str, body: str | None, result: str | None, statuses: tuple[int, ...],
     client_header: bool, definitions: dict[str, Any],
 ) -> dict[str, object]:
+    identifier = {key: definitions["Id"][key] for key in ("type", "minLength", "maxLength", "pattern")}
     parameters = [parameter("Origin", "header", {"type": "string"}, required=path == "/bootstrap")]
     if "{id}" in path:
-        parameters.append(parameter("id", "path", {"type": "string", "pattern": definitions["Id"]["pattern"]}, True))
+        parameters.append(parameter("id", "path", identifier, True))
     if client_header:
-        parameters.append(parameter(CLIENT_HEADER, "header", {"type": "string", "pattern": definitions["Id"]["pattern"]}, True))
+        parameters.append(parameter(CLIENT_HEADER, "header", identifier, True))
     if result in ("ObjectPage", "SessionPage", "MatchPage"):
         parameters.extend([
             parameter("limit", "query", {"type": "integer", "minimum": 1, "maximum": 100, "default": 25}),
@@ -99,7 +100,10 @@ def operation(
         ])
     if result == "ObjectPage":
         parameters.extend([
-            parameter("name", "query", {"type": "string", "maxLength": 120}),
+            parameter("name", "query", {
+                "type": "string",
+                "description": "At most 120 code points after trimming Unicode whitespace and normalizing to NFC.",
+            }),
             parameter("status", "query", {"enum": ["Lost", "Found"]}),
         ])
 
@@ -143,6 +147,16 @@ def exports() -> dict[str, object]:
         "components": {
             "schemas": {name: external(name) for name in definitions},
             "securitySchemes": {"Capability": {"type": "apiKey", "in": "header", "name": "X-App-Capability"}},
+        },
+        "x-laf-local-protection": {
+            "default_frontend_origin": "http://127.0.0.1:3000",
+            "no_origin_requires_capability": True,
+            "preflight": {
+                "status": 204, "credentials": False, "request_headers": list(APP_HEADERS),
+                "vary": ["Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"],
+            },
+            "body_limits_bytes": {"json": BODY_LIMIT, "multipart": 11_534_336,
+                                  "multipart_text": 65_536, "reference_image": 10_485_760},
         },
     }
     events = {

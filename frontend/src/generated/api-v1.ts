@@ -1,4 +1,4 @@
-// Generated from backend/contracts/v1 (SHA-256 c5e19b390988de692a88358ad0c0665c91c51a56d5a50e99142cb0cb3e4cfff7). Do not edit.
+// Generated from backend/contracts/v1 (SHA-256 40755a1b1fdf09f08b15678e12dc91e99598992ac15c6f7b1d6e1362ed89304c). Do not edit.
 
 /**
  * This interface was referenced by `HttpResponses`'s JSON-Schema
@@ -1189,6 +1189,18 @@ export interface HttpBodies {
   "POST /emergency-stop": EmergencyStopRequest;
   "POST /settings/retention-preview": RetentionPreviewRequest;
   "PUT /settings/retention": RetentionChange;
+}
+
+export interface HttpMediaResponses {
+  "GET /media/{id}": {
+    bytes: Uint8Array<ArrayBuffer>;
+    headers: {
+      "Content-Type": "image/png" | "image/jpeg";
+      "Cache-Control": "no-store";
+      "X-Content-Type-Options": "nosniff";
+      "Accept-Ranges": "none";
+    };
+  };
 }
 
 export const componentNames = ["Backend","Storage","Command","RobotVideo","DisplayedRobotVideo","Webcam","Controller","AI","Workspace","QualificationProfile"] as const;

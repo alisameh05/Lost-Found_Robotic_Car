@@ -131,6 +131,15 @@ def test_read_body_is_rejected_with_safe_error(tmp_path: Path) -> None:
         assert browser.get("/api/v1/health", headers={**headers, "Content-Encoding": "gzip"}).status_code == 415
 
 
+def test_empty_feed_distinguishes_malformed_and_inactive_cursors(tmp_path: Path) -> None:
+    with TestClient(create_app(Config(tmp_path)), base_url=BASE) as browser:
+        headers = credentials(browser)
+        wait_for_health(browser, headers)
+        for cursor, code in (("malformed", "CURSOR_INVALID"), ("A" * 43, "CURSOR_EXPIRED")):
+            result = browser.get("/api/v1/objects", headers=headers, params={"cursor": cursor})
+            assert result.status_code == 400 and result.json()["code"] == code
+
+
 def test_inactive_clients_expire_without_evicting_healthy_clients(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
     now = 0
     monkeypatch.setattr("backend.app.runtime.monotonic", lambda: now)
@@ -169,7 +178,7 @@ def test_health_preserves_initialization_without_exposing_records(tmp_path: Path
         wait_for_health(browser, headers)
 
 
-@pytest.mark.parametrize("fault", ["version", "checksum", "schema", "journal", "due expiry"])
+@pytest.mark.parametrize("fault", ["version", "checksum", "schema", "extra table", "journal", "due expiry"])
 def test_storage_fault_keeps_history_and_fails_closed(tmp_path: Path, fault: str) -> None:
     config = Config(tmp_path)
     with TestClient(create_app(config), base_url=BASE) as browser:
@@ -187,6 +196,8 @@ def test_storage_fault_keeps_history_and_fails_closed(tmp_path: Path, fault: str
             db.execute("UPDATE schema_migrations SET checksum = ?", ("0" * 64,))
         elif fault == "schema":
             db.execute("DROP INDEX one_active_session")
+        elif fault == "extra table":
+            db.execute("CREATE TABLE sqliteExtra (value TEXT)")
         elif fault == "journal":
             db.execute("INSERT INTO storage_operations VALUES ('recovery', 'Purge', 'saved', '[\"media/saved.jpg\"]', "
                        "'Pending', 1, NULL)")
@@ -232,3 +243,43 @@ def test_storage_fault_keeps_history_and_fails_closed(tmp_path: Path, fault: str
             assert db.execute("SELECT COUNT(*) FROM objects").fetchone() == (1,)
         if fault == "journal":
             assert db.execute("SELECT COUNT(*) FROM storage_operations").fetchone() == (1,)
+
+
+def test_durable_baseline_enforces_pause_and_capture_constraints(tmp_path: Path) -> None:
+    with TestClient(create_app(Config(tmp_path)), base_url=BASE) as browser:
+        wait_for_health(browser, credentials(browser))
+    with closing(sqlite3.connect(tmp_path / "records.sqlite3")) as db:
+        db.execute("PRAGMA foreign_keys = ON")
+        insert_owner = """INSERT INTO objects
+            (id,name,status,registered_at_ms,roi_x,roi_y,roi_width,roi_height,revision,
+             reference_media_id,reference_width,reference_height)
+            VALUES ('saved',?,'Lost',1,0,0,1,1,1,'reference',20,30)"""
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(insert_owner, ("\t\u00a0\n",))
+        db.execute(insert_owner, ("Saved",))
+        db.execute(
+            "INSERT INTO media VALUES ('reference','saved',NULL,'Reference','media/reference.png','image/png',20,30,1,?,1,'Ready')",
+            ("1" * 64,),
+        )
+        insert_session = "INSERT INTO sessions VALUES (?, 'saved', 'Gestures', 'Paused', 2, NULL, NULL, ?, 1)"
+        pause_causes = '[{"cause":"CandidateReview","failure_id":null}]'
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(insert_session, ("invalid", "[null]"))
+        db.execute(insert_session, ("session", pause_causes))
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(insert_session, ("second", pause_causes))
+        db.execute(
+            """INSERT INTO match_events
+               (id,session_id,object_id,captured_at_ms,frame_id,stream_epoch,box_x,box_y,box_width,box_height,
+                disposition,evidence_media_id,evidence_width,evidence_height)
+               VALUES ('match','session','saved',3,'frame','stream',0,0,1,1,'Pending','capture',20,30)"""
+        )
+        insert_evidence = "INSERT INTO media VALUES ('capture','saved','match','Evidence',?,?,20,30,1,?,3,'Ready')"
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute(insert_evidence, ("media/capture.jpg", "image/jpeg", "1" * 64))
+        db.execute(insert_evidence, ("media/capture.png", "image/png", "1" * 64))
+        db.commit()
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute("UPDATE match_events SET frame_id = 'changed'")
+        with pytest.raises(sqlite3.IntegrityError):
+            db.execute("UPDATE sessions SET pause_causes = '[{\"cause\":\"RecoveryRequired\",\"failure_id\":null}]'")

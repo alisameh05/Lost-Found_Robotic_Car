@@ -41,6 +41,15 @@ def test_approved_models_and_route_catalogue_match_the_backend_exports(tmp_path:
     assert version and openapi["info"]["version"] == version[1]
     assert set(openapi["components"]["schemas"]) == set(definitions["$defs"])
     assert all(definition_of(ref) == name for name, ref in openapi["components"]["schemas"].items())
+    protection = openapi["x-laf-local-protection"]
+    assert protection["preflight"] == {
+        "status": 204, "credentials": False,
+        "request_headers": ["content-type", "x-app-capability", "x-app-client-id", "x-action-created-at-ms"],
+        "vary": ["Origin", "Access-Control-Request-Method", "Access-Control-Request-Headers"],
+    }
+    assert protection["body_limits_bytes"] == {
+        "json": 65_536, "multipart": 11_534_336, "multipart_text": 65_536, "reference_image": 10_485_760,
+    }
     operations = {(method, path): operation for path, methods in openapi["paths"].items()
                   for method, operation in methods.items()}
     assert operations.keys() == approved_http.keys()
@@ -68,7 +77,35 @@ def test_approved_models_and_route_catalogue_match_the_backend_exports(tmp_path:
         else:
             assert "requestBody" not in operation
         assert bool(operation["security"]) == (key[1] != "/bootstrap")
+        parameters = {(item["in"], item["name"]): item for item in operation["parameters"]}
+        required = {(item["in"], item["name"]) for item in parameters.values() if item["required"]}
+        expected = set()
+        if "{id}" in key[1]:
+            expected.add(("path", "id"))
+        if key[1] == "/bootstrap":
+            expected.add(("header", "Origin"))
+        if key == ("post", "/objects"):
+            expected.add(("header", "X-Action-Created-At-Ms"))
+        if key in {
+            ("post", "/objects"), ("get", "/snapshot"), ("get", "/objects"),
+            ("get", "/objects/{id}/sessions"), ("get", "/sessions/{id}/matches"),
+            ("post", "/settings/retention-preview"), ("put", "/settings/retention"),
+        }:
+            expected.add(("header", "X-App-Client-Id"))
+        assert required == expected
+        query_names = {name for kind, name in parameters if kind == "query"}
+        if key in {("get", "/objects"), ("get", "/objects/{id}/sessions"), ("get", "/sessions/{id}/matches")}:
+            assert query_names == ({"limit", "cursor", "name", "status"} if key[1] == "/objects" else {"limit", "cursor"})
+            assert parameters["query", "limit"]["schema"] == {
+                "type": "integer", "minimum": 1, "maximum": 100, "default": 25,
+            }
+        else:
+            assert not query_names
+        assert all(value["headers"]["Cache-Control"]["schema"] == {"const": "no-store"}
+                   for value in operation["responses"].values())
 
+    health_error = operations["get", "/health"]["responses"]["503"]["content"]["application/json"]["schema"]["oneOf"]
+    assert [definition_of(ref) for ref in health_error] == ["Health", "Error"]
     actual_routes = {(method.lower(), route.path.removeprefix("/api/v1"))
                      for route in create_app(Config(tmp_path)).routes for method in route.methods}
     assert actual_routes == {key for key, operation in operations.items() if operation["x-laf-records-runtime"]}
@@ -79,6 +116,7 @@ def test_approved_models_and_route_catalogue_match_the_backend_exports(tmp_path:
     assert approved_sockets == {event_socket["path"], *frame_socket["paths"]}
     assert event_socket["protocol"] == frame_socket["protocol"] == "laf.v1"
     assert event_socket["ticket_offer_prefix"] == frame_socket["ticket_offer_prefix"] == "laf.ticket."
+    assert event_socket["initial_message_type"] == "snapshot"
     assert definition_of(events) == "EventEnvelope"
     assert definition_of(event_socket["incoming"]) == "WorkspaceHeartbeat"
     assert definition_of(frames) == "FrameMetadata"

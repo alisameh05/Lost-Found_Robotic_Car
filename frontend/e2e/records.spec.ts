@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, mkdtempSync } from "node:fs";
+import { existsSync, mkdtempSync, writeFileSync } from "node:fs";
 import { rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -15,8 +15,9 @@ let backendProcess: ChildProcess | undefined;
 
 test.use({ baseURL: frontend });
 
-async function startBackend() {
-  const child = spawn(python, ["-m", "backend.app"], {
+async function startBackend(initializationGate?: string) {
+  const entry = initializationGate ? ["backend.tests.pause_startup", initializationGate] : ["backend.app"];
+  const child = spawn(python, ["-m", ...entry], {
     cwd: repo, windowsHide: true, env: {
       ...process.env, LOCALAPPDATA: parent, LAF_DATA_ROOT: join(parent, "records"),
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
@@ -110,26 +111,15 @@ test("keeps Start, Resume and acquisition unavailable on direct routes", async (
 });
 
 test("preserves a 503 Health diagnostic during initialization", async ({ page }) => {
-  await startBackend();
-  let initializing = true;
-  await page.route(`${backend}/health`, async (route) => {
-    if (!initializing || route.request().method() !== "GET") return route.continue();
-    const response = await route.fetch();
-    await route.fulfill({ response, status: 503, json: {
-      ...await response.json(), initialization: "Starting", storage_integrity: "Reconciling", operational_state: "Reconciling",
-    } });
-  });
-  await page.route(`${backend}/snapshot`, async (route) => {
-    if (!initializing || route.request().method() !== "GET") return route.continue();
-    const response = await route.fetch();
-    await route.fulfill({ response, status: 503, json: { code: "INITIALIZING", message: "Initializing storage.", retryable: true } });
-  });
+  const gate = join(parent, "allow-initialization");
+  await startBackend(gate);
   await page.goto("/devices");
   await expect(page.getByText("Initializing services", { exact: true })).toBeVisible();
+  await expect(page.locator("summary").filter({ hasText: "Managed storage" })).toContainText("Initializing");
   await page.getByRole("link", { name: "Objects / History" }).click();
   await expect(page.getByText("Objects unavailable", { exact: true })).toBeVisible();
   await expect(page.getByText("No objects registered")).toHaveCount(0);
-  initializing = false;
+  writeFileSync(gate, "");
   await expect(page.getByText("No objects registered")).toBeVisible({ timeout: 10_000 });
 });
 

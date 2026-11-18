@@ -64,17 +64,24 @@ export function RuntimeProvider({ openTransport, harnessEnabled = false, records
         void runtime.refresh(recordsMode ? { revalidate: true } : { readBootstrap: true });
       }
     };
+    const visibility = () => {
+      if (recordsMode && document.visibilityState === "hidden") runtime.suspendRecords();
+      else wake();
+    };
+    const restore = (event: PageTransitionEvent) => { if (event.persisted) wake(); };
     const poll = recordsMode ? setInterval(() => {
-      if (document.visibilityState === "visible" && !runtime.getView().loading) void runtime.refresh();
+      if (document.visibilityState === "visible") void runtime.refresh({ background: true });
     }, 4_000) : undefined;
     window.addEventListener("focus", wake);
     window.addEventListener("online", wake);
-    document.addEventListener("visibilitychange", wake);
+    document.addEventListener("visibilitychange", visibility);
+    if (recordsMode) window.addEventListener("pageshow", restore);
     return () => {
       clearInterval(poll);
       window.removeEventListener("focus", wake);
       window.removeEventListener("online", wake);
-      document.removeEventListener("visibilitychange", wake);
+      document.removeEventListener("visibilitychange", visibility);
+      window.removeEventListener("pageshow", restore);
     };
   }, [recordsMode, runtime]);
   useEffect(() => {

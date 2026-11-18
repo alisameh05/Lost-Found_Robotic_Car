@@ -1,6 +1,6 @@
 import type { BootstrapResponse, Error as ApiError, HttpResponses } from "@/generated/api-v1";
-import { conforms, type Definition } from "./fixture-contracts";
 import { protectedHeaders, type ApplicationTransport, type Endpoint, type HttpRequest, type ReadResult } from "./transport";
+import { conforms, type Definition } from "./wire-contracts";
 
 const responses = {
   "GET /health": "Health",

@@ -1,8 +1,8 @@
 import asyncio
+import re
 import unicodedata
-from collections.abc import AsyncIterator, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
-from typing import Awaitable
 
 from fastapi import FastAPI, Request
 from fastapi.responses import JSONResponse, Response
@@ -26,9 +26,14 @@ from .owner import own_data_root
 from .runtime import RecordsRuntime
 from .storage import RecordsStorage
 
+WHITE_SPACE = (
+    "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
+    "\u2028\u2029\u202f\u205f\u3000"
+)
+
 
 def validate_objects_query(query: dict[str, str]) -> None:
-    name = unicodedata.normalize("NFC", query.get("name", "").strip())
+    name = unicodedata.normalize("NFC", query.get("name", "").strip(WHITE_SPACE))
     if len(name) > 120:
         raise invalid_query("OUT_OF_RANGE", "/query/name")
     if "status" in query and query["status"] not in ("Lost", "Found"):
@@ -128,8 +133,11 @@ def create_app(config: Config, *, held_owner: bool = False) -> FastAPI:
             case "/settings":
                 return JSONResponse(storage.settings)
             case "/objects":
-                if "cursor" in request.state.objects_query:
-                    return HttpError(400, "CURSOR_INVALID", "Refresh the first page of objects.").response()
+                cursor = request.state.objects_query.get("cursor")
+                if cursor is not None:
+                    # This empty feed never issues cursors. A well-formed incoming token has no live context.
+                    code = "CURSOR_EXPIRED" if re.fullmatch("[A-Za-z0-9_-]{43}", cursor) else "CURSOR_INVALID"
+                    return HttpError(400, code, "Refresh the first page of objects.").response()
                 return JSONResponse({"items": [], "next_cursor": None})
             case _:
                 return JSONResponse(runtime.snapshot(storage))

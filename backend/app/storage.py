@@ -35,8 +35,8 @@ def utc_ms() -> int:
 
 
 @contextmanager
-def transaction(db: sqlite3.Connection, *, write: bool = False) -> Iterator[None]:
-    db.execute("BEGIN IMMEDIATE" if write else "BEGIN")
+def read_transaction(db: sqlite3.Connection) -> Iterator[None]:
+    db.execute("BEGIN")
     try:
         yield
         db.commit()
@@ -49,7 +49,7 @@ def schema(db: sqlite3.Connection) -> list[tuple[str, str, str]]:
     return [
         (kind, name, sql)
         for kind, name, sql in db.execute(
-            "SELECT type, name, sql FROM sqlite_schema WHERE name NOT LIKE 'sqlite_%' ORDER BY type, name"
+            "SELECT type, name, sql FROM sqlite_schema WHERE name NOT GLOB 'sqlite_*' ORDER BY type, name"
         )
     ]
 
@@ -66,6 +66,7 @@ def migrate(db: sqlite3.Connection) -> None:
 
     # Check the actual structure as well as the recorded migration checksums.
     with closing(sqlite3.connect(":memory:")) as expected:
+        expected.execute("PRAGMA foreign_keys = ON")
         for script in scripts[:version]:
             expected.executescript(script)
         if schema(db) != schema(expected):
@@ -114,7 +115,7 @@ class RecordsStorage:
 
     def inspect(self) -> Inspection:
         try:
-            with self.connect() as db, transaction(db):
+            with self.connect() as db, read_transaction(db):
                 return self._inspect(db)
         except (OSError, sqlite3.Error):
             return Inspection(problem="Records storage cannot be read. Check local storage and restart the backend.")
