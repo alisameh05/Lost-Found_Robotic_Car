@@ -13,6 +13,7 @@ from .http import BODY_LIMIT, HEADER_LIMIT, HttpError, body_length, header
 
 MULTIPART_LIMIT = 11 * 1024**2
 IMAGE_LIMIT = 10 * 1024**2
+NAME_LIMIT = 120
 SAFE_INTEGER = 9_007_199_254_740_991
 WHITE_SPACE = (
     "\t\n\v\f\r \u0085\u00a0\u1680\u2000\u2001\u2002\u2003\u2004\u2005\u2006\u2007\u2008\u2009\u200a"
@@ -243,7 +244,7 @@ async def parse_registration(request: Request) -> Registration:
     if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", action_id):
         raise invalid("/action_id", "Use a lowercase UUIDv4 action ID.")
     name = normalize_name(text_field(parts, "name"))
-    if not 1 <= len(name) <= 120 or "\0" in name:
+    if not 1 <= len(name) <= NAME_LIMIT or "\0" in name:
         raise invalid("/name", "Enter an object name with 1 to 120 characters.", "OUT_OF_RANGE")
     submitted = header(request, "x-action-created-at-ms", 422, "VALIDATION_FAILED") or ""
     if not re.fullmatch(r"0|[1-9][0-9]{0,15}", submitted) or int(submitted) > SAFE_INTEGER:

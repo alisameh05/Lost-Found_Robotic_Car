@@ -228,7 +228,7 @@ def test_storage_fault_keeps_history_and_fails_closed(tmp_path: Path, fault: str
                 break
             sleep(0.01)
         assert health.status_code == 503 and health.json()["storage_integrity"] == "Unavailable"
-        for path in ("objects", "settings", "snapshot"):
+        for path in ("settings", "snapshot"):
             denied = browser.get(f"/api/v1/{path}", headers=headers)
             assert denied.status_code == 503
             assert denied.headers["cache-control"] == "no-store"
@@ -238,6 +238,12 @@ def test_storage_fault_keeps_history_and_fails_closed(tmp_path: Path, fault: str
                 deletion = denied.json()["snapshot"]["retention"]["deletion"]
                 assert deletion == {"status": "Failed", "remaining_objects": 1, "remaining_files": 1,
                                     "error_code": "STORAGE_UNAVAILABLE"}
+        objects = browser.get("/api/v1/objects", headers=headers)
+        assert objects.headers["cache-control"] == "no-store"
+        if fault in ("journal", "due expiry"):
+            assert objects.status_code == 200 and objects.json() == {"items": [], "next_cursor": None}
+        else:
+            assert objects.status_code == 503 and objects.json()["code"] == "STORAGE_UNAVAILABLE"
     with closing(sqlite3.connect(database)) as db:
         assert db.execute("SELECT retention_days FROM app_settings").fetchone() == (7,)
         if fault == "due expiry":

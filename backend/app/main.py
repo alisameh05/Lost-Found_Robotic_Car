@@ -25,15 +25,16 @@ from .http import (
     route_path,
 )
 from .owner import own_data_root
-from .registration_input import normalize_name, parse_registration
+from .registration_input import NAME_LIMIT, normalize_name, parse_registration
 from .runtime import RecordsRuntime
 from .storage import RecordsStorage, storage_unavailable
 
 
 def validate_objects_query(query: dict[str, str]) -> None:
     name = normalize_name(query.get("name", ""))
-    if len(name) > 120:
+    if len(name) > NAME_LIMIT:
         raise invalid_query("OUT_OF_RANGE", "/query/name")
+    query["name"] = name
     if "status" in query and query["status"] not in ("Lost", "Found"):
         raise invalid_query("INVALID_VALUE", "/query/status")
     if "limit" in query:
@@ -138,11 +139,6 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
     async def objects(request: Request) -> JSONResponse:
         runtime: RecordsRuntime = request.app.state.runtime
         runtime.check_started()
-        storage = await runtime.inspect()
-        if storage and storage.cleanup_pending:
-            return storage_unavailable(storage.problem or "Retention cleanup is incomplete.").response(
-                snapshot=await runtime.snapshot(storage),
-            )
         return JSONResponse(await runtime.objects(request.headers["x-app-client-id"], request.state.objects_query))
 
     @app.post(API_PREFIX + "/objects")

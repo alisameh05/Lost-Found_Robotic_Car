@@ -92,6 +92,34 @@ function observe(page: Page) {
   return { requests, sockets };
 }
 
+async function seedLibrary(items: readonly (readonly [string, string, "Lost" | "Found", number])[], referenceIds: string[] = []) {
+  const bootstrap = await fetch(`${backend}/bootstrap`, { headers: { Origin: frontend } });
+  const { capability } = await bootstrap.json();
+  await expect.poll(async () =>
+    (await fetch(`${backend}/health`, { headers: { "X-App-Capability": capability } })).status).toBe(200);
+  execFileSync(python, [
+    "-c", [
+      "from io import BytesIO", "import json, sys", "from pathlib import Path", "from PIL import Image",
+      "from backend.tests.test_object_library import seed_objects",
+      "image = BytesIO()", "Image.new('RGB', (1, 1), (10, 20, 30)).save(image, format='PNG')",
+      "seed_objects(Path(sys.argv[1]), json.loads(sys.argv[2]), dict.fromkeys(json.loads(sys.argv[3]), image.getvalue()))",
+    ].join("\n"),
+    join(parent, "records"), JSON.stringify(items), JSON.stringify(referenceIds),
+  ], { windowsHide: true });
+}
+
+async function loopbackOnly(page: Page) {
+  await page.context().route("**/*", async (route) => {
+    const url = new URL(route.request().url());
+    if (url.origin === frontend || url.origin === new URL(backend).origin) await route.continue();
+    else await route.abort();
+  });
+}
+
+function objectRows(page: Page) {
+  return page.getByRole("list", { name: "Object records" }).getByRole("listitem");
+}
+
 test.beforeEach(() => { parent = mkdtempSync(join(tmpdir(), "laf-records-browser-")); });
 test.afterEach(async () => {
   await stopBackend();
@@ -103,7 +131,7 @@ test("opens connected empty records and read-only settings with one page identit
   const { requests, sockets } = observe(page);
   await page.goto("/");
   await expect(page.getByText("Records connected · Search unavailable")).toBeVisible();
-  await expect(page.getByText("No sessions for recent objects", { exact: true })).toBeVisible();
+  await expect(page.getByText("Search history unavailable", { exact: true })).toBeVisible();
   await expect(page.getByText(/Fixture mode|Fixture scenario|Sample device observations/)).toHaveCount(0);
   await page.getByRole("link", { name: "Objects / History" }).click();
   await expect(page.getByRole("heading", { name: "No objects registered" })).toBeVisible();
@@ -183,6 +211,160 @@ test("recovers protected records after the backend dies and starts on the same p
   expect((await replacementHealth.json()).backend_boot_id).not.toBe(firstBoot);
   await expect(page.getByText("7 days", { exact: true })).toBeVisible();
   expect(requests.filter((value) => value === "GET /api/v1/bootstrap")).toHaveLength(2);
+});
+
+test("finds and pages real registrations, opens protected references and uses Dashboard details offline", async ({ page }) => {
+  await startBackend();
+  await loopbackOnly(page);
+  const registered = Date.now() - 1_000;
+  const items = Array.from({ length: 26 }, (_, index) =>
+    [`row-${String(index).padStart(2, "0")}`, `Spare item ${index}`, "Lost", registered - 10] as const);
+  await seedLibrary([
+    ...items,
+    ["a", "Straße%_  Café Ᲊ", "Found", registered],
+    ["Z", "Straße%_  Café Ᲊ", "Lost", registered],
+    ["unicode", "a\u{1e4ec}\u0301", "Lost", registered - 5],
+  ], ["a"]);
+
+  const { requests } = observe(page);
+  await page.goto("/");
+  const recent = page.getByRole("list", { name: "Recent registrations" });
+  await expect(recent.getByRole("listitem")).toHaveCount(3);
+  await expect(recent.getByRole("link").first()).toHaveAttribute("href", "/objects/a");
+  await expect(page.getByText("Search history unavailable", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "Search unavailable", exact: true })).toBeVisible();
+  await recent.getByRole("link").first().click();
+  await expect(page.getByRole("region", { name: "Object record" }).getByRole("heading")).toHaveText("Straße%_  Café Ᲊ");
+  await page.getByRole("link", { name: "Back to Objects" }).click();
+  await expect(objectRows(page)).toHaveCount(25);
+  await expect(objectRows(page).first().getByRole("link")).toHaveAttribute("href", "/objects/a");
+  await expect(objectRows(page).nth(1).getByRole("link")).toHaveAttribute("href", "/objects/Z");
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(objectRows(page)).toHaveCount(4);
+  await expect(objectRows(page).last().getByRole("link")).toHaveAttribute("href", "/objects/row-00");
+  const focusHealth = page.waitForResponse((response) => response.url() === `${backend}/health` && response.ok());
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await focusHealth;
+  await expect(page.getByText(/Page 2 · 4 objects/)).toBeVisible();
+  await page.getByRole("button", { name: "Previous", exact: true }).click();
+  await expect(objectRows(page)).toHaveCount(25);
+
+  const field = page.getByRole("searchbox", { name: "Search objects" });
+  await field.fill("\u0085STRASSE%_  CAFE\u0301 ᲊ\u2003");
+  await expect(objectRows(page)).toHaveCount(2);
+  await page.getByRole("button", { name: "Lost", exact: true }).click();
+  await expect(objectRows(page)).toHaveCount(1);
+  await expect(objectRows(page).first().getByRole("link")).toHaveAttribute("href", "/objects/Z");
+  await expect(page.getByText("Media missing", { exact: true }).first()).toBeVisible();
+  const bytesResponse = page.waitForResponse((response) => response.url() === `${backend}/media/a-reference` && response.ok());
+  await page.getByRole("button", { name: "Found", exact: true }).click();
+  const received = await bytesResponse;
+  expect(received.headers()).toMatchObject({
+    "cache-control": "no-store", "content-type": "image/png", "x-content-type-options": "nosniff", "accept-ranges": "none",
+  });
+  await expect(objectRows(page)).toHaveCount(1);
+  const image = objectRows(page).first().getByRole("img");
+  await expect(image).toHaveAttribute("src", /^blob:/);
+  const objectUrl = await image.getAttribute("src");
+  await page.getByRole("button", { name: "All", exact: true }).click();
+  await field.fill("a\u{1e4ec}\u0301");
+  await expect(objectRows(page).first().getByRole("link")).toHaveAttribute("href", "/objects/unicode");
+  expect(await page.evaluate(async (url) => {
+    try { await fetch(url!); return true; } catch { return false; }
+  }, objectUrl)).toBe(false);
+  await field.fill("🧭".repeat(121));
+  await expect(page.getByText(/Enter no more than 120 characters/)).toBeVisible();
+  expect(requests.filter((request) => request === "GET /api/v1/bootstrap")).toHaveLength(1);
+  expect(requests.some((request) => /\/sessions|\/control-lease/.test(request))).toBe(false);
+});
+
+test("discards overtaken search reads, resets an expired cursor and restarts with a new authority", async ({ page }) => {
+  await startBackend();
+  await loopbackOnly(page);
+  const registered = Date.now() - 1_000;
+  const common = "abcdefghijklmnopqrstuvwxyz1234567890";
+  await seedLibrary(Array.from({ length: 26 }, (_, index) => [
+    `row-${String(index).padStart(2, "0")}`, `${common} ${index === 25 ? "second" : "first"}`, "Lost", registered,
+  ]));
+  const { requests } = observe(page);
+  const initialPage = page.waitForRequest((request) => request.url() === `${backend}/objects` && request.method() === "GET");
+  await page.goto("/objects");
+  const { "x-app-capability": capability, "x-app-client-id": client } = await (await initialPage).allHeaders();
+  const delayed = Promise.withResolvers<void>();
+  const received = Promise.withResolvers<void>();
+  await page.route(`${backend}/objects?name=first`, async (route) => {
+    const realResponse = await route.fetch();
+    received.resolve();
+    await delayed.promise;
+    await route.fulfill({ response: realResponse }).catch(() => {});
+  });
+  const field = page.getByRole("searchbox", { name: "Search objects" });
+  await field.fill("first");
+  await received.promise;
+  await field.fill("second");
+  await expect(objectRows(page)).toHaveCount(1);
+  await expect(objectRows(page).first()).toContainText("second");
+  delayed.resolve();
+  await page.unrouteAll({ behavior: "wait" });
+  await expect(objectRows(page)).toHaveCount(1);
+  await expect(objectRows(page).first()).toContainText("second");
+
+  await field.fill("");
+  await expect(objectRows(page)).toHaveCount(25);
+  const nextPage = page.waitForRequest((request) => request.url().includes("/objects?cursor=") && request.method() === "GET");
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  const oldCursorRequest = (await nextPage).url();
+  await expect(page.getByText(/Page 2 · 1 object/)).toBeVisible();
+  const headers = { "X-App-Capability": capability, "X-App-Client-Id": client };
+  for (let i = 0; i < 32; i++) {
+    const result = await page.request.get(`${backend}/objects`, { headers, params: { limit: 1, name: common.slice(i, i + 4) } });
+    expect(result.ok()).toBe(true);
+    expect((await result.json()).next_cursor).toBeTruthy();
+  }
+  expect((await (await page.request.get(oldCursorRequest, { headers })).json()).code).toBe("CURSOR_EXPIRED");
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.getByText("Page access expired. Returned to page 1.")).toBeVisible();
+  await expect(objectRows(page)).toHaveCount(25);
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(page.getByText(/Page 2 · 1 object/)).toBeVisible();
+  await stopBackend();
+  await expect(page.getByText("Objects unavailable", { exact: true })).toBeVisible({ timeout: 12_000 });
+  await startBackend();
+  await expect(page.getByText(/Page 1 · 25 objects/)).toBeVisible({ timeout: 12_000 });
+  expect(requests.filter((request) => request === "GET /api/v1/bootstrap")).toHaveLength(2);
+});
+
+test("revokes an expired reference and keeps browsing the eligible page against the real service", async ({ page }) => {
+  const offset = join(parent, "catalogue-clock");
+  writeFileSync(offset, "0");
+  await startBackend({ clockOffset: offset });
+  await loopbackOnly(page);
+  const registered = Date.now() - 1_000;
+  const old = registered - 7 * 86_400_000 + 120_000;
+  await seedLibrary([
+    ...Array.from({ length: 25 }, (_, index): [string, string, "Lost", number] =>
+      [`row-${index}`, `Saved item ${index}`, "Lost", registered]),
+    ["old", "Due reference", "Lost", old],
+  ], ["old"]);
+  await page.goto("/objects");
+  await expect(objectRows(page)).toHaveCount(25);
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  const reference = objectRows(page).getByRole("img", { name: "Reference for Due reference" });
+  await expect(reference).toBeVisible();
+  const localUrl = await reference.getAttribute("src");
+  writeFileSync(offset, "180000");
+  // Re-read this page with its original cursor after the owner's cutoff.
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.getByText("No records on this page", { exact: true })).toBeVisible();
+  await expect(page.getByText("Due reference", { exact: true })).toHaveCount(0);
+  expect(await page.evaluate(async (url) => {
+    try { await fetch(url!); return true; } catch { return false; }
+  }, localUrl)).toBe(false);
+  await page.getByRole("button", { name: "Previous", exact: true }).click();
+  await expect(objectRows(page)).toHaveCount(25);
+  await expect(page.getByText("Local records storage unavailable", { exact: true })).toBeVisible();
+  await page.goto("/objects/old");
+  await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
 });
 
 test("registers an oriented reference and reopens its target after actual process restart", async ({ page }) => {

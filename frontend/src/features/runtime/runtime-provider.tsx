@@ -174,7 +174,7 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
     return () => lifetime.abort();
   }, [runtime, load, attempt, snapshot, authority, removedOwners, ready, enabled]);
 
-  const current = enabled && visibleRead && visibleRead.runtime === runtime && visibleRead.load === load &&
+  const current = ready && enabled && visibleRead && visibleRead.runtime === runtime && visibleRead.load === load &&
     visibleRead.attempt === attempt ? visibleRead : undefined;
   const retry = useCallback(() => {
     if (ready) setAttempt((previous) => previous + 1);

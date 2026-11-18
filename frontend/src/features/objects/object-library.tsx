@@ -9,7 +9,7 @@ import { DataUnavailable } from "@/components/layout/preview";
 import { Button } from "@/components/ui/button";
 import { LoadingState, Notice } from "@/components/ui/feedback";
 import { Field } from "@/components/ui/field";
-import { useCursorPage, useRuntimeView } from "@/features/runtime";
+import { useCursorPage, useEligibleObjects, useRuntimeView } from "@/features/runtime";
 import type { Object as ObjectRecord } from "@/generated/api-v1";
 import { maxObjectNameLength, normalizeObjectName } from "@/lib/object-name";
 import { objectHref, ObjectStatus, RecordReadFailure, RecordTime, ReferenceImage, RegisterLink, StartSearch } from "./record-ui";
@@ -19,7 +19,7 @@ const filters = ["All", "Lost", "Found"] as const;
 type Filter = (typeof filters)[number];
 
 export function ObjectLibraryScreen() {
-  const { disconnected, recordsMode, removedOwners } = useRuntimeView();
+  const { disconnected, recordsMode } = useRuntimeView();
   const [name, setName] = useState("");
   const [filter, setFilter] = useState<Filter>("All");
   const normalizedName = normalizeObjectName(name);
@@ -27,10 +27,12 @@ export function ObjectLibraryScreen() {
   const scope = useMemo(() => ({ query: {
     ...(normalizedName && { name: normalizedName }), ...(filter !== "All" && { status: filter }),
   } }), [filter, normalizedName]);
-  const { result, page, hasPrevious, hasNext, next, previous, retry } = useCursorPage("GET /objects", scope, !tooLong);
+  const { result, snapshotAtRead, reset, page, hasPrevious, hasNext, next, previous, retry } =
+    useCursorPage("GET /objects", scope, !tooLong);
   const filtered = Boolean(normalizedName || filter !== "All");
   const clear = () => { setName(""); setFilter("All"); };
-  const items = result?.kind === "ok" ? result.data.items.filter(({ id }) => !removedOwners?.has(id)) : undefined;
+  const eligible = useEligibleObjects(result?.kind === "ok" ? result.data.items : [], snapshotAtRead, retry);
+  const items = result?.kind === "ok" ? eligible : undefined;
   const showPaging = !tooLong && (!result || hasPrevious || Boolean(items?.length) || hasNext);
   if (disconnected) return <DataUnavailable />;
 
@@ -47,10 +49,12 @@ export function ObjectLibraryScreen() {
           aria-pressed={status === filter} onClick={() => setFilter(status)}>{status}</Button>)}
       </fieldset>
     </div>
+    {reset && <p role="status">{reset === "CURSOR_EXPIRED" ? "Page access expired." : "Page access was invalid."} Returned to page 1.</p>}
     {!tooLong && (!result ? <LoadingState label="Loading objects" />
       : !items ? <RecordReadFailure title="Objects unavailable" retry={retry} />
       : <>
         {items.length > 0 ? <RecordList key={page} records={items} />
+          : result.kind === "ok" && result.data.items.length > 0 ? <Notice role="status" title="Records on this page expired" />
           : hasPrevious ? <Notice role="status" title="No records on this page">Use Previous to return to the preceding page.</Notice>
           : filtered ? <Panel>
             <div role="status"><h2>No matching objects</h2></div>
