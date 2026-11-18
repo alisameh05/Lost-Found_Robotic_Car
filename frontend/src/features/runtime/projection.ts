@@ -59,7 +59,10 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     } });
 
   function serverTime() {
-    if (clock && !lifetime.signal.aborted) return clock.server + Math.ceil(performance.now() - clock.received);
+    if (clock && !lifetime.signal.aborted) {
+      const elapsed = performance.now() - clock.received;
+      return clock.server + (recordsMode ? Math.floor(elapsed) : Math.ceil(elapsed));
+    }
   }
 
   function acknowledgedSnapshot(response: EmergencyStopResponse) {
@@ -96,7 +99,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       authority: (view.authority ?? 0) + 1 });
   }
 
-  async function refresh({ readBootstrap = false, revalidate = false, background = false } = {}) {
+  async function refresh({ readBootstrap = false, revalidate = false, background = false, renewClock = false } = {}) {
     if (lifetime.signal.aborted || (background && readRequest)) return;
     readRequest?.abort();
     const controller = new AbortController();
@@ -106,11 +109,13 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       clearRecordsView(true);
     } else if (!recordsMode || !view.connected) update({ loading: true });
     try {
-      if (!context || (readBootstrap && !recordsMode)) {
+      if (!context || renewClock || (readBootstrap && !recordsMode)) {
         const bootstrapStarted = performance.now();
         const bootstrap = await transport.bootstrap(signal);
+        const bootstrapReceived = performance.now();
         if (signal.aborted) return;
         if (bootstrap.kind !== "ok") {
+          if (renewClock && context) return;
           if (view.recovering) {
             update({ loading: false, failedRead: bootstrap });
             retryBootstrap();
@@ -142,7 +147,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
           lastActiveSearch = undefined;
         }
         context = bootstrap.data;
-        clock = { server: bootstrap.data.server_time_ms, received: bootstrapStarted };
+        clock = { server: bootstrap.data.server_time_ms, received: recordsMode ? bootstrapReceived : bootstrapStarted };
         update({ connected: !recordsMode, profile: sameProfile ? view.profile : profile,
           ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined,
             removedOwners: undefined, removedSessionId: undefined,
@@ -430,7 +435,12 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     },
     async register(action: RegistrationAction, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;
-      return transport.request("POST /objects", { ...action, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+      const result = await transport.request("POST /objects", { ...action, context, signal: AbortSignal.any([signal, lifetime.signal]) });
+      if (recordsMode && invalidAuthority(result)) void refresh({ readBootstrap: true });
+      if (recordsMode && result.kind === "api-error" && result.error.code === "ACTION_EXPIRED") {
+        await refresh({ renewClock: true });
+      }
+      return result;
     },
     async previewRetention(body: RetentionPreviewRequest, signal: AbortSignal) {
       if (!context) return { kind: "unavailable" } as const;

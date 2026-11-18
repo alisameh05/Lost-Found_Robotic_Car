@@ -34,7 +34,7 @@ npm.cmd run build
 npm.cmd start
 ```
 
-Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Dashboard and Objects show an empty history. Settings shows the saved seven-day retention period. Devices shows the records service and unqualified search paths. Shutdown uses Ctrl+C in each terminal. Running the installed application uses local assets and loopback HTTP.
+Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Dashboard and Objects show an empty history on first use. Register Object saves a JPEG or PNG reference and selected rectangle to a new Lost record. Settings shows the saved seven-day retention period. Devices shows the records service and unqualified search paths. Shutdown uses Ctrl+C in each terminal. Running the installed application uses local assets and loopback HTTP.
 
 | Environment variable | Default | Where to set it |
 | --- | --- | --- |
@@ -43,9 +43,9 @@ Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Dashboard and Objects show 
 | `LAF_DATA_ROOT` | `%LOCALAPPDATA%\LostAndFound` | Backend terminal. Use an absolute application directory under `LOCALAPPDATA`. |
 | `LAF_MODE` | Disconnected | Frontend terminal. Use `records` for protected HTTP or `fixture` for labeled previews. |
 
-Each service reports an occupied port and exits. Only one backend owns a data root, even across different ports. Close the owner before changing its configuration. The OS releases the lock on process exit. Keep the database and its SQLite sidecars together under the local root. SQLite uses WAL and synchronous FULL, enables foreign keys on every connection, and applies migration SQL and its receipt in one immediate transaction. The current application's only durable write initializes the schema and settings.
+Each service reports an occupied port and exits. Only one backend owns a data root, even across different ports. Close the owner before changing its configuration. The OS releases the lock on process exit. Keep the database, its SQLite sidecars and the managed media together under the local root. SQLite uses WAL and synchronous FULL, enables foreign keys on every connection, and applies migration SQL and its receipt in one immediate transaction. Registration flushes the normalized reference into staging, journals the preparation, and promotes the file before committing the object, Ready media and receipt together. Restart rolls back interrupted preparations and preserves committed references.
 
-An incompatible database, interrupted records, unresolved storage journal or due expiry blocks records reads and leaves data available for recovery. Failed cleanup counts show the durable inventory of pending owners and paths. Health stays available with the current capability. Registration, retention edits, media/history reads, events and search controls have later implementation slices.
+An incompatible database or unresolved storage operation leaves the data available for recovery and blocks new writes. Due expiry hides the owner and blocks new registration until cleanup is repaired. Failed cleanup counts show pending owners and files. Health stays available with the current capability. If a save response is interrupted, use Retry Same Request to recover the result. Retention edits, search history, events and search controls have later implementation slices.
 
 ## Verify
 
@@ -61,4 +61,4 @@ $recordsPython = '.local-runtime/records/Scripts/python.exe'
 
 Run `npm.cmd run verify` from `frontend` with the same PowerShell npm script setting above. The browser suite starts temporary backends and uses temporary SQLite roots. The initialization journey holds the actual storage initialization in its test process until the browser reads the live 503 diagnostic. Its frontend ports are 3100–3103 and its records backend port is 8110. Set `LAF_TEST_PYTHON` to an absolute path when using a different Python environment with the locked dependencies.
 
-Refresh exports with `python -m backend.contracts.export` using the installed environment, then run `npm.cmd run contracts:generate` in `frontend`. The [wire manifest](contracts/v1/openapi.json) includes later operations. Its `x-laf-records-runtime` flag identifies the five mounted HTTP operations. Backend tests compare the exports with the approved API and verify that the mounted routes agree. Frontend contract checks validate existing fixture payloads and frame vectors against the generated definitions.
+Refresh exports with `python -m backend.contracts.export` using the installed environment, then run `npm.cmd run contracts:generate` in `frontend`. The [wire manifest](contracts/v1/openapi.json) includes later operations. Its `x-laf-records-runtime` flag identifies the mounted HTTP operations. Backend tests compare the exports with the approved API and verify that the mounted routes agree. Frontend contract checks validate existing fixture payloads and frame vectors against the generated definitions.

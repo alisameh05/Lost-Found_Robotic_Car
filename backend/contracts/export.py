@@ -53,8 +53,11 @@ def json_content(name: str) -> dict[str, object]:
 
 def responses(path: str, result: str | None, statuses: tuple[int, ...]) -> dict[str, object]:
     no_store = {"Cache-Control": {"schema": {"const": "no-store"}}}
+    failure = json_content("Error")
+    if path == "/objects" and result == "MutationResponse":
+        failure = {"application/json": {"schema": {"oneOf": [component("Error"), component("MutationResponse")]}}}
     definitions: dict[str, object] = {"default": {
-        "description": "API failure", "content": json_content("Error"), "headers": no_store,
+        "description": "API failure", "content": failure, "headers": no_store,
     }}
     for status in statuses:
         content: dict[str, object]
@@ -110,7 +113,7 @@ def operation(
     item: dict[str, object] = {
         "parameters": parameters, "responses": responses(path, result, statuses),
         "security": [] if path == "/bootstrap" else [{"Capability": []}],
-        "x-laf-records-runtime": method == "get" and path in RECORDS_ROUTES,
+        "x-laf-records-runtime": method.upper() in RECORDS_ROUTES.get(path, ()),
     }
     if body == "RegistrationFields":
         parameters.append(parameter("X-Action-Created-At-Ms", "header", component("UtcMs"), True))

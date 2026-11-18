@@ -13,15 +13,15 @@ import styles from "./records.module.css";
 
 export function ObjectDetailsScreen({ objectId }: { objectId: string }) {
   const { result, retry, object, absence } = useObjectRecord(objectId);
-  const { disconnected } = useRuntimeView();
-  const history = useObjectSessions(objectId, historyPageSize, Boolean(object));
+  const { disconnected, recordsMode } = useRuntimeView();
+  const history = useObjectSessions(objectId, historyPageSize, Boolean(object) && !recordsMode);
   const missing = absence ?? recordAbsence(history.result);
   if (disconnected) return <DataUnavailable />;
   return <div className={styles.recordLayout}>
     <PageHeader title="Object Details" description={missing ? undefined : object?.name}
       actions={object && !missing && <ObjectStatus status={object.status} />} />
     {missing ? <RecordAbsent status={missing} title="Object" />
-      : object ? <RecordDetails object={object} history={history} />
+      : object ? <RecordDetails object={object} history={history} recordsMode={recordsMode} />
       : !result ? <LoadingState label="Loading object details" />
       : <RecordReadFailure title="Object details unavailable" retry={retry} />}
     <footer className={styles.detailActions}>
@@ -31,13 +31,15 @@ export function ObjectDetailsScreen({ objectId }: { objectId: string }) {
   </div>;
 }
 
-function RecordDetails({ object, history }: { object: ObjectRecord; history: ReturnType<typeof useObjectSessions> }) {
+function RecordDetails({ object, history, recordsMode }: {
+  object: ObjectRecord; history: ReturnType<typeof useObjectSessions>; recordsMode?: boolean;
+}) {
   return <div className={styles.details}>
     <div className={styles.historyColumn}>
       <section className={styles.reference} aria-label="Object reference and selected target">
         <ReferenceImage object={object} target="both" />
       </section>
-      <ObjectSessionHistory objectId={object.id} paging={history} />
+      {recordsMode ? <Notice title="Search history unavailable" /> : <ObjectSessionHistory objectId={object.id} paging={history} />}
     </div>
     <section className={styles.recordSummary} aria-label="Object record">
       <h2>{object.name}</h2>
@@ -50,7 +52,7 @@ function RecordDetails({ object, history }: { object: ObjectRecord; history: Ret
         This record remains available while its active search continues.
       </Notice>}
       <StartSearch object={object} />
-      {object.status === "Found" && <ConfirmedEvidence objectId={object.id} />}
+      {object.status === "Found" && !recordsMode && <ConfirmedEvidence objectId={object.id} />}
     </section>
   </div>;
 }
