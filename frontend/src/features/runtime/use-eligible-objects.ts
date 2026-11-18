@@ -8,10 +8,10 @@ export function useEligibleObjects(
   objects: readonly ObjectRecord[], snapshotAtRead: Snapshot | undefined, retry: () => void,
 ) {
   const runtime = useRuntime()?.connection?.runtime;
-  const { recordSnapshot, snapshot, removedOwners } = useRuntimeView();
+  const { recordSnapshot, snapshot, recordsMode, removedOwners } = useRuntimeView();
   const now = runtime?.serverTime();
   const hasGrace = (object: ObjectRecord) => snapshot?.active_session?.object_id === object.id ||
-    (object.retention_grace && snapshotAtRead === recordSnapshot);
+    (object.retention_grace && (recordsMode || snapshotAtRead === recordSnapshot));
   const eligible = objects.filter((object) => !removedOwners?.has(object.id) &&
     (now === undefined || now < object.expires_at_ms || hasGrace(object)));
   const deadline = eligible.reduce((earliest, object) =>

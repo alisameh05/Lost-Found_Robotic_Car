@@ -234,12 +234,12 @@ class ManagedMedia:
             entry.discard()
 
     def exists(self, relative: str) -> bool:
-        with self.entry(relative) as entry:
-            try:
+        try:
+            with self.entry(relative) as entry:
                 entry.stat()
-            except FileNotFoundError:
-                return False
-            return True
+        except FileNotFoundError:
+            return False
+        return True
 
     def read(
         self, relative: str, byte_length: int, checksum: str, *,

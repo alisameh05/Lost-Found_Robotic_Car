@@ -165,6 +165,22 @@ def test_pending_purge_denies_access_and_reports_rows_and_actual_files(tmp_path:
         wait_for_cleanup(browser, headers, "Complete")
 
 
+def test_missing_managed_directories_reconcile_without_restart(tmp_path: Path) -> None:
+    now = 1_800_000_000_000
+    storage = RecordsStorage(tmp_path, clock=lambda: now, monotonic=lambda: 0.0)
+    with TestClient(create_app(Config(tmp_path), storage=storage), base_url=BASE) as browser:
+        wait_for_health(browser, headers := credentials(browser))
+        saved = submit(browser, headers, submitted=now)
+        next((tmp_path / "media").iterdir()).unlink()
+        (tmp_path / "media").rmdir()
+        (tmp_path / "staging").rmdir()
+        now += 7 * DAY_MS
+        assert wait_for_cleanup(browser, headers, "Complete")["operations"] == []
+        assert browser.get(saved.headers["location"], headers=headers).status_code == 404
+        assert list((tmp_path / "media").iterdir()) == []
+        assert list((tmp_path / "staging").iterdir()) == []
+
+
 @pytest.mark.parametrize("fault", ["disk full", "denied", "hard link", "traversal"])
 def test_failed_purge_never_exposes_or_replays_and_recovers_after_repair(
     tmp_path: Path, fault: str, monkeypatch: pytest.MonkeyPatch,
@@ -266,6 +282,52 @@ def test_process_death_during_startup_purge_recovers_on_restart(
         with closing(sqlite3.connect(storage.path)) as db:
             for table in ("objects", "media", "sessions", "match_events", "action_receipts", "storage_operations"):
                 assert db.execute(f"SELECT COUNT(*) FROM {table}").fetchone() == (0,)
+        assert not list((root / "media").iterdir())
+    finally:
+        recovered.kill()
+        recovered.communicate(timeout=10)
+
+
+def test_runtime_crash_before_journal_then_clock_rollback_does_not_restore_access(tmp_path: Path) -> None:
+    root = tmp_path / "records"
+    registered = utc_ms() - 6 * DAY_MS
+    storage = RecordsStorage(root, clock=lambda: registered, monotonic=lambda: 0.0)
+    with TestClient(create_app(Config(root), storage=storage), base_url=BASE) as browser:
+        wait_for_health(browser, headers := credentials(browser))
+        saved = submit(browser, headers, submitted=registered)
+        reference = saved.json()["result"]["object"]["reference_media"]["id"]
+        owned_stage = root / "staging" / (reference + ".part")
+        owned_stage.write_bytes(PNG)
+        orphan = root / "staging" / ("a" * 32 + ".part")
+        orphan.write_bytes(PNG)
+
+    clock = tmp_path / "clock-offset"
+    clock.write_text("0")
+    port = free_port()
+    crashed = launch(root, port, ("backend.tests.crash_registration", "clock", str(clock), "purge_before_journal"))
+    try:
+        headers = context_headers(connect(crashed, port))
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=5) as http:
+            assert http.get(saved.headers["location"], headers=headers).status_code == 200
+        assert owned_stage.is_file() and not orphan.exists()
+        clock.write_text(str(2 * DAY_MS))
+        crashed.communicate(timeout=15)
+        assert crashed.returncode == 84
+    finally:
+        if crashed.poll() is None:
+            crashed.kill()
+            crashed.communicate(timeout=10)
+    assert owned_stage.is_file()
+    with closing(sqlite3.connect(storage.path)) as db:
+        assert db.execute("SELECT deletion_pending FROM objects").fetchall() == [(0,)]
+        assert not db.execute("SELECT 1 FROM storage_operations").fetchone()
+
+    recovered = launch(root, port)
+    try:
+        headers = context_headers(connect(recovered, port))
+        with httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=5) as http:
+            assert http.get(saved.headers["location"], headers=headers).status_code == 404
+        assert not owned_stage.exists()
         assert not list((root / "media").iterdir())
     finally:
         recovered.kill()

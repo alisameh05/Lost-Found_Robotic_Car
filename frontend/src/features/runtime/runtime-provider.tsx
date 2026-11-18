@@ -1,6 +1,6 @@
 "use client";
 
-import { createContext, useCallback, useContext, useEffect, useState, useSyncExternalStore, type ReactNode } from "react";
+import { createContext, useCallback, useContext, useEffect, useRef, useState, useSyncExternalStore, type ReactNode } from "react";
 import { usePathname } from "next/navigation";
 import type { ApplicationTransport, ProtectedPath, ReadResult } from "@/lib/transport";
 import type { createFixtureHarness } from "@/lib/create-transport";
@@ -161,12 +161,13 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
   enabled = true, waitForRuntime = false, allowCleanupRead = false) {
   const runtime = useRuntime()?.connection?.runtime;
   const refresh = useRefreshRuntime();
-  const { authority, recordSnapshot: snapshot, connected, failedRead, loading, removedOwners } = useRuntimeView();
+  const { authority, recordSnapshot: snapshot, recordPoll, connected, failedRead, loading, removedOwners } = useRuntimeView();
   const cleanupDiagnostic = allowCleanupRead && failedRead?.kind === "api-error" &&
     failedRead.error.snapshot !== null && failedRead.error.snapshot !== undefined &&
     failedRead.error.snapshot.retention.deletion.status !== "Complete";
   const ready = (connected || cleanupDiagnostic) && (!waitForRuntime || snapshot !== undefined || !loading);
   const [attempt, setAttempt] = useState(0);
+  const pollRead = useRef<() => void>(null);
   const [read, setRead] = useState<{
     runtime: RuntimeProjection; load: typeof load; attempt: number; result: ReadResult<T>;
     snapshot: RuntimeView["snapshot"]; authority: RuntimeView["authority"]; removedOwners: RuntimeView["removedOwners"];
@@ -183,19 +184,34 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
     if (!runtime || !ready || !enabled) return;
     const currentRuntime = runtime;
     const lifetime = new AbortController();
+    let reading = false;
     function publish(result: ReadResult<T>) {
       const eligible = eligibleRead(result, removedOwners);
       const currentView = currentRuntime.getView();
       if (!lifetime.signal.aborted && eligible &&
-          currentView.authority === authority && currentView.removedOwners === removedOwners) {
+          currentView.authority === authority && currentView.removedOwners === removedOwners &&
+          currentView.recordSnapshot === snapshot) {
         setRead({ runtime: currentRuntime, load, attempt, result: eligible, snapshot, authority, removedOwners });
       }
     }
-    void load(currentRuntime, lifetime.signal).then(publish).catch((error: unknown) => {
-      if (!(error instanceof DOMException && error.name === "AbortError")) publish({ kind: "unavailable" });
-    });
-    return () => lifetime.abort();
+    function readCurrent() {
+      if (reading || lifetime.signal.aborted) return;
+      reading = true;
+      void load(currentRuntime, lifetime.signal).then(publish).catch((error: unknown) => {
+        if (!(error instanceof DOMException && error.name === "AbortError")) publish({ kind: "unavailable" });
+      }).finally(() => { reading = false; });
+    }
+    pollRead.current = readCurrent;
+    readCurrent();
+    return () => {
+      pollRead.current = null;
+      lifetime.abort();
+    };
   }, [runtime, load, attempt, snapshot, authority, removedOwners, ready, enabled]);
+  // A routine poll can refresh a settled read. A real invalidation cancels it above.
+  useEffect(() => {
+    if (allowCleanupRead && recordPoll !== undefined) pollRead.current?.();
+  }, [allowCleanupRead, recordPoll]);
 
   const current = ready && enabled && visibleRead && visibleRead.runtime === runtime && visibleRead.load === load &&
     visibleRead.attempt === attempt ? visibleRead : undefined;

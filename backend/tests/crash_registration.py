@@ -37,7 +37,11 @@ def test_app(config: Config, *, held_owner: bool = False):
                 pass
             return utc_ms() + offset
 
-        storage = RecordsStorage(config.data_root, clock=clock)
+        def crash_with_clock(boundary: str) -> None:
+            if len(sys.argv) > 3 and boundary == sys.argv[3]:
+                os._exit(84)
+
+        storage = RecordsStorage(config.data_root, clock=clock, checkpoint=crash_with_clock)
     else:
         storage = RecordsStorage(config.data_root, checkpoint=crash_at_checkpoint)
     return create_app(config, held_owner=held_owner, storage=storage)

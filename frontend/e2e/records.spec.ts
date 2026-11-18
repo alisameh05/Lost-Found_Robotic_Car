@@ -612,7 +612,7 @@ test("clears expired media on wake and reports failed cleanup through restart an
   await seedLibrary([["old", "Due reference", "Lost", Date.now() - 7 * 86_400_000 + 120_000]], ["old"]);
 
   await page.goto("/objects/old");
-  const reference = page.getByRole("img", { name: "Reference for Due reference" });
+  const reference = page.getByRole("img", { name: "Reference for Due reference", exact: true });
   await expect(reference).toHaveAttribute("src", /^blob:/);
   const url = await reference.getAttribute("src");
   await expect(page.getByText("7 days from registration")).toBeVisible();
@@ -649,6 +649,61 @@ test("clears expired media on wake and reports failed cleanup through restart an
   await page.goto("/objects/old");
   await expect(page.getByText("Object not found", { exact: true })).toBeVisible();
   await expect(reference).toHaveCount(0);
+});
+
+test("preserves grace during a slow refresh and rejects its stale response after session end", async ({ page }) => {
+  test.setTimeout(60_000);
+  const clock = join(parent, "grace-clock");
+  writeFileSync(clock, "0");
+  await startBackend({ clockOffset: clock });
+  await loopbackOnly(page);
+  const started = Date.now() - 1000;
+  await seedLibrary([["old", "Graced reference", "Lost", started - 7 * 86_400_000 + 120_000]], ["old"]);
+  const database = join(parent, "records", "records.sqlite3");
+  execFileSync(python, [
+    "-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
+      "db.execute(\"INSERT INTO sessions VALUES ('paused','old','Controller','Paused',?,NULL,NULL,?,1)\", " +
+      "(int(sys.argv[2]), '[{\"cause\":\"ManualPause\",\"failure_id\":null}]')); db.commit()",
+    database, String(started),
+  ], { windowsHide: true });
+  writeFileSync(clock, "180000");
+  await page.goto("/objects/old");
+  const image = page.getByRole("img", { name: "Reference for Graced reference", exact: true });
+  await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Search" })).toBeDisabled();
+  await expect(image).toHaveAttribute("src", /^blob:/);
+  const url = await image.getAttribute("src");
+
+  let readHeld = false;
+  let releaseRead = () => {};
+  const held = new Promise<void>((resolve) => { releaseRead = resolve; });
+  await page.route(`${backend}/objects/old`, async (route) => {
+    const response = await route.fetch();
+    readHeld = response.ok();
+    await held;
+    await route.fulfill({ response }).catch(() => {});
+  }, { times: 1 });
+  try {
+    await expect.poll(() => readHeld, { timeout: 12_000 }).toBe(true);
+    await page.waitForResponse((response) => response.url() === `${backend}/snapshot`, { timeout: 12_000 });
+    await expect(image).toHaveAttribute("src", url!);
+    await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();
+
+    execFileSync(python, [
+      "-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
+        "db.execute(\"UPDATE sessions SET state='Ended', end_reason='Stopped', ended_at_ms=?, pause_causes='[]' " +
+        "WHERE id='paused'\", (int(sys.argv[2]),)); db.commit()",
+      database, String(Date.now() + 180_000),
+    ], { windowsHide: true });
+    await page.evaluate(() => dispatchEvent(new Event("focus")));
+    await expect(page.getByText(/^(Record expired|Object not found)$/)).toBeVisible();
+  } finally {
+    releaseRead();
+  }
+  await expect(image).toHaveCount(0);
+  expect(await page.evaluate(async (url) => {
+    try { await fetch(url!); return true; } catch { return false; }
+  }, url)).toBe(false);
 });
 
 test("starts a new submission from the backend clock after an expired action", async ({ page }) => {

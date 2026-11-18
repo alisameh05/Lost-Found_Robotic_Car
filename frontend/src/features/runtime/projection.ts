@@ -17,6 +17,7 @@ type RuntimeView = {
   recordsMode?: boolean;
   snapshot?: Snapshot;
   recordSnapshot?: Snapshot;
+  recordPoll?: number;
   failedRead?: Exclude<ReadResult<never>, { kind: "ok" }>;
   loading: boolean;
   connected?: boolean;
@@ -193,16 +194,17 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
           ? status.error.snapshot : undefined;
         const cleanup = deletionSnapshot?.backend_boot_id === request.context.backend_boot_id &&
           deletionSnapshot.retention.deletion.status !== "Complete" ? deletionSnapshot : undefined;
-        const recordSnapshot = cleanup && !background && !recordsChanged(view.recordSnapshot, cleanup)
+        const recordSnapshot = cleanup && !recordsChanged(view.recordSnapshot, cleanup)
           ? view.recordSnapshot : cleanup;
         if (view.connected) resetProtectedScope();
         update({ connected: false, snapshot: undefined, recordSnapshot, health: diagnostics, loading: false,
           failedRead: status.kind === "api-error" ? status : unavailable(),
+          ...(cleanup && background && { recordPoll: (view.recordPoll ?? 0) + 1 }),
           ...(view.connected && { authority: (view.authority ?? 0) + 1 }) });
         return;
       }
       const refreshRecords = !recordsMode || (next && (
-        background || view.recordSnapshot?.event_seq !== next.event_seq || recordsChanged(view.recordSnapshot, next)
+        view.recordSnapshot?.event_seq !== next.event_seq || recordsChanged(view.recordSnapshot, next)
       ));
       update({
         snapshot: ordered ? view.snapshot : next ?? view.snapshot,
@@ -210,6 +212,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
         failedRead: next || view.workspace?.eventsLive ? undefined : status.kind === "ok" ? unavailable() : status,
         health: diagnostics,
         ...(recordsMode && { connected: true }),
+        ...(recordsMode && background && { recordPoll: (view.recordPoll ?? 0) + 1 }),
         loading: false,
         ...(next && !ordered && { recovering: false, reconnectingSessionId: undefined }),
       });
@@ -510,6 +513,7 @@ function recordsChanged(before: Snapshot | undefined, after: Snapshot) {
     before.retention.deletion.status !== after.retention.deletion.status ||
     before.retention.deletion.remaining_objects !== after.retention.deletion.remaining_objects ||
     before.retention.deletion.remaining_files !== after.retention.deletion.remaining_files ||
+    before.operations.length !== after.operations.length ||
     after.operations.some((operation) => operation.persistence === "Committed" && !before.operations.some((previous) =>
       previous.action_id === operation.action_id && previous.request_id === operation.request_id && previous.persistence === "Committed"));
 }
