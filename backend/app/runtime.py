@@ -124,8 +124,11 @@ class RecordsRuntime:
         profile = self.realtime.profile if self.realtime else None
         return dict(profile.frontend) if profile else None
 
+    def client_time(self) -> float:
+        return self.storage.monotonic() if self.realtime and self.realtime.profile else monotonic()
+
     def expire_clients(self) -> None:
-        now = self.storage.monotonic()
+        now = self.client_time()
         for client, touched in list(self._clients.items()):
             connected = self.realtime and self.realtime.client_has_events(client)
             if now - touched >= CLIENT_IDLE_SECONDS and not connected:
@@ -135,7 +138,7 @@ class RecordsRuntime:
 
     def bootstrap(self) -> dict[str, object] | None:
         self.expire_clients()
-        now = self.storage.monotonic()
+        now = self.client_time()
         if len(self._clients) >= MAX_CLIENTS:
             return None
         client = token_urlsafe(24)
@@ -147,7 +150,7 @@ class RecordsRuntime:
 
     def touch_client(self, client: str) -> bool:
         self.expire_clients()
-        now = self.storage.monotonic()
+        now = self.client_time()
         if client not in self._clients:
             return False
         self._clients[client] = now
