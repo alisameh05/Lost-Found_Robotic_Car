@@ -43,7 +43,8 @@ def connect(process: subprocess.Popen[str], port: int) -> dict:
                     time.sleep(0.05)
             except (httpx.ConnectError, httpx.ConnectTimeout):
                 time.sleep(0.1)
-    raise AssertionError("Backend process did not become healthy")
+    output = process.stdout.read() if process.poll() is not None and process.stdout else ""
+    raise AssertionError(f"Backend process did not become healthy. {output}")
 
 
 def raw_http(port: int, data: bytes) -> tuple[str, bytes]:

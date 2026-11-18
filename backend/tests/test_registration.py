@@ -10,7 +10,7 @@ from contextlib import closing
 from io import BytesIO
 from pathlib import Path
 from threading import Event
-from time import time_ns
+from time import monotonic, sleep, time_ns
 from uuid import uuid4
 
 import httpx
@@ -44,12 +44,19 @@ def context_headers(context: dict) -> dict[str, str]:
 
 def submit(
     client: httpx.Client, headers: dict[str, str], *, action: str | None = None, submitted: int | None = None,
-    name: str = "Desk plant", roi: str = ROI, image: bytes = PNG, filename: str = "reference.png",
+    name: str = "Desk plant", roi: str = ROI, image: bytes = PNG, filename: str = "reference.png", wait: bool = True,
 ) -> httpx.Response:
-    return client.post(OBJECTS, headers={
+    protected = {
         **headers, "X-Action-Created-At-Ms": str(now_ms() if submitted is None else submitted),
-    }, data={"name": name, "action_id": action or str(uuid4()), "roi": roi},
-        files={"reference_image": (filename, image, "application/octet-stream")})
+    }
+    fields = {"name": name, "action_id": action or str(uuid4()), "roi": roi}
+    files = {"reference_image": (filename, image, "application/octet-stream")}
+    deadline = monotonic() + 8
+    while True:
+        response = client.post(OBJECTS, headers=protected, data=fields, files=files)
+        if not wait or response.status_code != 202 or monotonic() >= deadline:
+            return response
+        sleep(0.02)
 
 
 def image_bytes(
@@ -117,8 +124,12 @@ def test_real_process_crash_reconciles_reference_and_receipt(tmp_path: Path, bou
     try:
         headers = context_headers(connect(process, port))
         with httpx.Client(base_url=f"http://127.0.0.1:{port}", trust_env=False, timeout=5) as http:
-            with pytest.raises(httpx.TransportError):
-                submit(http, headers, action=action, submitted=anchor, image=image, roi=roi)
+            try:
+                admitted = submit(http, headers, action=action, submitted=anchor, image=image, roi=roi, wait=False)
+            except httpx.TransportError:
+                pass
+            else:
+                assert admitted.status_code == 202
         assert process.wait(timeout=10) == 84
     finally:
         if process.poll() is None:
@@ -167,10 +178,10 @@ def test_matching_concurrent_registration_tracks_one_write(tmp_path: Path) -> No
         wait_for_health(browser, headers)
         action, anchor = str(uuid4()), now_ms()
         with ThreadPoolExecutor(max_workers=1) as executor:
-            first = executor.submit(submit, browser, headers, action=action, submitted=anchor)
+            first = executor.submit(submit, browser, headers, action=action, submitted=anchor, wait=False)
             try:
                 assert entered.wait(3)
-                duplicate = submit(browser, headers, action=action, submitted=anchor, filename="renamed.bin")
+                duplicate = submit(browser, headers, action=action, submitted=anchor, filename="renamed.bin", wait=False)
                 assert duplicate.status_code == 202
                 assert first.result(timeout=3).json() == duplicate.json()
                 assert browser.get(OBJECTS, headers=headers).json()["items"] == []
@@ -181,11 +192,7 @@ def test_matching_concurrent_registration_tracks_one_write(tmp_path: Path) -> No
                 assert changed.status_code == 409 and changed.json()["code"] == "ACTION_ID_CONFLICT"
             finally:
                 release.set()
-        for _ in range(25):
-            receipt = submit(browser, headers, action=action, submitted=anchor)
-            if receipt.status_code == 201:
-                break
-            release.wait(0.01)
+        receipt = submit(browser, headers, action=action, submitted=anchor)
         assert receipt.status_code == 201, receipt.text
         assert len(browser.get(OBJECTS, headers=headers).json()["items"]) == 1
         assert browser.get("/api/v1/snapshot", headers=headers).json()["operations"] == [
@@ -267,7 +274,7 @@ def test_supported_variants_keep_format_and_normalized_edge_roi(
         wait_for_health(browser, headers)
         saved = submit(browser, headers, image=image_bytes(mode, kind, orientation=6, **options),
                        roi='{"x":2,"y":4,"width":1,"height":1}')
-        assert saved.status_code in (201, 202), saved.json()
+        assert saved.status_code == 201, saved.json()
         record = saved.json()["result"]["object"]
         media = record["reference_media"]
         assert [media["width"], media["height"]] == [3, 5]
@@ -290,8 +297,6 @@ def test_inclusive_image_and_text_size_bounds(tmp_path: Path) -> None:
         name = "Pixel boundary"
         roi = ROI + " " * (65_536 - len(action) - len(name) - len(ROI))
         saved = submit(browser, headers, action=action, submitted=anchor, image=source, name=name, roi=roi)
-        if saved.status_code == 202:
-            saved = submit(browser, headers, action=action, submitted=anchor, image=source, name=name, roi=roi)
         assert saved.status_code == 201, saved.text
         assert submit(browser, headers, name=name, roi=roi + " " * 2).status_code == 413
 
