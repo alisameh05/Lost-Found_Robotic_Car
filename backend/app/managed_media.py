@@ -13,8 +13,7 @@ from typing import BinaryIO
 
 from PIL import Image
 
-from .http import DOMAIN_ID, HttpError
-from .reference_image import PNG, inspect_png
+from .http import DOMAIN_ID
 
 GENERATED_ID = r"[0-9a-f]{32}"
 STAGING_NAME = re.compile(rf"({GENERATED_ID})\.part")
@@ -220,7 +219,8 @@ class ManagedMedia:
             entry.discard()
 
     def read(
-        self, relative: str, byte_length: int, checksum: str, *, metadata_only: bool = False,
+        self, relative: str, byte_length: int, checksum: str, *,
+        metadata_only: bool = False, byte_limit: int | None = 100_000_000,
     ) -> tuple[str, bytes | None]:
         try:
             with self.entry(relative) as entry, entry.open_read() as handle:
@@ -229,7 +229,7 @@ class ManagedMedia:
                         or info.st_nlink != 1 or info.st_size != byte_length):
                     return "Corrupt", None
                 # Registration re-encoding may exceed the upload limit, but cannot exceed this RGB bound.
-                if byte_length > 100_000_000:
+                if byte_limit is not None and byte_length > byte_limit:
                     return "Corrupt", None
                 if metadata_only:
                     digest = hashlib.sha256()
@@ -248,21 +248,18 @@ class ManagedMedia:
     def read_evidence(
         self, relative: str, byte_length: int, checksum: str, width: int, height: int,
     ) -> tuple[str, bytes | None]:
-        availability, data = self.read(relative, byte_length, checksum)
+        availability, data = self.read(relative, byte_length, checksum, byte_limit=None)
         if data is None:
             return availability, None
-        if not data.startswith(PNG):
-            return "Corrupt", None
         try:
-            checked, palette = inspect_png(data)
-            with Image.open(BytesIO(checked), formats=["PNG"]) as image:
-                if image.size != (width, height) or image.getexif().get(274, 1) != 1:
+            with Image.open(BytesIO(data), formats=["PNG"]) as image:
+                if image.size != (width, height) or getattr(image, "is_animated", False):
                     return "Corrupt", None
+                image.verify()
+            with Image.open(BytesIO(data), formats=["PNG"]) as image:
                 image.load()
-                if palette:
-                    extrema = image.getextrema()
-                    if not extrema or not isinstance(extrema[1], int) or extrema[1] >= palette:
-                        return "Corrupt", None
-        except (OSError, ValueError, SyntaxError, struct.error, zlib.error, HttpError):
+                if image.getexif().get(274, 1) != 1:
+                    return "Corrupt", None
+        except (OSError, ValueError, RuntimeError, SyntaxError, struct.error, zlib.error, Image.DecompressionBombError):
             return "Corrupt", None
         return "Available", data

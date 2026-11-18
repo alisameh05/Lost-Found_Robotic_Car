@@ -239,7 +239,7 @@ test("finds and pages real registrations, opens protected references and uses Da
   await expect(page.getByText("No sessions for recent objects", { exact: true })).toBeVisible();
   await expect(page.getByText("Search unavailable", { exact: true })).toBeVisible();
   await recent.getByRole("link").first().click();
-  await expect(page.getByRole("region", { name: "Object record" }).getByRole("heading")).toHaveText("Straße%_  Café Ᲊ");
+  await expect(page.getByRole("region", { name: "Object record" }).getByRole("heading", { level: 2 })).toHaveText("Straße%_  Café Ᲊ");
   await page.getByRole("link", { name: "Back to Objects" }).click();
   await expect(objectRows(page)).toHaveCount(25);
   await expect(objectRows(page).first().getByRole("link")).toHaveAttribute("href", "/objects/a");

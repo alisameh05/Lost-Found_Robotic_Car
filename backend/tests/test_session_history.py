@@ -18,9 +18,11 @@ from backend.tests.test_object_library import NOW, seed_objects
 from backend.tests.test_records import BASE, credentials, wait_for_health
 
 
-def captured_png() -> bytes:
-    with Image.new("RGB", (80, 40), (20, 90, 160)) as image, BytesIO() as output:
-        image.putpixel((79, 39), (251, 37, 59))
+def captured_png(
+    size: tuple[int, int] = (80, 40), accent: tuple[int, int, int] = (251, 37, 59),
+) -> bytes:
+    with Image.new("RGB", size, (20, 90, 160)) as image, BytesIO() as output:
+        image.putpixel((79, 39), accent)
         image.save(output, format="PNG")
         return output.getvalue()
 
@@ -33,7 +35,6 @@ def seed_history(root: Path, now: int) -> None:
             ("history-owner", "History test · Wallet", "Lost", now - 60_000),
             ("different-owner", "History test · Keys", "Lost", now - 55_000),
         ], {"history-owner": output.getvalue()})
-    frame = captured_png()
     with closing(sqlite3.connect(root / "records.sqlite3")) as db, db:
         db.execute("PRAGMA foreign_keys = ON")
         sessions = [
@@ -48,27 +49,29 @@ def seed_history(root: Path, now: int) -> None:
             (now - 29_000,),
         )
         cases = [
-            ("match-Z", "session-a", now - 49_000, "Rejected", now - 48_000),
-            ("match-a", "session-a", now - 49_000, "NotReviewed", None),
-            ("match-confirmed", "session-confirmed", now - 30_000, "Confirmed", now - 29_000),
+            ("match-Z", "session-a", now - 49_000, "Rejected", now - 48_000, (30, 51, 94), (5, 4, 20, 12)),
+            ("match-a", "session-a", now - 49_000, "NotReviewed", None, (80, 35, 100), (50, 20, 20, 12)),
+            ("match-confirmed", "session-confirmed", now - 30_000, "Confirmed", now - 29_000, (251, 37, 59), (10, 8, 30, 16)),
         ]
-        for match_id, session, captured, disposition, reviewed in cases:
-            insert_match(db, root, match_id, session, "history-owner", captured, disposition, reviewed, frame)
+        for match_id, session, captured, disposition, reviewed, accent, box in cases:
+            insert_match(db, root, match_id, session, "history-owner", captured, disposition, reviewed,
+                         captured_png(accent=accent), box=box)
 
 
 def insert_match(
     db: sqlite3.Connection, root: Path, match: str, session: str, owner: str,
-    captured: int, disposition: str, reviewed: int | None, frame: bytes,
+    captured: int, disposition: str, reviewed: int | None, frame: bytes, *,
+    size: tuple[int, int] = (80, 40), box: tuple[int, int, int, int] = (10, 8, 30, 16),
 ) -> None:
     media = f"evidence-{match}"
     relative = f"media/{media}.png"
     db.execute(
-        """INSERT INTO match_events VALUES (?, ?, ?, ?, ?, ?, 10, 8, 30, 16, ?, ?, ?, 80, 40)""",
-        (match, session, owner, captured, f"frame-{match}", "epoch-capture", disposition, reviewed, media),
+        """INSERT INTO match_events VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?, ?)""",
+        (match, session, owner, captured, f"frame-{match}", "epoch-capture", *box, disposition, reviewed, media, *size),
     )
     db.execute(
-        """INSERT INTO media VALUES (?, ?, ?, 'Evidence', ?, 'image/png', 80, 40, ?, ?, ?, 'Ready')""",
-        (media, owner, match, relative, len(frame), hashlib.sha256(frame).hexdigest(), captured),
+        """INSERT INTO media VALUES (?, ?, ?, 'Evidence', ?, 'image/png', ?, ?, ?, ?, ?, 'Ready')""",
+        (media, owner, match, relative, *size, len(frame), hashlib.sha256(frame).hexdigest(), captured),
     )
     (root / relative).write_bytes(frame)
 
@@ -154,6 +157,11 @@ def test_exact_evidence_unavailability_does_not_rewrite_a_committed_review(tmp_p
         assert response.status_code == 200 and response.content == captured_png()
         assert response.headers["content-type"] == "image/png" and response.headers["cache-control"] == "no-store"
         assert response.headers["x-content-type-options"] == "nosniff" and response.headers["accept-ranges"] == "none"
+        rejected = browser.get("/api/v1/sessions/session-a/matches", headers=headers).json()["items"][1]
+        assert rejected["frame_id"] == "frame-match-Z" and rejected["box"] == {"x": 5, "y": 4, "width": 20, "height": 12}
+        other_frame = browser.get(f"/api/v1/media/{rejected['evidence_media']['id']}", headers=headers)
+        assert other_frame.status_code == 200 and other_frame.content == captured_png(accent=(30, 51, 94))
+        assert other_frame.content != response.content
         saved = tmp_path / "media" / "evidence-match-confirmed.png"
         saved.unlink()
         for availability in ("Missing", "Corrupt"):
@@ -167,6 +175,21 @@ def test_exact_evidence_unavailability_does_not_rewrite_a_committed_review(tmp_p
                 frame = captured_png()
                 saved.write_bytes(frame[:-1] + bytes([frame[-1] ^ 1]))
         assert browser.get("/api/v1/media/unknown", headers=headers).status_code == 404
+
+
+def test_evidence_can_exceed_the_reference_upload_dimensions(tmp_path: Path) -> None:
+    size = (5120, 4096)
+    with TestClient(create_app(Config(tmp_path), storage=RecordsStorage(tmp_path, clock=lambda: NOW)), base_url=BASE) as browser:
+        wait_for_health(browser, headers := credentials(browser))
+        seed_history(tmp_path, NOW)
+        frame = captured_png(size)
+        with closing(sqlite3.connect(tmp_path / "records.sqlite3")) as db, db:
+            db.execute("PRAGMA foreign_keys = ON")
+            insert_match(db, tmp_path, "large", "session-other", "different-owner", NOW - 30_500,
+                         "NotReviewed", None, frame, size=size)
+        saved = browser.get("/api/v1/sessions/session-other/matches", headers=headers).json()["items"][0]["evidence_media"]
+        assert (saved["width"], saved["height"], saved["availability"]) == (*size, "Available")
+        assert browser.get("/api/v1/media/evidence-large", headers=headers).content == frame
 
 
 @pytest.mark.parametrize("paused", [True, False])
@@ -234,6 +257,8 @@ def test_history_schema_rejects_cross_owner_associations_and_rewritten_facts(tmp
             ("INSERT INTO sessions VALUES ('restart', 'history-owner', 'Controller', 'Searching', ?, NULL, NULL, '[]', 1)",
              (NOW - 29_000,)),
             ("UPDATE sessions SET end_reason = 'Confirmed' WHERE id = 'session-a'", ()),
+            ("INSERT INTO sessions VALUES ('later', 'history-owner', 'Controller', 'Ended', ?, ?, 'Confirmed', '[]', 1)",
+             (NOW - 30_000, NOW - 28_000)),
             ("UPDATE match_events SET disposition = 'Confirmed' WHERE id = 'match-Z'", ()),
             ("UPDATE match_events SET box_x = 0 WHERE id = 'match-Z'", ()),
             ("UPDATE media SET checksum = ? WHERE id = 'evidence-match-a'", ("a" * 64,)),
@@ -245,6 +270,9 @@ def test_history_schema_rejects_cross_owner_associations_and_rewritten_facts(tmp
         with pytest.raises(sqlite3.IntegrityError, match="match is outside its session"), db:
             insert_match(db, tmp_path, "too-late", "session-a", "history-owner", NOW - 49_000,
                          "Rejected", NOW - 42_999, captured_png())
+        with pytest.raises(sqlite3.IntegrityError, match="UNIQUE"), db:
+            insert_match(db, tmp_path, "another-confirmation", "session-confirmed", "history-owner", NOW - 30_000,
+                         "Confirmed", NOW - 29_000, captured_png())
         with pytest.raises(sqlite3.IntegrityError, match="FOREIGN KEY"), db:
             db.execute(
                 "INSERT INTO match_events VALUES ('owned', 'session-a', 'history-owner', ?, "
