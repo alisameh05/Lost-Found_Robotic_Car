@@ -15,12 +15,12 @@ ORIGIN = {"Origin": "http://127.0.0.1:3000"}
 BASE = "http://127.0.0.1:8000"
 
 
-def wait_for_health(browser: TestClient, headers: dict[str, str]) -> None:
+def wait_for_health(browser: TestClient, headers: dict[str, str], status: int = 200) -> None:
     deadline = monotonic() + 5
     while monotonic() < deadline:
         response = browser.get("/api/v1/health", headers=headers)
         if response.json().get("initialization") != "Starting":
-            assert response.status_code == 200, response.json()
+            assert response.status_code == status, response.json()
             return
         sleep(0.01)
     raise AssertionError("Records backend did not initialize")
@@ -240,10 +240,8 @@ def test_storage_fault_keeps_history_and_fails_closed(tmp_path: Path, fault: str
                                     "error_code": "STORAGE_UNAVAILABLE"}
         objects = browser.get("/api/v1/objects", headers=headers)
         assert objects.headers["cache-control"] == "no-store"
-        if fault in ("journal", "due expiry"):
-            assert objects.status_code == 200 and objects.json() == {"items": [], "next_cursor": None}
-        else:
-            assert objects.status_code == 503 and objects.json()["code"] == "STORAGE_UNAVAILABLE"
+        assert objects.status_code == 503 and objects.json()["code"] == "STORAGE_UNAVAILABLE"
+        assert "Existing belongings" not in objects.text
     with closing(sqlite3.connect(database)) as db:
         assert db.execute("SELECT retention_days FROM app_settings").fetchone() == (7,)
         if fault == "due expiry":

@@ -158,6 +158,7 @@ class RecordsStorage:
         self._clock_lock = Lock()
         self._wall_floor = 0
         self._repair_needed = False
+        self._startup_cleanup_pending = False
         self._anchor = (clock(), monotonic())
 
     def open_database(self, mode: str) -> sqlite3.Connection:
@@ -190,6 +191,10 @@ class RecordsStorage:
             db = self.open_database("rwc")
             try:
                 self.recover_database(db)
+                now, _ = self.now()
+                self._startup_cleanup_pending = self._inspect(db, now, ()).cleanup_pending
+                if self._startup_cleanup_pending:
+                    self.persist_clock(db, now)
             except BaseException:
                 db.close()
                 raise
@@ -390,7 +395,11 @@ class RecordsStorage:
 
     def check_read_storage(self, db: sqlite3.Connection, now: int, preparing: Collection[str]) -> Inspection:
         inspection = self._inspect(db, now, preparing)
-        if inspection.problem and (not inspection.cleanup_pending or inspection.recovery_pending):
+        # Finish startup recovery before opening records. During normal operation,
+        # cleanup failures hide their owners without taking unexpired reads offline.
+        if inspection.problem and (
+            self._startup_cleanup_pending or not inspection.cleanup_pending or inspection.recovery_pending
+        ):
             raise storage_unavailable(inspection.problem)
         return inspection
 

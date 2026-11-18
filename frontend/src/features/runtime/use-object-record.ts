@@ -1,9 +1,10 @@
 "use client";
 
-import { useEffect, useMemo } from "react";
+import { useCallback, useMemo } from "react";
 import type { ReadResult } from "@/lib/transport";
 import { useRuntime, useRuntimeView } from "./runtime-provider";
 import { useProtectedRead } from "./use-protected-read";
+import { useRecordDeadline } from "./use-record-deadline";
 
 export function recordAbsence(result?: ReadResult<unknown>): 404 | 410 | undefined {
   if (result?.kind === "api-error" && (result.status === 404 || result.status === 410)) return result.status;
@@ -23,31 +24,12 @@ export function useObjectRecord(id: string | undefined) {
   const expired = !canUseGrace && expiresAt !== undefined && now !== undefined && now >= expiresAt;
   const removed = Boolean(record && id && removedOwners?.has(id));
 
-  useEffect(() => {
-    if (expiresAt === undefined || !runtime || grace) return;
-    const currentRuntime = runtime;
-    const deadline = expiresAt;
-    const revalidate = () => {
-      // Refresh both the snapshot and its protected reads at an active owner's cutoff.
-      if (activeOwner) void currentRuntime.refresh();
-      else retry();
-    };
-    const check = () => { if ((currentRuntime.serverTime() ?? 0) >= deadline) revalidate(); };
-    // Retention can exceed the maximum browser timer interval. Recheck on wake as well.
-    const delay = Math.min(Math.max(0, deadline - (currentRuntime.serverTime() ?? deadline)), 2_147_483_647);
-    let timer = window.setTimeout(tick, delay);
-    function tick() {
-      const time = currentRuntime.serverTime();
-      if (time === undefined) return;
-      if (time >= deadline) revalidate();
-      else timer = window.setTimeout(tick, Math.min(deadline - time, 2_147_483_647));
-    }
-    window.addEventListener("focus", check);
-    return () => {
-      window.clearTimeout(timer);
-      window.removeEventListener("focus", check);
-    };
-  }, [activeOwner, expiresAt, grace, retry, runtime]);
+  const revalidate = useCallback(() => {
+    // An active owner needs a fresh snapshot at the cutoff to establish grace.
+    if (activeOwner) void runtime?.refresh();
+    else retry();
+  }, [activeOwner, retry, runtime]);
+  useRecordDeadline(runtime, grace ? Infinity : expiresAt ?? Infinity, revalidate);
 
   return { result, snapshotAtRead, retry, object: expired || removed ? undefined : record,
     absence: expired || removed ? 410 as const : recordAbsence(result) };

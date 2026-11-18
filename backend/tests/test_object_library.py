@@ -64,6 +64,17 @@ def test_continuation_rechecks_eligibility_and_excludes_the_binary_boundary(tmp_
         assert browser.get("/api/v1/media/due-reference", headers=headers).status_code == 410
         assert browser.get("/api/v1/objects/earlier", headers=headers).json() == page.json()["items"][0]
 
+    with TestClient(create_app(Config(tmp_path), storage=RecordsStorage(tmp_path, clock=lambda: now)), base_url=BASE) as browser:
+        headers = credentials(browser)
+        wait_for_health(browser, headers, status=503)
+        page = browser.get("/api/v1/objects", headers=headers)
+        assert page.status_code == 503 and page.json()["code"] == "STORAGE_UNAVAILABLE"
+        assert browser.get("/api/v1/objects/earlier", headers=headers).status_code == 503
+        assert browser.get("/api/v1/objects/due", headers=headers).status_code == 410
+        assert browser.get("/api/v1/snapshot", headers=headers).json()["snapshot"]["retention"]["deletion"] == {
+            "status": "Failed", "remaining_objects": 1, "remaining_files": 1, "error_code": "STORAGE_UNAVAILABLE",
+        }
+
 
 def test_search_uses_pinned_unicode_fold_and_literal_wildcards(tmp_path: Path) -> None:
     storage = RecordsStorage(tmp_path, clock=lambda: NOW)

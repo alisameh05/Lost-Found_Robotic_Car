@@ -1,4 +1,5 @@
 import asyncio
+import re
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
@@ -26,8 +27,15 @@ from .http import (
 )
 from .owner import own_data_root
 from .registration_input import NAME_LIMIT, normalize_name, parse_registration
-from .runtime import RecordsRuntime
+from .runtime import ObjectPageError, RecordsRuntime
 from .storage import RecordsStorage, storage_unavailable
+
+OBJECT_PAGE_ERRORS = {
+    "cursor_expired": (400, "CURSOR_EXPIRED", "Refresh the first page of objects.", False),
+    "scope_mismatch": (400, "CURSOR_INVALID", "Use the original page filters.", False),
+    "capacity": (503, "CAPACITY_REACHED", "Page capacity reached. Retry after pending reads complete.", True),
+    "client_expired": (403, "CLIENT_INVALID", "Reconnect to obtain a current page identity.", False),
+}
 
 
 def validate_objects_query(query: dict[str, str]) -> None:
@@ -45,6 +53,8 @@ def validate_objects_query(query: dict[str, str]) -> None:
         if not significant or len(significant) > 3 or int(significant) > 100:
             raise invalid_query("OUT_OF_RANGE", "/query/limit")
         query["limit"] = significant
+    if "cursor" in query and not re.fullmatch(r"[A-Za-z0-9_-]{43}", query["cursor"]):
+        raise HttpError(400, "CURSOR_INVALID", "Refresh the first page of objects.")
 
 
 def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStorage | None = None) -> FastAPI:
@@ -139,7 +149,11 @@ def create_app(config: Config, *, held_owner: bool = False, storage: RecordsStor
     async def objects(request: Request) -> JSONResponse:
         runtime: RecordsRuntime = request.app.state.runtime
         runtime.check_started()
-        return JSONResponse(await runtime.objects(request.headers["x-app-client-id"], request.state.objects_query))
+        try:
+            page = await runtime.objects(request.headers["x-app-client-id"], request.state.objects_query)
+        except ObjectPageError as error:
+            raise HttpError(*OBJECT_PAGE_ERRORS[error.reason]) from error
+        return JSONResponse(page)
 
     @app.post(API_PREFIX + "/objects")
     async def register(request: Request) -> Response:

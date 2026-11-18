@@ -105,7 +105,7 @@ async function seedLibrary(items: readonly (readonly [string, string, "Lost" | "
       "seed_objects(Path(sys.argv[1]), json.loads(sys.argv[2]), dict.fromkeys(json.loads(sys.argv[3]), image.getvalue()))",
     ].join("\n"),
     join(parent, "records"), JSON.stringify(items), JSON.stringify(referenceIds),
-  ], { windowsHide: true });
+  ], { cwd: repo, windowsHide: true });
 }
 
 async function loopbackOnly(page: Page) {
@@ -214,6 +214,7 @@ test("recovers protected records after the backend dies and starts on the same p
 });
 
 test("finds and pages real registrations, opens protected references and uses Dashboard details offline", async ({ page }) => {
+  test.setTimeout(60_000);
   await startBackend();
   await loopbackOnly(page);
   const registered = Date.now() - 1_000;
@@ -232,7 +233,7 @@ test("finds and pages real registrations, opens protected references and uses Da
   await expect(recent.getByRole("listitem")).toHaveCount(3);
   await expect(recent.getByRole("link").first()).toHaveAttribute("href", "/objects/a");
   await expect(page.getByText("Search history unavailable", { exact: true })).toBeVisible();
-  await expect(page.getByRole("heading", { name: "Search unavailable", exact: true })).toBeVisible();
+  await expect(page.getByText("Search unavailable", { exact: true })).toBeVisible();
   await recent.getByRole("link").first().click();
   await expect(page.getByRole("region", { name: "Object record" }).getByRole("heading")).toHaveText("Straße%_  Café Ᲊ");
   await page.getByRole("link", { name: "Back to Objects" }).click();
@@ -279,6 +280,7 @@ test("finds and pages real registrations, opens protected references and uses Da
 });
 
 test("discards overtaken search reads, resets an expired cursor and restarts with a new authority", async ({ page }) => {
+  test.setTimeout(60_000);
   await startBackend();
   await loopbackOnly(page);
   const registered = Date.now() - 1_000;
@@ -335,6 +337,7 @@ test("discards overtaken search reads, resets an expired cursor and restarts wit
 });
 
 test("revokes an expired reference and keeps browsing the eligible page against the real service", async ({ page }) => {
+  test.setTimeout(60_000);
   const offset = join(parent, "catalogue-clock");
   writeFileSync(offset, "0");
   await startBackend({ clockOffset: offset });

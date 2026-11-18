@@ -1,12 +1,12 @@
 import asyncio
 import json
-import re
 import sqlite3
 from collections import OrderedDict
 from collections.abc import Callable, Collection
 from dataclasses import dataclass, field, replace
 from secrets import token_urlsafe
 from time import monotonic
+from typing import Literal
 
 from .http import HttpError
 from .reference_image import Reference, prepare_reference
@@ -52,6 +52,12 @@ class Cursor:
     before: tuple[int, str]
     deadline: float
     readers: int = 0
+
+
+class ObjectPageError(Exception):
+    def __init__(self, reason: Literal["cursor_expired", "scope_mismatch", "capacity", "client_expired"]):
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -153,13 +159,11 @@ class RecordsRuntime:
         before = (SAFE_INTEGER + 1, "")
         cursor = None
         if token is not None:
-            if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
-                raise HttpError(400, "CURSOR_INVALID", "Refresh the first page of objects.")
             cursor = self._cursors.get(token)
             if cursor is None:
-                raise HttpError(400, "CURSOR_EXPIRED", "Refresh the first page of objects.")
+                raise ObjectPageError("cursor_expired")
             if cursor.scope != scope:
-                raise HttpError(400, "CURSOR_INVALID", "Use the original page filters.")
+                raise ObjectPageError("scope_mismatch")
             self._cursors.move_to_end(token)
             cursor.readers += 1
             before = cursor.before
@@ -180,7 +184,10 @@ class RecordsRuntime:
 
     def issue_cursor(self, scope: CursorScope, boundary: tuple[int, str]) -> str:
         now = monotonic()
+        self._expire_clients(now)
         self.prune_cursors(now)
+        if scope.client not in self._clients:
+            raise ObjectPageError("client_expired")
         owned = [token for token, cursor in self._cursors.items() if cursor.scope.client == scope.client]
         # Polling and going back to a still-current page preserve its existing token and deadline.
         for token in owned:
@@ -201,7 +208,7 @@ class RecordsRuntime:
             if not self._cursors[token].readers:
                 del self._cursors[token]
                 return
-        raise HttpError(503, "CAPACITY_REACHED", "Page capacity reached. Retry after pending reads complete.", True)
+        raise ObjectPageError("capacity")
 
     async def register(self, registration: Registration, authorize: Callable[[], None]) -> Receipt:
         try:
