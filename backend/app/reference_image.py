@@ -14,6 +14,8 @@ PNG = b"\x89PNG\r\n\x1a\n"
 JPEG = b"\xff\xd8"
 NEXT_JPEG_MARKER = re.compile(rb"\xff+(?![\xff\x00\xd0-\xd7])")
 ADAM7 = ((0, 0, 8, 8), (4, 0, 8, 8), (0, 4, 4, 8), (2, 0, 4, 4), (0, 2, 2, 4), (1, 0, 2, 2), (0, 1, 1, 2))
+PNG_CHANNELS = {0: 1, 2: 3, 3: 1, 4: 2, 6: 4}
+PNG_DEPTHS = {0: (1, 2, 4, 8, 16), 2: (8, 16), 3: (1, 2, 4, 8), 4: (8, 16), 6: (8, 16)}
 
 
 @dataclass(frozen=True)
@@ -104,14 +106,17 @@ def check_png_scanlines(
         offset = end
 
 
-def inspect_png(source: bytes) -> tuple[bytes, int]:
-    if len(source) < 33 or source[8:16] != b"\x00\x00\x00\x0dIHDR":
+def inspect_png(source: bytes, *, expected_size: tuple[int, int] | None = None) -> tuple[bytes, int]:
+    if len(source) < 33 or not source.startswith(PNG + b"\x00\x00\x00\x0dIHDR"):
         raise ValueError
     width, height, depth, color, compression, filtering, interlace = struct.unpack_from(">IIBBBBB", source, 16)
-    check_dimensions(width, height)
-    if (color == 3 and depth not in (1, 2, 4, 8)) or (color != 3 and (color not in (0, 2, 6) or depth != 8)):
-        raise invalid("/reference_image", "Use an 8-bit grayscale, RGB, RGBA, or supported indexed PNG.")
-    if compression or filtering or interlace > 1:
+    if expected_size is None:
+        check_dimensions(width, height)
+        if (color == 3 and depth not in (1, 2, 4, 8)) or (color != 3 and (color not in (0, 2, 6) or depth != 8)):
+            raise invalid("/reference_image", "Use an 8-bit grayscale, RGB, RGBA, or supported indexed PNG.")
+    elif (width, height) != expected_size:
+        raise ValueError
+    if depth not in PNG_DEPTHS.get(color, ()) or compression or filtering or interlace > 1:
         raise ValueError
     palette = 0
     transparency = exif = saw_data = passed_data = False
@@ -136,7 +141,7 @@ def inspect_png(source: bytes) -> tuple[bytes, int]:
                 break
             exif = True
         elif tag == b"PLTE":
-            if palette or transparency or saw_data or color == 0 or not 0 < length <= 768 or length % 3:
+            if palette or transparency or saw_data or color in (0, 4) or not 0 < length <= 768 or length % 3:
                 break
             palette = length // 3
             if color == 3 and palette > 2**depth:
@@ -155,7 +160,7 @@ def inspect_png(source: bytes) -> tuple[bytes, int]:
         elif tag == b"IEND":
             if length or end + 4 != len(source) or not image_data:
                 break
-            check_png_scanlines(image_data, width, height, {2: 3, 6: 4}.get(color, 1) * depth, interlace)
+            check_png_scanlines(image_data, width, height, PNG_CHANNELS[color] * depth, interlace)
             kept.extend(source[offset:end + 4])
             return bytes(kept), palette if color == 3 else 0
         elif not re.fullmatch(rb"[a-z][A-Za-z]{3}", tag):

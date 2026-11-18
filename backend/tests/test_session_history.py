@@ -192,6 +192,28 @@ def test_evidence_can_exceed_the_reference_upload_dimensions(tmp_path: Path) -> 
         assert browser.get("/api/v1/media/evidence-large", headers=headers).content == frame
 
 
+def test_evidence_with_a_saved_digest_still_requires_a_complete_png(tmp_path: Path) -> None:
+    with TestClient(create_app(Config(tmp_path), storage=RecordsStorage(tmp_path, clock=lambda: NOW)), base_url=BASE) as browser:
+        wait_for_health(browser, headers := credentials(browser))
+        seed_history(tmp_path, NOW)
+        frame = captured_png()
+        with closing(sqlite3.connect(tmp_path / "records.sqlite3")) as db, db:
+            db.execute("PRAGMA foreign_keys = ON")
+            cases = {
+                "truncated": frame[:-4],
+                "bad-crc": frame[:-1] + bytes([frame[-1] ^ 1]),
+                "trailing": frame + b"trailing bytes",
+            }
+            for label, data in cases.items():
+                insert_match(db, tmp_path, label, "session-other", "different-owner", NOW - 30_500,
+                             "NotReviewed", None, data)
+        saved = browser.get("/api/v1/sessions/session-other/matches", headers=headers).json()["items"]
+        assert {item["id"]: item["evidence_media"]["availability"] for item in saved} == dict.fromkeys(cases, "Corrupt")
+        for label in cases:
+            response = browser.get(f"/api/v1/media/evidence-{label}", headers=headers)
+            assert response.status_code == 503 and response.json()["code"] == "MEDIA_UNAVAILABLE"
+
+
 @pytest.mark.parametrize("paused", [True, False])
 def test_startup_reconciles_unfinished_sessions_and_preparation(tmp_path: Path, paused: bool) -> None:
     config = Config(tmp_path)
