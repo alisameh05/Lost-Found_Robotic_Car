@@ -1,4 +1,4 @@
-// Generated from backend/contracts/v1 (SHA-256 2db4bca37008c6c05b0ec8b0ca8e2227669354649bbcc20e0e1608feb6bd0b7f). Do not edit.
+// Generated from backend/contracts/v1 (SHA-256 a68ac3ecb289dcba4ec56f1d5d75d40349c4b80c2f0696d4b0a6a58a47e8e83d). Do not edit.
 
 /**
  * This interface was referenced by `HttpResponses`'s JSON-Schema

@@ -836,7 +836,7 @@
             "Capability": []
           }
         ],
-        "x-laf-records-runtime": false
+        "x-laf-records-runtime": true
       }
     },
     "/sessions": {
@@ -991,7 +991,7 @@
             "Capability": []
           }
         ],
-        "x-laf-records-runtime": false
+        "x-laf-records-runtime": true
       }
     },
     "/sessions/{id}/matches": {
@@ -1089,7 +1089,7 @@
             "Capability": []
           }
         ],
-        "x-laf-records-runtime": false
+        "x-laf-records-runtime": true
       }
     },
     "/sessions/{id}/actions": {

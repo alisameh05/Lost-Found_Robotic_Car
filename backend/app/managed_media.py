@@ -2,13 +2,19 @@ import hashlib
 import os
 import re
 import stat
+import struct
+import zlib
 from collections.abc import Iterator
 from contextlib import ExitStack, contextmanager
 from dataclasses import dataclass
+from io import BytesIO
 from pathlib import Path
 from typing import BinaryIO
 
-from .http import DOMAIN_ID
+from PIL import Image
+
+from .http import DOMAIN_ID, HttpError
+from .reference_image import PNG, inspect_png
 
 GENERATED_ID = r"[0-9a-f]{32}"
 STAGING_NAME = re.compile(rf"({GENERATED_ID})\.part")
@@ -236,5 +242,27 @@ class ManagedMedia:
         except OSError:
             return "Corrupt", None
         if len(data) != byte_length or hashlib.sha256(data).hexdigest() != checksum:
+            return "Corrupt", None
+        return "Available", data
+
+    def read_evidence(
+        self, relative: str, byte_length: int, checksum: str, width: int, height: int,
+    ) -> tuple[str, bytes | None]:
+        availability, data = self.read(relative, byte_length, checksum)
+        if data is None:
+            return availability, None
+        if not data.startswith(PNG):
+            return "Corrupt", None
+        try:
+            checked, palette = inspect_png(data)
+            with Image.open(BytesIO(checked), formats=["PNG"]) as image:
+                if image.size != (width, height) or image.getexif().get(274, 1) != 1:
+                    return "Corrupt", None
+                image.load()
+                if palette:
+                    extrema = image.getextrema()
+                    if not extrema or not isinstance(extrema[1], int) or extrema[1] >= palette:
+                        return "Corrupt", None
+        except (OSError, ValueError, SyntaxError, struct.error, zlib.error, HttpError):
             return "Corrupt", None
         return "Available", data

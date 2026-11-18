@@ -45,7 +45,9 @@ Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Dashboard and Objects show 
 
 Each service reports an occupied port and exits. Only one backend owns a data root, even across different ports. Close the owner before changing its configuration. The OS releases the lock on process exit. Keep the database, its SQLite sidecars and the managed media together under the local root. SQLite uses WAL and synchronous FULL, enables foreign keys on every connection, and applies migration SQL and its receipt in one immediate transaction. Registration flushes the normalized reference into staging, journals the preparation, and promotes the file before committing the object, Ready media and receipt together. Restart rolls back interrupted preparations and preserves committed references.
 
-An incompatible database or unresolved storage operation leaves the data available for recovery and blocks new writes. Due expiry hides the owner and blocks new registration until cleanup is repaired. Failed cleanup counts show pending owners and files. Health stays available with the current capability. If a save response is interrupted, use Retry Same Request to recover the result. Retention edits, search history, events and search controls have later implementation slices.
+An incompatible database or unresolved storage operation leaves the data available for recovery and blocks new writes. Due expiry hides the owner and blocks new registration until cleanup is repaired. Failed cleanup counts show pending owners and files. Health stays available with the current capability. If a save response is interrupted, use Retry Same Request to recover the result.
+
+Object Details links to saved sessions and their captured matches. Startup ends unfinished sessions as Interrupted and keeps durable pending captures as Not reviewed. Missing or corrupt evidence leaves the saved outcome intact. Fresh installations have empty histories. Retention edits, events and search controls have later implementation slices.
 
 ## Verify
 

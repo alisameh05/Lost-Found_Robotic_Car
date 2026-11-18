@@ -8,7 +8,7 @@ from contextlib import closing, contextmanager
 from dataclasses import dataclass
 from pathlib import Path
 from threading import Lock
-from typing import TypedDict
+from typing import Literal, TypedDict
 from uuid import uuid4
 
 from .http import HttpError
@@ -33,6 +33,8 @@ OBJECT_ROWS = f"""
            {GRACE} AS grace, {DELETING} AS deleting
     FROM objects AS o JOIN media AS m ON m.id = o.reference_media_id
 """
+SESSION_FIELDS = ("id", "object_id", "control_mode", "state", "started_at_ms", "ended_at_ms", "end_reason", "revision")
+HistoryKind = Literal["sessions", "matches"]
 
 
 class Settings(TypedDict):
@@ -218,12 +220,25 @@ class RecordsStorage:
         sync_directory(self.files.root)
         try:
             self.recover_preparations(db)
+            self.recover_interrupted_sessions(db)
         except (OSError, sqlite3.Error) as exc:
             raise StorageRecoveryRequired(RECONCILE_ERROR) from exc
-        if db.execute("SELECT 1 FROM sessions WHERE state <> 'Ended' LIMIT 1").fetchone() or db.execute(
-            "SELECT 1 FROM match_events WHERE disposition = 'Pending' LIMIT 1"
-        ).fetchone():
-            raise StorageRecoveryRequired("Interrupted search records need recovery. Keep the data intact.")
+
+    def recover_interrupted_sessions(self, db: sqlite3.Connection) -> None:
+        now, _ = self.now()
+        with write_transaction(db):
+            # Pending rows already have an owned Ready media association. Keep that fact
+            # even when the underlying file is now unavailable.
+            db.execute("UPDATE match_events SET disposition = 'NotReviewed' WHERE disposition = 'Pending'")
+            db.execute("""
+                UPDATE sessions
+                SET state = 'Ended', end_reason = 'Interrupted', pause_causes = '[]', revision = revision + 1,
+                    ended_at_ms = MAX(?, started_at_ms, COALESCE((
+                        SELECT MAX(COALESCE(reviewed_at_ms, captured_at_ms))
+                        FROM match_events WHERE session_id = sessions.id
+                    ), 0))
+                WHERE state IN ('Searching', 'Paused')
+            """, (now,))
 
     def close(self) -> None:
         with self.writer:
@@ -377,6 +392,80 @@ class RecordsStorage:
             self.observe_clock(now)
         return items, (rows[limit - 1]["registered_at_ms"], rows[limit - 1]["id"]) if len(rows) > limit else None
 
+    @staticmethod
+    def session_payload(row: sqlite3.Row) -> dict[str, object]:
+        return {**{field: row[field] for field in SESSION_FIELDS}, "pause_causes": json.loads(row["pause_causes"])}
+
+    def match_payload(self, row: sqlite3.Row) -> dict[str, object]:
+        availability, _ = self.files.read_evidence(
+            row["relative_path"], row["byte_length"], row["checksum"], row["evidence_width"], row["evidence_height"],
+        )
+        return {
+            **{field: row[field] for field in (
+                "id", "session_id", "object_id", "captured_at_ms", "frame_id", "stream_epoch", "disposition",
+                "reviewed_at_ms",
+            )},
+            "box": {key: row[f"box_{key}"] for key in ("x", "y", "width", "height")},
+            "evidence_media": {
+                "id": row["evidence_media_id"], "role": "Evidence", "content_type": "image/png",
+                "width": row["evidence_width"], "height": row["evidence_height"], "byte_length": row["byte_length"],
+                "created_at_ms": row["created_at_ms"], "availability": availability,
+            },
+        }
+
+    def history_parent(
+        self, db: sqlite3.Connection, parent: str, kind: HistoryKind, now: int,
+    ) -> sqlite3.Row:
+        db.row_factory = sqlite3.Row
+        if kind == "sessions":
+            row = db.execute(f"""
+                SELECT o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting FROM objects AS o WHERE o.id = ?
+            """, (parent,)).fetchone()
+        else:
+            row = db.execute(f"""
+                SELECT s.*, o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting
+                FROM sessions AS s JOIN objects AS o ON o.id = s.object_id WHERE s.id = ?
+            """, (parent,)).fetchone()
+        return self.require_eligible(row, now, self.settings(db)["retention_days"])
+
+    def check_history_parent(self, parent: str, kind: HistoryKind) -> None:
+        with self.connect() as db, read_transaction(db):
+            self.history_parent(db, parent, kind, self.now()[0])
+
+    def read_session(self, session_id: str, preparing: Collection[str]) -> dict[str, object]:
+        with self.connect() as db, read_transaction(db):
+            now, _ = self.now()
+            session = self.history_parent(db, session_id, "matches", now)
+            self.check_read_storage(db, now, preparing)
+            return self.session_payload(session)
+
+    def read_history(
+        self, parent: str, kind: HistoryKind, limit: int, before: tuple[int, str], preparing: Collection[str],
+    ) -> tuple[list[dict[str, object]], tuple[int, str] | None]:
+        with self.connect() as db, read_transaction(db):
+            now, _ = self.now()
+            self.history_parent(db, parent, kind, now)
+            self.check_read_storage(db, now, preparing)
+            parameters = (parent, *before, limit + 1)
+            if kind == "sessions":
+                rows = db.execute("""
+                    SELECT * FROM sessions WHERE object_id = ?
+                    AND (started_at_ms, id COLLATE BINARY) < (?, ?)
+                    ORDER BY started_at_ms DESC, id COLLATE BINARY DESC LIMIT ?
+                """, parameters).fetchall()
+                time_field = "started_at_ms"
+                items = [self.session_payload(row) for row in rows[:limit]]
+            else:
+                rows = db.execute("""
+                    SELECT c.*, m.relative_path, m.byte_length, m.checksum, m.created_at_ms
+                    FROM match_events AS c JOIN media AS m ON m.id = c.evidence_media_id
+                    WHERE c.session_id = ? AND (c.captured_at_ms, c.id COLLATE BINARY) < (?, ?)
+                    ORDER BY c.captured_at_ms DESC, c.id COLLATE BINARY DESC LIMIT ?
+                """, parameters).fetchall()
+                time_field = "captured_at_ms"
+                items = [self.match_payload(row) for row in rows[:limit]]
+        return items, (rows[limit - 1][time_field], rows[limit - 1]["id"]) if len(rows) > limit else None
+
     def read_media(self, media_id: str, preparing: Collection[str]) -> tuple[str, bytes]:
         with self.connect() as db, read_transaction(db):
             db.row_factory = sqlite3.Row
@@ -388,7 +477,12 @@ class RecordsStorage:
                 WHERE m.id = ? AND m.lifecycle = 'Ready'
             """, (media_id,)).fetchone(), now, days)
             self.check_read_storage(db, now, preparing)
-            availability, data = self.files.read(row["relative_path"], row["byte_length"], row["checksum"])
+            if row["role"] == "Evidence":
+                availability, data = self.files.read_evidence(
+                    row["relative_path"], row["byte_length"], row["checksum"], row["width"], row["height"],
+                )
+            else:
+                availability, data = self.files.read(row["relative_path"], row["byte_length"], row["checksum"])
         if data is None:
             raise HttpError(503, "MEDIA_UNAVAILABLE", f"The managed image is {availability.lower()}.", True)
         return row["format"], data

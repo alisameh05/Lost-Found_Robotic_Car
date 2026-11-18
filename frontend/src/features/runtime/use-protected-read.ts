@@ -9,7 +9,8 @@ import { useApplicationRead, useRuntime, useRuntimeView } from "./runtime-provid
 export function useProtectedRead<Route extends ReadEndpoint>(route: Route, params: ReadParams<Route>, enabled = true) {
   const load = useCallback((runtime: RuntimeProjection, signal: AbortSignal) =>
     runtime.read(route, params, signal), [params, route]);
-  return useApplicationRead(load, enabled, true, route === "GET /objects" || route === "GET /objects/{id}");
+  const records = route === "GET /objects" || route.startsWith("GET /objects/") || route.startsWith("GET /sessions/");
+  return useApplicationRead(load, enabled, true, records);
 }
 
 type PageRoute = {
@@ -35,7 +36,7 @@ export function useCursorPage<Route extends PageRoute>(route: Route, scope: Read
   const cursor = cursors.at(-1);
   const load = useCallback((runtime: RuntimeProjection, signal: AbortSignal) =>
     runtime.read(route, { ...scope, query: { ...scope.query, cursor } }, signal), [route, scope, cursor]);
-  const { result, snapshotAtRead, retry } = useApplicationRead(load, enabled, true, route === "GET /objects");
+  const { result, snapshotAtRead, retry } = useApplicationRead(load, enabled, true, true);
   const restart = cursor !== undefined && isInvalidCursor(result) && result?.kind === "api-error"
     ? result.error.code === "CURSOR_EXPIRED" ? "CURSOR_EXPIRED" : "CURSOR_INVALID" : undefined;
 
