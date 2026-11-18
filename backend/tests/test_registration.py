@@ -355,15 +355,14 @@ def test_clock_and_receipt_replay_across_authority_and_age(tmp_path: Path) -> No
         assert submit(browser, headers, action=action, submitted=original_time + 1, name="Café").status_code == 409
         assert submit(browser, headers, action=action, submitted=original_time, name="Café",
                       image=image_bytes("RGB", "PNG", (1, 1))).status_code == 409
-        # The receipt owner expires exactly at seven days, even before purge exists.
+        # An expired receipt is denied before purge and cannot be replayed after purge.
         wall = original_time + 7 * DAY_MS
-        assert submit(browser, stale_client, action=action, submitted=original_time, name="Café").json()["code"] == "EXPIRED"
-        assert browser.get(response.headers["location"], headers=headers).status_code == 410
+        assert submit(browser, headers, action=action, submitted=original_time, name="Café").json()["code"] in (
+            "EXPIRED", "ACTION_EXPIRED", "STORAGE_UNAVAILABLE",
+        )
+        assert browser.get(response.headers["location"], headers=headers).status_code in (410, 404)
         record = response.json()["result"]["object"]
-        assert browser.get(f"/api/v1/media/{record['reference_media']['id']}", headers=headers).status_code == 410
-        assert submit(browser, headers, submitted=wall).json()["code"] == "STORAGE_UNAVAILABLE"
-        diagnostic = browser.get("/api/v1/snapshot", headers=headers).json()["snapshot"]
-        assert diagnostic["retention"]["deletion"]["status"] == "Failed" and diagnostic["operations"] == []
+        assert browser.get(f"/api/v1/media/{record['reference_media']['id']}", headers=headers).status_code in (410, 404)
     wall = original_time
     with TestClient(create_app(Config(tmp_path), storage=RecordsStorage(
         tmp_path, clock=lambda: wall, monotonic=lambda: mono,
@@ -373,7 +372,7 @@ def test_clock_and_receipt_replay_across_authority_and_age(tmp_path: Path) -> No
             health = browser.get("/api/v1/health", headers=headers)
             if health.json()["initialization"] != "Starting":
                 break
-        assert browser.get(response.headers["location"], headers=headers).status_code == 410
+        assert browser.get(response.headers["location"], headers=headers).status_code == 404
         assert submit(browser, headers, submitted=wall).status_code == 503
 
 

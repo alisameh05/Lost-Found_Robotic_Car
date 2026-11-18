@@ -19,9 +19,11 @@ export function useRecordDeadline(runtime: RuntimeProjection | undefined, deadli
     }
     recheck();
     window.addEventListener("focus", recheck);
+    document.addEventListener("visibilitychange", recheck);
     return () => {
       clearTimeout(timer);
       window.removeEventListener("focus", recheck);
+      document.removeEventListener("visibilitychange", recheck);
     };
   }, [deadline, revalidate, runtime]);
 }

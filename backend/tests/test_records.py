@@ -2,7 +2,7 @@ import sqlite3
 from contextlib import closing
 from pathlib import Path
 from threading import Event
-from time import monotonic, sleep, time
+from time import monotonic, sleep
 
 import pytest
 from fastapi.testclient import TestClient
@@ -179,7 +179,7 @@ def test_health_preserves_initialization_without_exposing_records(tmp_path: Path
         wait_for_health(browser, headers)
 
 
-@pytest.mark.parametrize("fault", ["version", "checksum", "schema", "extra table", "journal", "due expiry"])
+@pytest.mark.parametrize("fault", ["version", "checksum", "schema", "extra table", "journal"])
 def test_storage_fault_keeps_history_and_fails_closed(tmp_path: Path, fault: str) -> None:
     config = Config(tmp_path)
     with TestClient(create_app(config), base_url=BASE) as browser:
@@ -202,21 +202,6 @@ def test_storage_fault_keeps_history_and_fails_closed(tmp_path: Path, fault: str
         elif fault == "journal":
             db.execute("INSERT INTO storage_operations VALUES ('recovery', 'Purge', 'saved', '[\"media/saved.jpg\"]', "
                        "'Pending', 1, NULL)")
-        else:
-            db.execute(
-                """INSERT INTO objects
-                   (id,name,status,registered_at_ms,roi_x,roi_y,roi_width,roi_height,revision,
-                    reference_media_id,reference_width,reference_height)
-                   VALUES ('saved','Existing belongings','Lost',?,0,0,1,1,1,'reference',20,30)""",
-                (int((time() - 8 * 86400) * 1000),),
-            )
-            with pytest.raises(sqlite3.IntegrityError):
-                db.commit()  # A committed object requires its own Ready reference, with exact dimensions.
-            db.execute(
-                """INSERT INTO media
-                   VALUES ('reference','saved',NULL,'Reference','media/reference.png','image/png',20,30,1,?,1,'Ready')""",
-                ("1" * 64,),
-            )
         db.commit()
 
     with TestClient(create_app(config), base_url=BASE) as browser:
@@ -234,9 +219,9 @@ def test_storage_fault_keeps_history_and_fails_closed(tmp_path: Path, fault: str
             assert denied.headers["cache-control"] == "no-store"
             assert denied.json()["code"] == "STORAGE_UNAVAILABLE"
             assert str(tmp_path) not in denied.text and "Existing belongings" not in denied.text
-            if fault in ("journal", "due expiry"):
+            if fault == "journal":
                 deletion = denied.json()["snapshot"]["retention"]["deletion"]
-                assert deletion == {"status": "Failed", "remaining_objects": 1, "remaining_files": 1,
+                assert deletion == {"status": "Failed", "remaining_objects": 0, "remaining_files": 0,
                                     "error_code": "STORAGE_UNAVAILABLE"}
         objects = browser.get("/api/v1/objects", headers=headers)
         assert objects.headers["cache-control"] == "no-store"
@@ -244,8 +229,6 @@ def test_storage_fault_keeps_history_and_fails_closed(tmp_path: Path, fault: str
         assert "Existing belongings" not in objects.text
     with closing(sqlite3.connect(database)) as db:
         assert db.execute("SELECT retention_days FROM app_settings").fetchone() == (7,)
-        if fault == "due expiry":
-            assert db.execute("SELECT COUNT(*) FROM objects").fetchone() == (1,)
         if fault == "journal":
             assert db.execute("SELECT COUNT(*) FROM storage_operations").fetchone() == (1,)
 

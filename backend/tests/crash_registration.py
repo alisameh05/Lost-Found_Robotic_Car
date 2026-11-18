@@ -26,7 +26,18 @@ def crash_at_checkpoint(name: str) -> None:
 def test_app(config: Config, *, held_owner: bool = False):
     if sys.argv[1] == "clock":
         source = Path(sys.argv[2])
-        storage = RecordsStorage(config.data_root, clock=lambda: utc_ms() + int(source.read_text()))
+        offset = int(source.read_text())
+
+        def clock() -> int:
+            nonlocal offset
+            try:
+                offset = int(source.read_text())
+            except ValueError:
+                # The harness can sample while the browser is rewriting the file.
+                pass
+            return utc_ms() + offset
+
+        storage = RecordsStorage(config.data_root, clock=clock)
     else:
         storage = RecordsStorage(config.data_root, checkpoint=crash_at_checkpoint)
     return create_app(config, held_owner=held_owner, storage=storage)

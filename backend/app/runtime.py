@@ -96,6 +96,8 @@ class RecordsRuntime:
     _terminal: OrderedDict[str, Operation] = field(default_factory=OrderedDict, repr=False)
     _cursors: OrderedDict[str, Cursor] = field(default_factory=OrderedDict, repr=False)
     _stopping: bool = False
+    _stop_retention: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
+    _retention_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _queued_reference_bytes: int = 0
 
     def _expire_clients(self, now: float) -> None:
@@ -134,6 +136,17 @@ class RecordsRuntime:
             self._startup_fault = Inspection(problem="Records storage could not initialize. Check local storage and restart.")
         finally:
             self._starting = False
+        if self._startup_fault is None:
+            self._retention_task = asyncio.create_task(self.maintain_retention())
+
+    async def maintain_retention(self) -> None:
+        while not self._stop_retention.is_set():
+            delay = await asyncio.to_thread(self.storage.service_retention)
+            await self.prune_terminal()
+            try:
+                await asyncio.wait_for(self._stop_retention.wait(), delay)
+            except TimeoutError:
+                pass
 
     async def inspect(self) -> Inspection | None:
         if self._starting:
@@ -299,19 +312,30 @@ class RecordsRuntime:
             self._terminal.popitem(last=False)
         return receipt
 
-    async def operations(self) -> list[dict[str, object]]:
-        for key, operation in tuple(self._terminal.items()):
-            if operation.owner and not await asyncio.to_thread(self.storage.retain_terminal, operation.owner):
-                if self._terminal.get(key) is operation:
+    async def prune_terminal(self) -> None:
+        records = {key: operation for key, operation in self._terminal.items() if operation.owner is not None}
+        if records:
+            try:
+                eligible = await asyncio.to_thread(self.storage.eligible_owners, {op.owner for op in records.values()})
+            except (OSError, sqlite3.Error):
+                eligible = set()
+            for key, operation in records.items():
+                if operation.owner not in eligible and self._terminal.get(key) is operation:
                     del self._terminal[key]
+
+    async def operations(self) -> list[dict[str, object]]:
+        await self.prune_terminal()
         return [operation.payload() for operation, _ in self._pending.values()] + [
             operation.payload() for operation in self._terminal.values()
         ]
 
     async def stop(self) -> None:
         self._stopping = True
+        self._stop_retention.set()
         async with self._admission:
             await asyncio.gather(*(task for _, task in self._pending.values()), return_exceptions=True)
+        if self._retention_task is not None:
+            await self._retention_task
 
     def readiness(self, storage: Inspection | None) -> dict[str, object]:
         status = "Initializing" if storage is None else "Unavailable" if storage.problem else "Ready"
@@ -342,10 +366,10 @@ class RecordsRuntime:
 
     async def snapshot(self, storage: Inspection) -> dict[str, object]:
         deletion = {
-            "status": "Failed" if storage.cleanup_pending else "Complete",
+            "status": storage.deletion_status,
             "remaining_objects": storage.remaining_objects,
             "remaining_files": storage.remaining_files,
-            "error_code": "STORAGE_UNAVAILABLE" if storage.cleanup_pending else None,
+            "error_code": "STORAGE_UNAVAILABLE" if storage.deletion_status == "Failed" else None,
         }
         return {
             "protocol_version": 1, "backend_boot_id": self.boot_id, "event_seq": 1,

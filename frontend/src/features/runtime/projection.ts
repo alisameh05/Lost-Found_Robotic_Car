@@ -192,8 +192,9 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
         const deletionSnapshot = status.kind === "api-error" && status.error.code === "STORAGE_UNAVAILABLE"
           ? status.error.snapshot : undefined;
         const cleanup = deletionSnapshot?.backend_boot_id === request.context.backend_boot_id &&
-          deletionSnapshot.retention.deletion.status === "Failed" ? deletionSnapshot : undefined;
-        const recordSnapshot = cleanup && !recordsChanged(view.recordSnapshot, cleanup) ? view.recordSnapshot : cleanup;
+          deletionSnapshot.retention.deletion.status !== "Complete" ? deletionSnapshot : undefined;
+        const recordSnapshot = cleanup && !background && !recordsChanged(view.recordSnapshot, cleanup)
+          ? view.recordSnapshot : cleanup;
         if (view.connected) resetProtectedScope();
         update({ connected: false, snapshot: undefined, recordSnapshot, health: diagnostics, loading: false,
           failedRead: status.kind === "api-error" ? status : unavailable(),
@@ -201,7 +202,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
         return;
       }
       const refreshRecords = !recordsMode || (next && (
-        view.recordSnapshot?.event_seq !== next.event_seq || recordsChanged(view.recordSnapshot, next)
+        background || view.recordSnapshot?.event_seq !== next.event_seq || recordsChanged(view.recordSnapshot, next)
       ));
       update({
         snapshot: ordered ? view.snapshot : next ?? view.snapshot,
@@ -508,6 +509,7 @@ function recordsChanged(before: Snapshot | undefined, after: Snapshot) {
     before.retention.settings.revision !== after.retention.settings.revision ||
     before.retention.deletion.status !== after.retention.deletion.status ||
     before.retention.deletion.remaining_objects !== after.retention.deletion.remaining_objects ||
+    before.retention.deletion.remaining_files !== after.retention.deletion.remaining_files ||
     after.operations.some((operation) => operation.persistence === "Committed" && !before.operations.some((previous) =>
       previous.action_id === operation.action_id && previous.request_id === operation.request_id && previous.persistence === "Committed"));
 }

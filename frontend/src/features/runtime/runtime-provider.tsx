@@ -68,20 +68,40 @@ export function RuntimeProvider({ openTransport, harnessEnabled = false, records
       if (recordsMode && document.visibilityState === "hidden") runtime.suspendRecords();
       else wake();
     };
+    const suspend = () => runtime.suspendRecords();
     const restore = (event: PageTransitionEvent) => { if (event.persisted) wake(); };
+    let lastPoll = Date.now();
+    let lastTick = performance.now();
     const poll = recordsMode ? setInterval(() => {
-      if (document.visibilityState === "visible") void runtime.refresh({ background: true });
+      const wall = Date.now();
+      const tick = performance.now();
+      const clockChanged = Math.abs((wall - lastPoll) - (tick - lastTick)) > 2_000;
+      const resumed = tick - lastTick > 8_000;
+      lastPoll = wall;
+      lastTick = tick;
+      if (document.visibilityState === "visible") {
+        if (clockChanged || resumed) wake();
+        else void runtime.refresh({ background: true });
+      }
     }, 4_000) : undefined;
     window.addEventListener("focus", wake);
     window.addEventListener("online", wake);
     document.addEventListener("visibilitychange", visibility);
-    if (recordsMode) window.addEventListener("pageshow", restore);
+    if (recordsMode) {
+      window.addEventListener("pageshow", restore);
+      window.addEventListener("pagehide", suspend);
+      document.addEventListener("freeze", suspend);
+      document.addEventListener("resume", wake);
+    }
     return () => {
       clearInterval(poll);
       window.removeEventListener("focus", wake);
       window.removeEventListener("online", wake);
       document.removeEventListener("visibilitychange", visibility);
       window.removeEventListener("pageshow", restore);
+      window.removeEventListener("pagehide", suspend);
+      document.removeEventListener("freeze", suspend);
+      document.removeEventListener("resume", wake);
     };
   }, [recordsMode, runtime]);
   useEffect(() => {
@@ -143,7 +163,8 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
   const refresh = useRefreshRuntime();
   const { authority, recordSnapshot: snapshot, connected, failedRead, loading, removedOwners } = useRuntimeView();
   const cleanupDiagnostic = allowCleanupRead && failedRead?.kind === "api-error" &&
-    failedRead.error.snapshot?.retention.deletion.status === "Failed";
+    failedRead.error.snapshot !== null && failedRead.error.snapshot !== undefined &&
+    failedRead.error.snapshot.retention.deletion.status !== "Complete";
   const ready = (connected || cleanupDiagnostic) && (!waitForRuntime || snapshot !== undefined || !loading);
   const [attempt, setAttempt] = useState(0);
   const [read, setRead] = useState<{
@@ -164,7 +185,9 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
     const lifetime = new AbortController();
     function publish(result: ReadResult<T>) {
       const eligible = eligibleRead(result, removedOwners);
-      if (!lifetime.signal.aborted && eligible) {
+      const currentView = currentRuntime.getView();
+      if (!lifetime.signal.aborted && eligible &&
+          currentView.authority === authority && currentView.removedOwners === removedOwners) {
         setRead({ runtime: currentRuntime, load, attempt, result: eligible, snapshot, authority, removedOwners });
       }
     }
