@@ -1,16 +1,16 @@
 import asyncio
 import json
-import re
 import sqlite3
 from collections import OrderedDict
-from collections.abc import Callable
+from collections.abc import Callable, Collection
 from dataclasses import dataclass, field, replace
 from secrets import token_urlsafe
 from time import monotonic
+from typing import Literal
 
 from .http import HttpError
 from .reference_image import Reference, prepare_reference
-from .registration_input import SAFE_INTEGER, Registration, canonical_json, normalize_name
+from .registration_input import SAFE_INTEGER, Registration, canonical_json
 from .storage import (
     IncompatibleStorage,
     Inspection,
@@ -19,9 +19,13 @@ from .storage import (
     StorageRecoveryRequired,
     storage_unavailable,
 )
+from .unicode_search import casefold
 
 CLIENT_IDLE_SECONDS = 30 * 60
+CURSOR_LIFETIME_SECONDS = 30 * 60
 MAX_CLIENTS = 64
+MAX_CLIENT_CURSORS = 32
+MAX_CURSORS = 1024
 MAX_ORDINARY_PENDING = 62
 MAX_TERMINAL = 64
 MAX_QUEUED_REFERENCE_BYTES = 128 * 1024**2
@@ -29,14 +33,31 @@ DEFERRED_COMPONENTS = (
     "Command", "RobotVideo", "DisplayedRobotVideo", "Webcam", "Controller", "AI", "Workspace", "QualificationProfile",
 )
 
-ObjectQuery = tuple[str, str, str, int]  # client, normalized name, status, limit
-
-
 @dataclass(frozen=True)
+class CursorScope:
+    boot_id: str
+    client: str
+    name: str
+    status: str
+    limit: int
+    # This registry only accepts v1 object pages without a parent.
+    route: str = "/api/v1/objects"
+    parent: str | None = None
+    order: str = "registered_at_ms DESC, id COLLATE BINARY DESC"
+
+
+@dataclass
 class Cursor:
-    query: ObjectQuery
+    scope: CursorScope
     before: tuple[int, str]
     deadline: float
+    readers: int = 0
+
+
+class ObjectPageError(Exception):
+    def __init__(self, reason: Literal["cursor_expired", "scope_mismatch", "capacity", "client_expired"]):
+        super().__init__(reason)
+        self.reason = reason
 
 
 @dataclass(frozen=True)
@@ -131,36 +152,63 @@ class RecordsRuntime:
         return tuple(self._pending)
 
     async def objects(self, client: str, query: dict[str, str]) -> dict[str, object]:
-        context: ObjectQuery = (client, normalize_name(query.get("name", "")).casefold(),
-                                query.get("status", ""), int(query.get("limit", "25")))
+        scope = CursorScope(self.boot_id, client, casefold(query["name"]), query.get("status", ""),
+                            int(query.get("limit", "25")))
         token = query.get("cursor")
-        now = monotonic()
-        for key, saved_cursor in tuple(self._cursors.items()):
-            if saved_cursor.deadline <= now:
-                del self._cursors[key]
+        self.prune_cursors(monotonic())
         before = (SAFE_INTEGER + 1, "")
+        cursor = None
         if token is not None:
-            if not re.fullmatch(r"[A-Za-z0-9_-]{43}", token):
-                raise HttpError(400, "CURSOR_INVALID", "Refresh the first page of objects.")
             cursor = self._cursors.get(token)
             if cursor is None:
-                raise HttpError(400, "CURSOR_EXPIRED", "Refresh the first page of objects.")
-            if cursor.query != context:
-                raise HttpError(400, "CURSOR_INVALID", "Use the original page filters.")
+                raise ObjectPageError("cursor_expired")
+            if cursor.scope != scope:
+                raise ObjectPageError("scope_mismatch")
             self._cursors.move_to_end(token)
+            cursor.readers += 1
             before = cursor.before
-        _, name, status, limit = context
-        items, boundary = await asyncio.to_thread(self.storage.read_objects, name, status, limit, before, self.preparing())
-        next_cursor = None
-        if boundary:
-            owned = [key for key, cursor in self._cursors.items() if cursor.query[0] == client]
-            if len(owned) >= 32:
-                del self._cursors[owned[0]]
-            if len(self._cursors) >= 1024:
-                self._cursors.popitem(last=False)
-            next_cursor = token_urlsafe(32)
-            self._cursors[next_cursor] = Cursor(context, boundary, monotonic() + CLIENT_IDLE_SECONDS)
+        try:
+            items, boundary = await asyncio.to_thread(
+                self.storage.read_objects, scope.name, scope.status, scope.limit, before, self.preparing(),
+            )
+        finally:
+            if cursor is not None:
+                cursor.readers -= 1
+        next_cursor = self.issue_cursor(scope, boundary) if boundary else None
         return {"items": items, "next_cursor": next_cursor}
+
+    def prune_cursors(self, now: float) -> None:
+        for token, cursor in tuple(self._cursors.items()):
+            if cursor.deadline <= now or cursor.scope.client not in self._clients:
+                del self._cursors[token]
+
+    def issue_cursor(self, scope: CursorScope, boundary: tuple[int, str]) -> str:
+        now = monotonic()
+        self._expire_clients(now)
+        self.prune_cursors(now)
+        if scope.client not in self._clients:
+            raise ObjectPageError("client_expired")
+        owned = [token for token, cursor in self._cursors.items() if cursor.scope.client == scope.client]
+        # Polling and going back to a still-current page preserve its existing token and deadline.
+        for token in owned:
+            cursor = self._cursors[token]
+            if cursor.scope == scope and cursor.before == boundary:
+                self._cursors.move_to_end(token)
+                return token
+        if len(owned) >= MAX_CLIENT_CURSORS:
+            self.reclaim_cursor(owned)
+        if len(self._cursors) >= MAX_CURSORS:
+            self.reclaim_cursor(self._cursors)
+        token = token_urlsafe(32)
+        self._cursors[token] = Cursor(scope, boundary, now + CURSOR_LIFETIME_SECONDS)
+        return token
+
+    def reclaim_cursor(self, candidates: Collection[str]) -> None:
+        for token in candidates:
+            if not self._cursors[token].readers:
+                del self._cursors[token]
+                return
+        raise ObjectPageError("capacity")
 
     async def register(self, registration: Registration, authorize: Callable[[], None]) -> Receipt:
         try:

@@ -6,5 +6,6 @@ export { searchActionKey, unresolved } from "./search-actions";
 export type { SearchFeedback, SearchIntent } from "./search-actions";
 export { useCursorPage, useProtectedRead } from "./use-protected-read";
 export { useProtectedImage } from "./use-protected-image";
+export { useEligibleObjects } from "./use-eligible-objects";
 export { useEligibleSearchSetup } from "./use-eligible-search-setup";
 export { recordAbsence, useObjectRecord } from "./use-object-record";

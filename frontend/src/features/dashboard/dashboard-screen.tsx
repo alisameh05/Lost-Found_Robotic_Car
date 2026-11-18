@@ -28,7 +28,7 @@ export function DashboardScreen() {
         <SearchStatus view={view} readiness={readiness} retry={refresh} />
         <RecentObjects recent={recent} disconnected={view.disconnected} recordsMode={view.recordsMode} />
         <DeviceReadiness view={view} readiness={readiness} refresh={refresh} />
-        <RecentSearches recent={recent} disconnected={view.disconnected} />
+        <RecentSearches recent={recent} disconnected={view.disconnected} recordsMode={view.recordsMode} />
       </div>
     </div>
     <DashboardFixtureControls />
@@ -155,13 +155,14 @@ function RecentObjects({ recent: { objectPage, objects, retry }, disconnected, r
   </section>;
 }
 
-function RecentSearches({ recent: { objectPage, sessions, loadingSessions, incomplete, retry }, disconnected }: {
-  recent: RecentRecords; disconnected?: boolean;
+function RecentSearches({ recent: { objectPage, sessions, loadingSessions, incomplete, retry }, disconnected, recordsMode }: {
+  recent: RecentRecords; disconnected?: boolean; recordsMode?: boolean;
 }) {
   return <section className={styles.searches} aria-labelledby="dashboard-sessions">
     <h2 id="dashboard-sessions">Recent searches</h2>
-    <p className={styles.muted}>Sessions for recent objects · Up to 3, newest starts first</p>
-    {!objectPage ? <LoadingState label="Loading recent searches" />
+    {!recordsMode && <p className={styles.muted}>Sessions for recent objects · Up to 3, newest starts first</p>}
+    {recordsMode ? <Notice title="Search history unavailable" role="status" />
+      : !objectPage ? <LoadingState label="Loading recent searches" />
       : objectPage.kind !== "ok" ? <Notice title="Recent searches unavailable" tone="warning" role="status">
         {disconnected ? "Search records require a connection to the local application." : "Retry recent objects to retrieve their searches."}
       </Notice> : incomplete ? <div className="feedback-stack">

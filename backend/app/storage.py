@@ -15,6 +15,7 @@ from .http import HttpError
 from .managed_media import GENERATED_ID, STAGING_NAME, ManagedMedia, sync_directory
 from .reference_image import Reference
 from .registration_input import Registration, canonical_json
+from .unicode_search import casefold
 
 DAY_MS = 86_400_000
 SUBMISSION_WINDOW = 600_000
@@ -157,6 +158,7 @@ class RecordsStorage:
         self._clock_lock = Lock()
         self._wall_floor = 0
         self._repair_needed = False
+        self._startup_cleanup_pending = False
         self._anchor = (clock(), monotonic())
 
     def open_database(self, mode: str) -> sqlite3.Connection:
@@ -189,6 +191,10 @@ class RecordsStorage:
             db = self.open_database("rwc")
             try:
                 self.recover_database(db)
+                now, _ = self.now()
+                self._startup_cleanup_pending = self._inspect(db, now, ()).cleanup_pending
+                if self._startup_cleanup_pending:
+                    self.persist_clock(db, now)
             except BaseException:
                 db.close()
                 raise
@@ -355,20 +361,21 @@ class RecordsStorage:
     ) -> tuple[list[dict[str, object]], tuple[int, str] | None]:
         with self.connect() as db, read_transaction(db):
             db.row_factory = sqlite3.Row
-            db.create_function("unicode_casefold", 1, str.casefold, deterministic=True)
+            db.create_function("unicode_casefold", 1, casefold, deterministic=True)
             now, _ = self.now()
             days = self.settings(db)["retention_days"]
-            inspection = self._inspect(db, now, preparing)
-            if inspection.problem:
-                raise storage_unavailable(inspection.problem)
+            inspection = self.check_read_storage(db, now, preparing)
+            # instr treats %, _ and backslash literally when matching bound text.
             rows = db.execute(OBJECT_ROWS + f"""
                 WHERE {ELIGIBLE}
                 AND (? = '' OR o.status = ?) AND instr(unicode_casefold(o.name), ?) > 0
-                AND (o.registered_at_ms, o.id) < (?, ?)
-                ORDER BY o.registered_at_ms DESC, o.id DESC LIMIT ?
+                AND (o.registered_at_ms, o.id COLLATE BINARY) < (?, ?)
+                ORDER BY o.registered_at_ms DESC, o.id COLLATE BINARY DESC LIMIT ?
             """, (now - days * DAY_MS, status, status, folded_name, *before, limit + 1)).fetchall()
             items = [self.object_payload(row, days, now) for row in rows[:limit]]
-            return items, (rows[limit - 1]["registered_at_ms"], rows[limit - 1]["id"]) if len(rows) > limit else None
+        if inspection.cleanup_pending:
+            self.observe_clock(now)
+        return items, (rows[limit - 1]["registered_at_ms"], rows[limit - 1]["id"]) if len(rows) > limit else None
 
     def read_media(self, media_id: str, preparing: Collection[str]) -> tuple[str, bytes]:
         with self.connect() as db, read_transaction(db):
@@ -386,10 +393,15 @@ class RecordsStorage:
             raise HttpError(503, "MEDIA_UNAVAILABLE", f"The managed image is {availability.lower()}.", True)
         return row["format"], data
 
-    def check_read_storage(self, db: sqlite3.Connection, now: int, preparing: Collection[str]) -> None:
+    def check_read_storage(self, db: sqlite3.Connection, now: int, preparing: Collection[str]) -> Inspection:
         inspection = self._inspect(db, now, preparing)
-        if inspection.problem and (not inspection.cleanup_pending or inspection.recovery_pending):
+        # Finish startup recovery before opening records. During normal operation,
+        # cleanup failures hide their owners without taking unexpired reads offline.
+        if inspection.problem and (
+            self._startup_cleanup_pending or not inspection.cleanup_pending or inspection.recovery_pending
+        ):
             raise storage_unavailable(inspection.problem)
+        return inspection
 
     def receipt(self, action_id: str, fingerprint: str) -> Receipt | None:
         with self.connect() as db, read_transaction(db):

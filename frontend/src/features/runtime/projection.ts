@@ -28,6 +28,7 @@ type RuntimeView = {
   workspace?: WorkspaceView;
   searchActions?: Readonly<Record<string, SearchFeedback>>;
   authority?: number;
+  cursorAuthority?: number;
   recovering?: boolean;
   reconnectingSessionId?: string;
 };
@@ -99,6 +100,15 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       authority: (view.authority ?? 0) + 1 });
   }
 
+  function loseRecordsAuthority() {
+    context = undefined;
+    clock = undefined;
+    resetProtectedScope();
+    update({ loading: false, connected: false, health: undefined, snapshot: undefined, recordSnapshot: undefined,
+      removedOwners: undefined, failedRead: { kind: "unavailable" },
+      authority: (view.authority ?? 0) + 1, cursorAuthority: (view.cursorAuthority ?? 0) + 1 });
+  }
+
   async function refresh({ readBootstrap = false, revalidate = false, background = false, renewClock = false } = {}) {
     if (lifetime.signal.aborted || (background && readRequest)) return;
     readRequest?.abort();
@@ -151,7 +161,8 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
         update({ connected: !recordsMode, profile: sameProfile ? view.profile : profile,
           ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined,
             removedOwners: undefined, removedSessionId: undefined,
-            emergency: undefined, authority: (view.authority ?? 0) + 1 }),
+            emergency: undefined, authority: (view.authority ?? 0) + 1,
+            cursorAuthority: (view.cursorAuthority ?? 0) + 1 }),
           ...(authorityChanged && { recovering: true,
             reconnectingSessionId: view.snapshot?.active_session?.id ?? view.reconnectingSessionId }) });
       }
@@ -163,11 +174,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       ]);
       if (signal.aborted) return;
       if (recordsMode && (invalidAuthority(status) || invalidAuthority(health))) {
-        resetProtectedScope();
-        context = undefined;
-        clock = undefined;
-        update({ loading: false, connected: false, health: undefined, snapshot: undefined, recordSnapshot: undefined,
-          failedRead: { kind: "unavailable" }, authority: (view.authority ?? 0) + 1 });
+        loseRecordsAuthority();
         retryBootstrap();
         return;
       }
@@ -182,8 +189,13 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       const diagnostics = health.kind === "ok" && health.data.backend_boot_id === request.context.backend_boot_id
         ? health.data : undefined;
       if (recordsMode && (!next || diagnostics?.storage_integrity !== "Healthy")) {
+        const deletionSnapshot = status.kind === "api-error" && status.error.code === "STORAGE_UNAVAILABLE"
+          ? status.error.snapshot : undefined;
+        const cleanup = deletionSnapshot?.backend_boot_id === request.context.backend_boot_id &&
+          deletionSnapshot.retention.deletion.status === "Failed" ? deletionSnapshot : undefined;
+        const recordSnapshot = cleanup && !recordsChanged(view.recordSnapshot, cleanup) ? view.recordSnapshot : cleanup;
         if (view.connected) resetProtectedScope();
-        update({ connected: false, snapshot: undefined, recordSnapshot: undefined, health: diagnostics, loading: false,
+        update({ connected: false, snapshot: undefined, recordSnapshot, health: diagnostics, loading: false,
           failedRead: status.kind === "api-error" ? status : unavailable(),
           ...(view.connected && { authority: (view.authority ?? 0) + 1 }) });
         return;
@@ -282,7 +294,11 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     const scoped = AbortSignal.any([signal, scope, protectedScope.signal, lifetime.signal]);
     const result = await load({ context, signal: scoped });
     scoped.throwIfAborted();
-    if (recordsMode && invalidAuthority(result)) void refresh();
+    if (recordsMode && invalidAuthority(result)) {
+      loseRecordsAuthority();
+      void refresh();
+      scoped.throwIfAborted();
+    }
     return result;
   }
 
@@ -491,6 +507,7 @@ function recordsChanged(before: Snapshot | undefined, after: Snapshot) {
     before.pending_candidate?.id !== after.pending_candidate?.id ||
     before.retention.settings.revision !== after.retention.settings.revision ||
     before.retention.deletion.status !== after.retention.deletion.status ||
+    before.retention.deletion.remaining_objects !== after.retention.deletion.remaining_objects ||
     after.operations.some((operation) => operation.persistence === "Committed" && !before.operations.some((previous) =>
       previous.action_id === operation.action_id && previous.request_id === operation.request_id && previous.persistence === "Committed"));
 }
