@@ -685,7 +685,6 @@ test("preserves grace during a slow refresh and rejects its stale response after
   }, { times: 1 });
   try {
     await expect.poll(() => readHeld, { timeout: 12_000 }).toBe(true);
-    await page.waitForResponse((response) => response.url() === `${backend}/snapshot`, { timeout: 12_000 });
     await expect(image).toHaveAttribute("src", url!);
     await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();
 
@@ -695,8 +694,7 @@ test("preserves grace during a slow refresh and rejects its stale response after
         "WHERE id='paused'\", (int(sys.argv[2]),)); db.commit()",
       database, String(Date.now() + 180_000),
     ], { windowsHide: true });
-    await page.evaluate(() => dispatchEvent(new Event("focus")));
-    await expect(page.getByText(/^(Record expired|Object not found)$/)).toBeVisible();
+    await expect(page.getByText(/^(Record expired|Object not found)$/)).toBeVisible({ timeout: 12_000 });
   } finally {
     releaseRead();
   }

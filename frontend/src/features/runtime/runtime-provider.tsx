@@ -184,22 +184,29 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
     if (!runtime || !ready || !enabled) return;
     const currentRuntime = runtime;
     const lifetime = new AbortController();
-    let reading = false;
-    function publish(result: ReadResult<T>) {
+    let inFlight = 0;
+    let issued = 0;
+    let accepted = 0;
+    let lastPoll = -1;
+    function publish(result: ReadResult<T>, request: number) {
       const eligible = eligibleRead(result, removedOwners);
       const currentView = currentRuntime.getView();
-      if (!lifetime.signal.aborted && eligible &&
+      if (request > accepted && !lifetime.signal.aborted && eligible &&
           currentView.authority === authority && currentView.removedOwners === removedOwners &&
           currentView.recordSnapshot === snapshot) {
+        accepted = request;
         setRead({ runtime: currentRuntime, load, attempt, result: eligible, snapshot, authority, removedOwners });
       }
     }
     function readCurrent() {
-      if (reading || lifetime.signal.aborted) return;
-      reading = true;
-      void load(currentRuntime, lifetime.signal).then(publish).catch((error: unknown) => {
-        if (!(error instanceof DOMException && error.name === "AbortError")) publish({ kind: "unavailable" });
-      }).finally(() => { reading = false; });
+      const poll = currentRuntime.getView().recordPoll ?? 0;
+      if (inFlight >= 2 || poll === lastPoll || lifetime.signal.aborted) return;
+      lastPoll = poll;
+      inFlight += 1;
+      const request = ++issued;
+      void load(currentRuntime, lifetime.signal).then((result) => publish(result, request)).catch((error: unknown) => {
+        if (!(error instanceof DOMException && error.name === "AbortError")) publish({ kind: "unavailable" }, request);
+      }).finally(() => { inFlight -= 1; });
     }
     pollRead.current = readCurrent;
     readCurrent();
@@ -208,7 +215,7 @@ export function useApplicationRead<T>(load: (runtime: RuntimeProjection, signal:
       lifetime.abort();
     };
   }, [runtime, load, attempt, snapshot, authority, removedOwners, ready, enabled]);
-  // A routine poll can refresh a settled read. A real invalidation cancels it above.
+  // A poll can overtake one slow read. Only newer results can replace a published result.
   useEffect(() => {
     if (allowCleanupRead && recordPoll !== undefined) pollRead.current?.();
   }, [allowCleanupRead, recordPoll]);
