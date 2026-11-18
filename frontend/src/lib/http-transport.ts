@@ -38,8 +38,14 @@ export function createHttpTransport(base: string): ApplicationTransport {
         const object = mutation.result?.object;
         const location = response.headers.get("Location");
         if (response.status === 201 && mutation.persistence === "Committed" && object &&
+            path === "/objects" &&
             location === "/api/v1/objects/" + encodeURIComponent(object.id)) {
           return { kind: "ok", status: response.status, data: data as T, location };
+        }
+        if (path === "/settings/retention" && response.status === 200 && mutation.persistence === "Committed" &&
+            mutation.result?.settings && mutation.result.deletion && !location &&
+            !object && !mutation.result.session && !mutation.result.match) {
+          return { kind: "ok", status: response.status, data: data as T };
         }
         if ((response.status === 202 && mutation.persistence === "Pending") ||
             (response.status >= 400 && mutation.persistence === "Failed")) {
@@ -70,6 +76,15 @@ export function createHttpTransport(base: string): ApplicationTransport {
       return readJson("/objects", "MutationResponse", input.signal, {
         method: "POST", headers: protectedHeaders("POST /objects", registration), body: form,
       });
+    }
+    if (route === "POST /settings/retention-preview" || route === "PUT /settings/retention") {
+      const request = input as HttpRequest<typeof route>;
+      const headers = protectedHeaders(route, request);
+      headers.set("Content-Type", "application/json");
+      return readJson(route.slice(route.indexOf(" ") + 1),
+        route === "PUT /settings/retention" ? "MutationResponse" : "RetentionPreview", input.signal, {
+          method: route === "PUT /settings/retention" ? "PUT" : "POST", body: JSON.stringify(request.body), headers,
+        });
     }
     if (!Object.hasOwn(responses, route)) return deferred;
     const definition = responses[route as keyof typeof responses];

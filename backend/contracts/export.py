@@ -54,7 +54,7 @@ def json_content(name: str) -> dict[str, object]:
 def responses(path: str, result: str | None, statuses: tuple[int, ...]) -> dict[str, object]:
     no_store = {"Cache-Control": {"schema": {"const": "no-store"}}}
     failure = json_content("Error")
-    if path == "/objects" and result == "MutationResponse":
+    if path in ("/objects", "/settings/retention") and result == "MutationResponse":
         failure = {"application/json": {"schema": {"oneOf": [component("Error"), component("MutationResponse")]}}}
     definitions: dict[str, object] = {"default": {
         "description": "API failure", "content": failure, "headers": no_store,

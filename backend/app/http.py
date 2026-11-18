@@ -26,6 +26,7 @@ RECORDS_ROUTES = {
     "/objects": ("GET", "POST"), "/objects/{id}": ("GET",),
     "/objects/{id}/sessions": ("GET",), "/sessions/{id}": ("GET",), "/sessions/{id}/matches": ("GET",),
     "/media/{id}": ("GET",), "/settings": ("GET",),
+    "/settings/retention-preview": ("POST",), "/settings/retention": ("PUT",),
 }
 PAGE_QUERY = frozenset({"cursor", "limit"})
 LIST_QUERIES = {
@@ -33,8 +34,10 @@ LIST_QUERIES = {
     "/objects/{id}/sessions": PAGE_QUERY,
     "/sessions/{id}/matches": PAGE_QUERY,
 }
-CLIENT_ROUTES = frozenset(LIST_QUERIES) | {"/snapshot"}
+RETENTION_ROUTES = frozenset({"/settings/retention-preview", "/settings/retention"})
+CLIENT_ROUTES = frozenset(LIST_QUERIES) | {"/snapshot"} | RETENTION_ROUTES
 DOMAIN_ID = r"[A-Za-z0-9_-]{1,128}"
+REQUEST_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 
 
 @dataclass

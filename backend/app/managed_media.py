@@ -234,12 +234,14 @@ class ManagedMedia:
             entry.discard()
 
     def exists(self, relative: str) -> bool:
+        return self.size(relative) is not None
+
+    def size(self, relative: str) -> int | None:
         try:
             with self.entry(relative) as entry:
-                entry.stat()
+                return entry.stat().st_size
         except FileNotFoundError:
-            return False
-        return True
+            return None
 
     def read(
         self, relative: str, byte_length: int, checksum: str, *,

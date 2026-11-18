@@ -17,11 +17,14 @@ test.use({ baseURL: frontend });
 
 async function startBackend(options: {
   initializationGate?: string; crashAfterCommit?: boolean; registrationGate?: string; clockOffset?: string;
+  cleanupFault?: string; settingsGate?: string;
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
     : options.registrationGate ? ["backend.tests.crash_registration", "journaled", options.registrationGate]
-    : options.clockOffset ? ["backend.tests.crash_registration", "clock", options.clockOffset]
+    : options.settingsGate ? ["backend.tests.crash_registration", "retention_before_commit", options.settingsGate]
+    : options.clockOffset ? ["backend.tests.crash_registration", "clock", options.clockOffset,
+      ...(options.cleanupFault ? ["deny-purge", options.cleanupFault] : [])]
     : ["backend.app"];
   const child = spawn(python, ["-m", ...entry], {
     cwd: repo, windowsHide: true, env: {
@@ -130,7 +133,7 @@ test.afterEach(async () => {
   await rm(parent, { recursive: true, force: true, maxRetries: 3 });
 });
 
-test("opens connected empty records and read-only settings with one page identity", async ({ page }) => {
+test("opens connected empty records and editable settings with one page identity", async ({ page }) => {
   await startBackend();
   const { requests, sockets } = observe(page);
   await page.goto("/");
@@ -141,7 +144,7 @@ test("opens connected empty records and read-only settings with one page identit
   await expect(page.getByRole("heading", { name: "No objects registered" })).toBeVisible();
   await page.getByRole("link", { name: "Settings" }).click();
   await expect(page.getByRole("region", { name: "Saved retention" }).getByText("7 days", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Preview Change" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Preview Change" })).toBeEnabled();
   await page.getByRole("link", { name: "Devices", exact: true }).click();
   await expect(page.getByText("Gestures requirements unavailable")).toBeVisible();
   const profile = page.locator("summary").filter({ hasText: "Qualification profile" });
@@ -296,6 +299,137 @@ function seedStoredHistory(now: number, interrupted = false) {
     join(parent, "records"), String(now), String(interrupted),
   ], { cwd: repo, windowsHide: true });
 }
+
+test("previews and cancels, rejects a changed impact, and retains the saved period", async ({ page }) => {
+  test.setTimeout(60_000);
+  const clock = join(parent, "retention-clock");
+  writeFileSync(clock, "0");
+  await startBackend({ clockOffset: clock });
+  await seedLibrary([
+    ["about-to-expire", "Boundary record", "Lost", Date.now() - 86_400_000 + 120_000],
+  ], ["about-to-expire"]);
+  await loopbackOnly(page);
+  const { requests } = observe(page);
+  await page.goto("/settings");
+  const saved = page.getByRole("region", { name: "Saved retention" });
+  const proposed = page.getByRole("textbox", { name: "Proposed retention in days" });
+  const preview = page.getByRole("button", { name: "Preview Change" });
+  const review = page.getByRole("button", { name: "Review Change", exact: true });
+  await expect(saved).toContainText("7 days");
+  await proposed.fill("1");
+  await preview.click();
+  await expect(page.getByRole("region", { name: "Immediate impact" })).toContainText("0 objects");
+  await review.click();
+  await page.getByRole("dialog").getByRole("button", { name: "Cancel Change" }).click();
+  await expect(proposed).toHaveValue("7");
+  expect(requests.filter((request) => request.startsWith("PUT"))).toEqual([]);
+
+  await proposed.fill("1");
+  await preview.click();
+  await review.click();
+  writeFileSync(clock, "180000");
+  await page.getByRole("button", { name: "Confirm and Apply" }).click();
+  await expect(page.getByText("Preview outdated", { exact: true })).toBeVisible();
+  await expect(saved).toContainText("7 days");
+  await preview.click();
+  await expect(page.getByRole("region", { name: "Immediate impact" })).toContainText("1 object");
+});
+
+test("observes a pending settings transaction settle through a protected snapshot", async ({ page }) => {
+  const gate = join(parent, "allow-settings-commit");
+  await startBackend({ settingsGate: gate });
+  await loopbackOnly(page);
+  await page.goto("/settings");
+  const saved = page.getByRole("region", { name: "Saved retention" });
+  await page.getByRole("textbox", { name: "Proposed retention in days" }).fill("14");
+  await page.getByRole("button", { name: "Preview Change" }).click();
+  await page.getByRole("button", { name: "Review Change", exact: true }).click();
+  const pending = page.waitForResponse((response) => response.url() === backend + "/settings/retention" &&
+    response.request().method() === "PUT" && response.status() === 202);
+  await page.getByRole("button", { name: "Confirm and Apply" }).click();
+  await pending;
+  await expect(page.getByText("Retention save pending", { exact: true })).toBeVisible();
+  await expect(saved).toContainText("7 days");
+  await page.getByRole("link", { name: "Devices", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Devices" })).toBeVisible();
+  await page.getByRole("link", { name: "Settings", exact: true }).click();
+  await expect(page.getByText("Retention save pending", { exact: true })).toBeVisible();
+  writeFileSync(gate, "commit");
+  await expect(page.getByText("Retention saved", { exact: true })).toBeVisible({ timeout: 12_000 });
+  await expect(saved).toContainText("14 days");
+  await expect(page.getByRole("button", { name: "Retry Same Request" })).toHaveCount(0);
+});
+
+test("recovers a lost settings response and removes records and open evidence through failed cleanup and repair", async ({ page, context }) => {
+  test.setTimeout(90_000);
+  const clock = join(parent, "retention-clock");
+  const fault = join(parent, "deny-cleanup");
+  writeFileSync(clock, "0");
+  writeFileSync(fault, "test fault");
+  await startBackend({ clockOffset: clock, cleanupFault: fault });
+  await waitForStorage();
+  seedStoredHistory(Date.now() - 2 * 86_400_000);
+  await seedLibrary([["kept", "Recent reference", "Lost", Date.now() - 1_000]], ["kept"]);
+  await loopbackOnly(page);
+  const { requests, sockets } = observe(page);
+  const historyTab = await context.newPage();
+  await historyTab.goto(frontend + "/sessions/session-confirmed");
+  const evidence = historyTab.getByRole("img", { name: "Captured evidence", exact: true });
+  await expect(evidence).toHaveAttribute("src", /^blob:/);
+  const url = await evidence.getAttribute("src");
+  await page.goto("/settings");
+  const proposed = page.getByRole("textbox", { name: "Proposed retention in days" });
+  const saved = page.getByRole("region", { name: "Saved retention" });
+  await proposed.fill("1");
+  await page.getByRole("button", { name: "Preview Change" }).click();
+  const impact = page.getByRole("region", { name: "Immediate impact" });
+  await expect(impact).toContainText("4 sessions");
+  await expect(impact).toContainText("3 matches");
+  await expect(impact).toContainText(/\d+ bytes of managed images/);
+  await page.getByRole("button", { name: "Review Change", exact: true }).click();
+  const payloads: string[] = [];
+  await page.route(backend + "/settings/retention", async (route) => {
+    if (route.request().method() !== "PUT") return route.fallback();
+    payloads.push(route.request().postData() ?? "");
+    if (payloads.length === 1) {
+      const response = await route.fetch();
+      expect(response.status()).toBe(200);
+      expect((await response.json()).result.deletion.status).toBe("Pending");
+      await route.abort();
+    } else await route.fallback();
+  });
+  await page.getByRole("button", { name: "Confirm and Apply" }).click();
+  await expect(page.getByText("Save outcome unknown", { exact: true })).toBeVisible();
+  await page.getByRole("button", { name: "Retry Same Request" }).click();
+  await expect(page.getByText("Retention saved", { exact: true })).toBeVisible();
+  expect(payloads).toHaveLength(2);
+  expect(payloads[1]).toBe(payloads[0]);
+  await expect(saved).toContainText("1 day");
+  await expect(page.getByText("Deletion failed", { exact: true })).toBeVisible({ timeout: 15_000 });
+  expect(existsSync(join(parent, "records", "media", "evidence-match-confirmed.png"))).toBe(true);
+  await historyTab.evaluate(() => window.dispatchEvent(new Event("online")));
+  await expect(evidence).toHaveCount(0);
+  await expect(historyTab.getByText(/^(Session expired|Session not found)$/)).toBeVisible({ timeout: 15_000 });
+  expect(await historyTab.evaluate(async (url) => {
+    try { await fetch(url!); return true; } catch { return false; }
+  }, url)).toBe(false);
+  await historyTab.close();
+
+  unlinkSync(fault);
+  await expect(page.getByText("Deletion complete", { exact: true })).toBeVisible({ timeout: 15_000 });
+  expect(existsSync(join(parent, "records", "media", "evidence-match-confirmed.png"))).toBe(false);
+  await page.getByRole("link", { name: "Objects / History" }).click();
+  await expect(objectRows(page)).toHaveCount(1);
+  await expect(objectRows(page).first()).toContainText("Recent reference");
+  await page.getByRole("link", { name: "Dashboard" }).click();
+  await expect(page.getByText("No sessions for recent objects", { exact: true })).toBeVisible();
+  await page.goto("/objects/history-owner");
+  await expect(page.getByText("Object not found", { exact: true })).toBeVisible();
+  expect(requests).not.toContain("GET /api/v1/sessions");
+  expect(requests).not.toContain("GET /api/v1/history");
+  expect(sockets).toEqual([]);
+  await expect(page.getByText(/Fixture mode|Fixture scenario/)).toHaveCount(0);
+});
 
 test("composes saved history offline and inspects the exact captured PNG with the keyboard", async ({ page }) => {
   test.setTimeout(60_000);

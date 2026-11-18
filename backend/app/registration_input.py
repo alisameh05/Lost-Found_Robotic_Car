@@ -9,7 +9,7 @@ from typing import NoReturn, TypedDict
 from fastapi import Request
 from starlette.requests import ClientDisconnect
 
-from .http import BODY_LIMIT, HEADER_LIMIT, HttpError, body_length, header
+from .http import BODY_LIMIT, HEADER_LIMIT, REQUEST_ID, HttpError, body_length, header
 
 MULTIPART_LIMIT = 11 * 1024**2
 IMAGE_LIMIT = 10 * 1024**2
@@ -241,7 +241,7 @@ async def parse_registration(request: Request) -> Registration:
     if parts.keys() != FIELDS:
         raise malformed()
     action_id = text_field(parts, "action_id")
-    if not re.fullmatch(r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}", action_id):
+    if not re.fullmatch(REQUEST_ID, action_id):
         raise invalid("/action_id", "Use a lowercase UUIDv4 action ID.")
     name = normalize_name(text_field(parts, "name"))
     if not 1 <= len(name) <= NAME_LIMIT or "\0" in name:
