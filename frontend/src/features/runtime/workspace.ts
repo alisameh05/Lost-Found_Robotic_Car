@@ -24,23 +24,27 @@ export function reconnectDelay(backoff: number) {
 }
 
 function readChannel<Socket extends ReadSocket>({
-  transport, context, channel, connect, lost,
+  transport, context, channel, connect, lost, calibrate,
 }: {
   transport: ApplicationTransport;
   context: ClientContext;
   channel: Channel;
   connect(request: ProtectedRequest, offer: SocketOffer, closed: () => void): ReadResult<Socket>;
   lost(): void;
+  calibrate?(issuedAtMs: number, requestedAt: number): void;
 }) {
   let scope: AbortController | undefined;
   let timer: ReturnType<typeof setTimeout> | undefined;
   let socket: Socket | undefined;
   let disposed = false;
   let backoff = 250;
+  let stableTimer: ReturnType<typeof setTimeout> | undefined;
 
   function disconnect() {
     const connection = scope;
     scope = undefined;
+    clearTimeout(stableTimer);
+    stableTimer = undefined;
     connection?.abort();
     socket?.close();
     socket = undefined;
@@ -63,9 +67,12 @@ function readChannel<Socket extends ReadSocket>({
     const closed = () => { if (scope === connection) reconnect(); };
     try {
       if (!navigator.onLine) { closed(); return; }
+      const requestedAt = performance.now();
       const ticket = await transport.request("POST /websocket-tickets", { ...request, body: { client_id: context.client_id, channel } });
       if (scope !== connection) return;
       if (ticket.kind !== "ok" || !conforms("TicketResponse", ticket.data)) { closed(); return; }
+      // The v1 ticket expiry is exactly ten seconds after issuance.
+      calibrate?.(ticket.data.expires_at_ms - 10_000, requestedAt);
       const result = connect(request, socketOffer(channel, ticket.data.ticket), closed);
       if (result.kind !== "ok") { closed(); return; }
       if (scope !== connection) { result.data.close(); return; }
@@ -79,7 +86,10 @@ function readChannel<Socket extends ReadSocket>({
   void open();
   return {
     current: () => socket,
-    healthy() { backoff = 250; },
+    healthy() {
+      // A snapshot followed immediately by another fault is still a retry streak.
+      stableTimer ??= setTimeout(() => { backoff = 250; }, 5_000);
+    },
     reconnect,
     dispose() { disposed = true; clearTimeout(timer); disconnect(); },
   };
@@ -249,8 +259,10 @@ export function openWorkspace({
 
   function video(surface: HTMLCanvasElement, source: "robot" | "webcam") {
     const channel: Channel = source === "robot" ? "robot-video" : "webcam-video";
+    let ticketClock: { issued: number; requested: number } | undefined;
     const display = openFrameDisplay({
-      profile, source, serverTime, monotonic: () => performance.now(),
+      profile, source, monotonic: () => performance.now(),
+      serverTime: readOnly ? () => ticketClock && ticketClock.issued + Math.ceil(performance.now() - ticketClock.requested) : serverTime,
       decode: (jpeg) => createImageBitmap(new Blob([jpeg], { type: "image/jpeg" }), { imageOrientation: "none" }),
       present(image) {
         if (readOnly && !view.eventsLive) return false;
@@ -274,9 +286,11 @@ export function openWorkspace({
         report({ previewLive: live });
       },
       epochChanged() { connection.reconnect(); },
+      timingLost: readOnly ? (): void => { connection.reconnect(); } : undefined,
     });
     const connection = readChannel<ReadSocket>({
       transport, context, channel, lost: display.reset,
+      calibrate(issued, requested) { ticketClock = { issued, requested }; },
       connect: (request, offer, closed) => transport.connectFrames(request, source, offer, {
         closed,
         message(frame) { if (!disposed && !request.signal?.aborted) display.receive(frame); },

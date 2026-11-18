@@ -41,7 +41,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
   const subscribers = new Set<() => void>();
   let view: RuntimeView = { loading: true, recordsMode };
   let context: ProtectedRequest["context"] | undefined;
-  let clock: { server: number; received: number; roundTrip?: number } | undefined;
+  let clock: { server: number; received: number } | undefined;
   let readRequest: AbortController | undefined;
   let protectedScope = new AbortController();
   let recordReads = new AbortController();
@@ -64,12 +64,6 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     if (clock && !lifetime.signal.aborted) {
       const elapsed = performance.now() - clock.received;
       return clock.server + (recordsMode ? Math.floor(elapsed) : Math.ceil(elapsed));
-    }
-  }
-
-  function frameServerTime() {
-    if (clock && !lifetime.signal.aborted) {
-      return clock.server + Math.ceil(performance.now() - clock.received) + (clock.roundTrip ?? 0);
     }
   }
 
@@ -167,8 +161,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
           lastActiveSearch = undefined;
         }
         context = bootstrap.data;
-        clock = { server: bootstrap.data.server_time_ms, received: recordsMode ? bootstrapReceived : bootstrapStarted,
-          roundTrip: recordsMode ? Math.ceil(bootstrapReceived - bootstrapStarted) : undefined };
+        clock = { server: bootstrap.data.server_time_ms, received: recordsMode ? bootstrapReceived : bootstrapStarted };
         update({ connected: !recordsMode, profile: sameProfile ? view.profile : profile,
           ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined,
             removedOwners: undefined, removedSessionId: undefined,
@@ -387,7 +380,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       const reusable = sessionId && workspace?.canHandOff(sessionId) ? workspace : undefined;
       if (!reusable) workspace?.dispose();
       const active = reusable ?? openWorkspace({
-        transport, context, profile: view.profile, serverTime: recordsMode ? frameServerTime : serverTime, readOnly: recordsMode,
+        transport, context, profile: view.profile, serverTime, readOnly: recordsMode,
         update: (observation) => update({ workspace: observation }),
         snapshot: (next, removedOwner) => {
           if (removedOwner) removeRecords([removedOwner]);

@@ -196,7 +196,9 @@ async function observePreviewFrames(page: Page) {
 
 test("watches a protected simulated preview from a saved Lost target across tabs and restart", async ({ page, context }) => {
   test.setTimeout(60_000);
-  await startBackend({ simulation: true });
+  const clockOffset = join(parent, "preview-clock-offset");
+  writeFileSync(clockOffset, "0");
+  await startBackend({ simulation: true, clockOffset });
   await observePreviewFrames(page);
   const source = sourceImage();
   await selectTarget(page, source, "Preview registration");
@@ -238,6 +240,12 @@ test("watches a protected simulated preview from a saved Lost target across tabs
   await expect.poll(eventSockets).toBeGreaterThan(connectedEvents);
   await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
 
+  const videoSockets = () => sockets.filter((url) => url.endsWith("/video/robot")).length;
+  const connectedVideo = videoSockets();
+  writeFileSync(clockOffset, "5000");
+  await expect.poll(videoSockets).toBeGreaterThan(connectedVideo);
+  await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
+
   const spectator = await context.newPage();
   const spectatorTraffic = observe(spectator);
   await spectator.goto(page.url());
@@ -251,7 +259,7 @@ test("watches a protected simulated preview from a saved Lost target across tabs
 
   await stopBackend();
   await expect(preview.getByText("Live preview", { exact: true })).toHaveCount(0);
-  await startBackend({ simulation: true });
+  await startBackend({ simulation: true, clockOffset });
   await expect(preview.getByText("Live preview", { exact: true })).toBeVisible({ timeout: 20_000 });
   await expect(page.getByRole("region", { name: "Saved search target" }).getByText("Preview registration")).toBeVisible();
   await expect(page.getByRole("button", { name: "Start Search" })).toBeDisabled();

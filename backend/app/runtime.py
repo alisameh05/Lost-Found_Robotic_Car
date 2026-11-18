@@ -116,22 +116,26 @@ class RecordsRuntime:
     def enable_realtime(self, simulation: Simulation | None, unavailable_code: str,
                         invalidate: Callable[[str, Channel], None]) -> Realtime:
         self.realtime = Realtime(simulation, unavailable_code, self.boot_id, self.storage.monotonic,
-                                 self.storage.clock, self.touch_client, self.realtime_projection, invalidate)
+                                 self.storage.clock, self.touch_client, self.realtime_projection, invalidate,
+                                 self.expire_clients)
         return self.realtime
 
     def frontend_profile(self) -> dict[str, int | str] | None:
         profile = self.realtime.profile if self.realtime else None
         return dict(profile.frontend) if profile else None
 
-    def _expire_clients(self, now: float) -> None:
+    def expire_clients(self) -> None:
+        now = self.storage.monotonic()
         for client, touched in list(self._clients.items()):
             connected = self.realtime and self.realtime.client_has_events(client)
             if now - touched >= CLIENT_IDLE_SECONDS and not connected:
                 del self._clients[client]
+                if self.realtime:
+                    self.realtime.expire_client(client)
 
     def bootstrap(self) -> dict[str, object] | None:
-        now = monotonic()
-        self._expire_clients(now)
+        self.expire_clients()
+        now = self.storage.monotonic()
         if len(self._clients) >= MAX_CLIENTS:
             return None
         client = token_urlsafe(24)
@@ -142,8 +146,8 @@ class RecordsRuntime:
         }
 
     def touch_client(self, client: str) -> bool:
-        now = monotonic()
-        self._expire_clients(now)
+        self.expire_clients()
+        now = self.storage.monotonic()
         if client not in self._clients:
             return False
         self._clients[client] = now
@@ -245,7 +249,7 @@ class RecordsRuntime:
 
     def issue_cursor(self, scope: CursorScope, boundary: tuple[int, str]) -> str:
         now = monotonic()
-        self._expire_clients(now)
+        self.expire_clients()
         self.prune_cursors(now)
         if scope.client not in self._clients:
             raise PageError("client_expired")

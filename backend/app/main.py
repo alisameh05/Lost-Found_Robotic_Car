@@ -256,8 +256,9 @@ def create_app(
             return JSONResponse(storage.settings)
         if runtime.realtime and runtime.realtime.profile:
             snapshot = await runtime.realtime.snapshot()
-            if snapshot is not None:
-                return JSONResponse(snapshot)
+            if snapshot is None:
+                return HttpError(503, "NOT_READY", "The current snapshot is unavailable. Retry shortly.", True).response()
+            return JSONResponse(snapshot)
         return JSONResponse(await runtime.snapshot(storage))
 
     @app.post(API_PREFIX + "/settings/retention-preview")

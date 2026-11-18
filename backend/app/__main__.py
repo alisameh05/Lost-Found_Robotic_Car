@@ -27,7 +27,7 @@ def main() -> int:
                     app, host=LOOPBACK, port=config.backend_port,
                     workers=1, reload=False, proxy_headers=False, access_log=False, http="httptools", ws="websockets",
                     ws_max_size=app.state.socket_message_limit, ws_max_queue=1, ws_per_message_deflate=False,
-                    timeout_graceful_shutdown=3, log_level="warning",
+                    log_level="warning",
                 ))
                 server.run(sockets=[listener])
                 return 0 if server.started else 1

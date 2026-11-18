@@ -113,7 +113,7 @@ class Realtime:
         self, simulation: Simulation | None, unavailable_code: str, boot: str,
         monotonic: Callable[[], float], utc: Callable[[], int], touch_client: Callable[[str], bool],
         project: Callable[[], Awaitable[Projection | None]],
-        invalidate: Callable[[str, Channel], None],
+        invalidate: Callable[[str, Channel], None], expire_clients: Callable[[], None],
     ):
         self.simulation = simulation
         self.unavailable_code = unavailable_code
@@ -123,6 +123,7 @@ class Realtime:
         self.touch_client = touch_client
         self.project = project
         self.invalidate = invalidate
+        self.expire_clients = expire_clients
         self.sequence = 1
         self._tickets: dict[bytes, Ticket] = {}
         self._connections: dict[tuple[str, Channel], Connection] = {}
@@ -131,6 +132,7 @@ class Realtime:
         self._readiness: dict[str, bool] = {}
         self._projection: Projection | None = None
         self._projection_lock = asyncio.Lock()
+        self._removal_revision = 0
         self._closed = False
 
     @property
@@ -139,12 +141,21 @@ class Realtime:
 
     def requires_profile(self) -> QualificationProfile:
         if not self.profile or self._closed:
-            code = self.unavailable_code if not self.profile else "NOT_READY"
+            code = self.unavailable_code
             raise HttpError(503, code, "A compatible backend simulation profile is unavailable.")
         return self.profile
 
     def client_has_events(self, client: str) -> bool:
         return (client, "events") in self._connections
+
+    def expire_client(self, client: str) -> None:
+        for channel in CHANNELS.values():
+            connection = self._connections.get((client, channel))
+            if connection is not None:
+                self.remove(connection, 1008)
+        for key, ticket in tuple(self._tickets.items()):
+            if ticket.client == client:
+                del self._tickets[key]
 
     def issue(self, client: str, channel: Channel) -> Projection:
         if not self.touch_client(client):
@@ -220,6 +231,7 @@ class Realtime:
             return
         if ordered:
             if self.sequence >= SAFE_INTEGER:
+                self.unavailable_code = "COUNTER_EXHAUSTED"
                 self.stop(1011)
                 return
             self.sequence += 1
@@ -234,7 +246,13 @@ class Realtime:
 
     async def _refresh_projection(self) -> Projection | None:
         # The caller holds _projection_lock for the read, commit and initial subscription.
-        next_state = await self.project()
+        for _ in range(3):
+            revision = self._removal_revision
+            next_state = await self.project()
+            if revision == self._removal_revision:
+                break
+        else:
+            return None
         if next_state is None or self._closed:
             return None
         before = self._projection
@@ -273,16 +291,20 @@ class Realtime:
 
     async def maintain_projection(self) -> None:
         while not self._closed:
+            self.expire_clients()
             if any(channel == "events" for _, channel in self._connections):
                 await self.snapshot()
             await asyncio.sleep(PROJECTION_INTERVAL)
 
-    def _check_capture(self, capture: Capture, previous: Frame | None, now: float,
+    def _check_capture(self, source: Source, capture: Capture, previous: Frame | None, now: float,
                        profile: QualificationProfile) -> Frame | None:
         if (not capture_identity_valid(capture) or not math.isfinite(capture.observed_at)
                 or capture.observed_at > now or not dimensions_allowed(profile, capture.width, capture.height)
                 or len(capture.jpeg) + 4 >= profile.bound("max_frame_bytes")
                 or capture.age_ms + (now - capture.observed_at) * 1000 >= profile.bound("capture_age_limit_ms")):
+            return None
+        frame = Frame(token_urlsafe(18), capture)
+        if frame.header(source, now, self.utc(), profile) is None:
             return None
         if previous:
             old = previous.capture
@@ -293,12 +315,12 @@ class Realtime:
                 return None
             # Static scene bytes have already been decoded and checked.
             if capture.jpeg is old.jpeg and (capture.width, capture.height) == (old.width, old.height):
-                return Frame(token_urlsafe(18), capture)
+                return frame
         try:
             read_sample(capture.jpeg, profile, (capture.width, capture.height))
         except (OSError, ValueError, Image.DecompressionBombError):
             return None
-        return Frame(token_urlsafe(18), capture)
+        return frame
 
     async def capture(self) -> None:
         simulation = self.simulation
@@ -309,18 +331,35 @@ class Realtime:
             observation = simulation.adapter.observe(now)
             for source, capture in zip(SOURCES, (observation.robot, observation.webcam), strict=True):
                 self._observe_source(source, capture, now, simulation.profile)
-            self._readiness = {
+            self._set_readiness({
                 "Command": observation.command, "Controller": observation.controller, "AI": observation.inference,
                 "RobotVideo": "robot" in self._live_sources, "Webcam": "webcam" in self._live_sources,
-            }
+            })
             await asyncio.sleep(CAPTURE_INTERVAL)
+
+    def _set_readiness(self, observations: dict[str, bool]) -> None:
+        if observations == self._readiness:
+            return
+        self._readiness = observations
+        if self._projection is not None:
+            current = cast(Projection, self._projection["readiness"])
+            components = cast(list[Projection], current["components"])
+            updated = {**current, "components": [
+                {"component": name, "status": "Ready" if observations[name] else "Unavailable",
+                 "cause_codes": [] if observations[name] else ["NOT_READY"]}
+                if (name := str(component["component"])) in observations else component
+                for component in components
+            ]}
+            if updated != current:
+                self._projection["readiness"] = updated
+                self._publish("readiness_changed", {"readiness": updated, "runtime": self._projection["runtime"]})
 
     def _observe_source(self, source: Source, capture: Capture | None, now: float,
                         profile: QualificationProfile) -> None:
         old = self._frames.get(source)
-        frame = self._check_capture(capture, old, now, profile) if capture is not None else None
+        frame = self._check_capture(source, capture, old, now, profile) if capture is not None else None
         channel: Channel = "robot-video" if source == "robot" else "webcam-video"
-        if frame and frame.header(source, now, self.utc(), profile) is not None:
+        if frame:
             self._frames[source] = frame
             self._live_sources.add(source)
             for connection in tuple(self._connections.values()):
@@ -341,8 +380,20 @@ class Realtime:
                         self.invalidate(connection.client, channel)
 
     def object_removed(self, owner: str) -> None:
-        if not self._closed and self.profile:
-            self._publish("object_removed", {"object_id": owner, "reason": "Expired"})
+        if self._closed or not self.profile:
+            return
+        self._removal_revision += 1
+        if self._projection is not None:
+            operations = cast(list[Projection], self._projection["operations"])
+            self._projection["operations"] = [
+                operation for operation in operations if _operation_owner(operation) != owner
+            ]
+        # A queued snapshot may still contain eligible-when-projected record data.
+        marker = canonical_json(owner).encode("utf-8")
+        for connection in tuple(self._connections.values()):
+            if any(marker in message for message in connection.events):
+                self.remove(connection, 1008)
+        self._publish("object_removed", {"object_id": owner, "reason": "Expired"})
 
     def stop(self, code: int = 1000) -> None:
         self._closed = True
@@ -459,6 +510,12 @@ class Realtime:
                 return 1008
         # There is no lease in the preview slice. Even a valid heartbeat is unauthorized.
         return 1008
+
+
+def _operation_owner(operation: Projection) -> object:
+    result = operation.get("result")
+    obj = result.get("object") if isinstance(result, dict) else None
+    return obj.get("id") if isinstance(obj, dict) else None
 
 
 def _reject_json_constant(_: str) -> None:

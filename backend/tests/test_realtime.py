@@ -20,6 +20,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import ClientConnection, connect
 
+from backend.app import realtime
 from backend.app import simulation as fixture
 from backend.app.config import Config
 from backend.app.main import create_app
@@ -180,7 +181,8 @@ def wait_for(client: httpx.Client, path: str, headers: dict[str, str], check=lam
 
 
 @contextmanager
-def service(root: Path, *, blocked: bool = False, event_limit: int | None = None) -> Iterator[Loopback]:
+def service(root: Path, *, blocked: bool = False, event_limit: int | None = None,
+            frame_limit: int | None = None) -> Iterator[Loopback]:
     clock = Clock()
     storage = RecordsStorage(root, monotonic=clock)
     simulation = load_simulation("fixture-v1")
@@ -191,6 +193,8 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
         profile = replace(profile, values={**profile.values, "event_queue_messages": 1})
     if event_limit is not None:
         profile = replace(profile, values={**profile.values, "max_event_message_bytes": event_limit})
+    if frame_limit is not None:
+        profile = replace(profile, values={**profile.values, "max_frame_bytes": frame_limit})
     invalidations: list[tuple[str, Channel]] = []
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
@@ -382,6 +386,44 @@ def test_video_freshness_dimensions_and_independent_channels(tmp_path: Path) -> 
                     assert frame(replacement)[0]["source"] == "robot"
                     webcam.send("bad")
                     closed(webcam, 1003)
+
+
+def test_video_only_client_expires_without_disturbing_the_event_watcher(tmp_path: Path) -> None:
+    with service(tmp_path) as app:
+        camera = auth(app.bootstrap())
+        watcher = auth(app.bootstrap())
+        wait_for(app.http, "/health", camera)
+        with (
+            app.open("/video/robot", app.ticket(camera, "robot-video")) as video,
+            app.open("/events", app.ticket(watcher, "events")) as events,
+        ):
+            frame(video)
+            initial = event(events)
+            app.clock.offset += 1801
+            closed(video, 1008, drain=True)
+            assert app.http.get(API + "/snapshot", headers=camera).json()["code"] == "CLIENT_INVALID"
+            app.observations.inference = False
+            assert event(events)["event_seq"] == initial["event_seq"] + 1
+            assert app.http.get(API + "/snapshot", headers=watcher).status_code == 200
+
+
+def test_full_frame_bound_applies_before_jpeg_decode(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    decoded = Event()
+
+    def unexpected_decode(*args, **kwargs):
+        decoded.set()
+        raise ValueError("This candidate cannot fit the frame envelope")
+
+    monkeypatch.setattr(realtime, "read_sample", unexpected_decode)
+    # This accepts the raw JPEG and prefix but lacks space for the metadata.
+    with service(tmp_path, frame_limit=(FIXTURES / "robot.jpg").stat().st_size + 5) as app:
+        headers = auth(app.bootstrap())
+        wait_for(app.http, "/health", headers)
+        with app.open("/video/robot", app.ticket(headers, "robot-video")) as video:
+            with pytest.raises(TimeoutError):
+                video.recv(timeout=0.25)
+        assert not decoded.is_set()
+        assert status(app.http.get(API + "/health", headers=headers).json(), "RobotVideo") == "Unavailable"
 
 
 def test_oversized_snapshot_explicitly_closes_only_the_event_channel(tmp_path: Path) -> None:

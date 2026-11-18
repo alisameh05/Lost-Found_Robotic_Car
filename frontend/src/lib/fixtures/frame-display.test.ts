@@ -35,7 +35,7 @@ test("acknowledges the latest successfully drawn image and rejects duplicate acq
   const firstDecode = Promise.withResolvers<typeof first>();
   const latestDecode = Promise.withResolvers<typeof second>();
   const decode = vi.fn().mockReturnValueOnce(firstDecode.promise).mockReturnValueOnce(latestDecode.promise).mockResolvedValueOnce(third);
-  const present = vi.fn().mockReturnValueOnce(true).mockReturnValue(false);
+  const present = vi.fn().mockReturnValueOnce(false).mockReturnValue(true);
   const display = openFrameDisplay({ profile: fixtureProfile, source: "robot", serverTime: () => sampleTime + clock,
     monotonic: () => clock, decode, present, changed() {}, epochChanged() {} });
   display.receive(frame(1));
@@ -47,7 +47,7 @@ test("acknowledges the latest successfully drawn image and rejects duplicate acq
   await Promise.resolve();
   await Promise.resolve();
   expect(first.close).toHaveBeenCalledOnce();
-  expect(present).not.toHaveBeenCalled();
+  expect(present).toHaveBeenCalledExactlyOnceWith(first);
   expect(display.displayedFrame()).toBeNull();
   latestDecode.resolve(second);
   await Promise.resolve();
@@ -55,7 +55,7 @@ test("acknowledges the latest successfully drawn image and rejects duplicate acq
   display.receive(frame(4));
   await Promise.resolve();
   expect(present).toHaveBeenLastCalledWith(third);
-  expect(display.displayedFrame()).toEqual({ frame_id: "sample-robot-3", stream_epoch: metadata.stream_epoch });
+  expect(display.displayedFrame()).toEqual({ frame_id: "sample-robot-4", stream_epoch: metadata.stream_epoch });
   clock += fixtureProfile.capture_age_limit_ms;
   display.receive(frame(4));
   expect(display.displayedFrame()).toBeNull();
