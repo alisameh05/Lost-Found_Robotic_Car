@@ -1,7 +1,8 @@
 import type { EmergencyStopRequest, EmergencyStopResponse, FrontendProfile, Health, RetentionChange, RetentionPreviewRequest, Snapshot } from "@/generated/api-v1";
-import { compatibleProfile, conforms } from "@/lib/fixture-contracts";
+import { compatibleProfile } from "@/lib/fixture-contracts";
 import { pendingReview } from "@/lib/match-evidence";
 import type { ApplicationTransport, HttpRequest, ProtectedPath, ProtectedRequest, ReadEndpoint, ReadParams, ReadResult } from "@/lib/transport";
+import { conforms } from "@/lib/wire-contracts";
 import { openWorkspace, reconnectDelay, type WorkspaceView } from "./workspace";
 import { openSearchActions, searchActionKey, type SearchFeedback, type SearchIntent, unresolved } from "./search-actions";
 import { validSnapshot, withoutRemovedOwners } from "./workspace-events";
@@ -13,6 +14,7 @@ type EmergencyFeedback =
 
 type RuntimeView = {
   disconnected?: boolean;
+  recordsMode?: boolean;
   snapshot?: Snapshot;
   recordSnapshot?: Snapshot;
   failedRead?: Exclude<ReadResult<never>, { kind: "ok" }>;
@@ -32,10 +34,10 @@ type RuntimeView = {
 
 export type RegistrationAction = Pick<HttpRequest<"POST /objects">, "body" | "actionCreatedAtMs">;
 
-export function openRuntimeProjection(transport: ApplicationTransport) {
+export function openRuntimeProjection(transport: ApplicationTransport, recordsMode = false) {
   const lifetime = new AbortController();
   const subscribers = new Set<() => void>();
-  let view: RuntimeView = { loading: true };
+  let view: RuntimeView = { loading: true, recordsMode };
   let context: ProtectedRequest["context"] | undefined;
   let clock: { server: number; received: number } | undefined;
   let readRequest: AbortController | undefined;
@@ -88,14 +90,23 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     }
   }
 
-  async function refresh({ readBootstrap = false } = {}) {
-    if (lifetime.signal.aborted) return;
+  function clearRecordsView(loading: boolean) {
+    resetProtectedScope();
+    update({ connected: false, snapshot: undefined, recordSnapshot: undefined, failedRead: undefined, loading,
+      authority: (view.authority ?? 0) + 1 });
+  }
+
+  async function refresh({ readBootstrap = false, revalidate = false, background = false } = {}) {
+    if (lifetime.signal.aborted || (background && readRequest)) return;
     readRequest?.abort();
-    readRequest = new AbortController();
-    const signal = AbortSignal.any([lifetime.signal, readRequest.signal]);
-    update({ loading: true });
+    const controller = new AbortController();
+    readRequest = controller;
+    const signal = AbortSignal.any([lifetime.signal, controller.signal]);
+    if (recordsMode && revalidate) {
+      clearRecordsView(true);
+    } else if (!recordsMode || !view.connected) update({ loading: true });
     try {
-      if (!context || readBootstrap) {
+      if (!context || (readBootstrap && !recordsMode)) {
         const bootstrapStarted = performance.now();
         const bootstrap = await transport.bootstrap(signal);
         if (signal.aborted) return;
@@ -115,7 +126,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
           return;
         }
         const candidate = bootstrap.data.qualification_profile;
-        const profile = compatibleProfile(candidate) ? candidate : undefined;
+        const profile = !recordsMode && compatibleProfile(candidate) ? candidate : undefined;
         const sameAuthority = context?.backend_boot_id === bootstrap.data.backend_boot_id &&
           context.client_id === bootstrap.data.client_id && context.capability === bootstrap.data.capability;
         const sameProfile = sameAuthority && JSON.stringify(profile) === JSON.stringify(view.profile);
@@ -132,7 +143,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         }
         context = bootstrap.data;
         clock = { server: bootstrap.data.server_time_ms, received: bootstrapStarted };
-        update({ connected: true, profile: sameProfile ? view.profile : profile,
+        update({ connected: !recordsMode, profile: sameProfile ? view.profile : profile,
           ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined,
             removedOwners: undefined, removedSessionId: undefined,
             emergency: undefined, authority: (view.authority ?? 0) + 1 }),
@@ -146,6 +157,15 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         transport.request("GET /health", request).catch(unavailable),
       ]);
       if (signal.aborted) return;
+      if (recordsMode && (invalidAuthority(status) || invalidAuthority(health))) {
+        resetProtectedScope();
+        context = undefined;
+        clock = undefined;
+        update({ loading: false, connected: false, health: undefined, snapshot: undefined, recordSnapshot: undefined,
+          failedRead: { kind: "unavailable" }, authority: (view.authority ?? 0) + 1 });
+        retryBootstrap();
+        return;
+      }
       const ordered = workspace !== undefined;
       const next = status.kind === "ok" && validSnapshot(status.data, request.context.backend_boot_id)
         ? withoutRemovedOwners(status.data, view.removedOwners) : undefined;
@@ -154,11 +174,24 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
         searchActions.synchronize(next, request.context);
         reconcileEmergency(next);
       }
+      const diagnostics = health.kind === "ok" && health.data.backend_boot_id === request.context.backend_boot_id
+        ? health.data : undefined;
+      if (recordsMode && (!next || diagnostics?.storage_integrity !== "Healthy")) {
+        if (view.connected) resetProtectedScope();
+        update({ connected: false, snapshot: undefined, recordSnapshot: undefined, health: diagnostics, loading: false,
+          failedRead: status.kind === "api-error" ? status : unavailable(),
+          ...(view.connected && { authority: (view.authority ?? 0) + 1 }) });
+        return;
+      }
+      const refreshRecords = !recordsMode || (next && (
+        view.recordSnapshot?.event_seq !== next.event_seq || recordsChanged(view.recordSnapshot, next)
+      ));
       update({
-        snapshot: ordered ? view.snapshot : next ? withoutRemovedOwners(next, view.removedOwners) : view.snapshot,
-        recordSnapshot: ordered ? view.recordSnapshot : next ? withoutRemovedOwners(next, view.removedOwners) : view.recordSnapshot,
+        snapshot: ordered ? view.snapshot : next ?? view.snapshot,
+        recordSnapshot: ordered || !refreshRecords ? view.recordSnapshot : next ?? view.recordSnapshot,
         failedRead: next || view.workspace?.eventsLive ? undefined : status.kind === "ok" ? unavailable() : status,
-        health: health.kind === "ok" ? health.data : undefined,
+        health: diagnostics,
+        ...(recordsMode && { connected: true }),
         loading: false,
         ...(next && !ordered && { recovering: false, reconnectingSessionId: undefined }),
       });
@@ -166,10 +199,17 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       else if (next && !ordered) recoveryComplete();
     } catch {
       if (!signal.aborted) {
+        if (recordsMode) clearRecordsView(false);
         update({ loading: false, failedRead: { kind: "unavailable" }, health: undefined });
         if (view.recovering) retryBootstrap();
       }
+    } finally {
+      if (readRequest === controller) readRequest = undefined;
     }
+  }
+
+  function invalidAuthority(result: ReadResult<unknown>) {
+    return result.kind === "api-error" && (result.error.code === "CAPABILITY_INVALID" || result.error.code === "CLIENT_INVALID");
   }
 
   function retryBootstrap() {
@@ -237,6 +277,7 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
     const scoped = AbortSignal.any([signal, scope, protectedScope.signal, lifetime.signal]);
     const result = await load({ context, signal: scoped });
     scoped.throwIfAborted();
+    if (recordsMode && invalidAuthority(result)) void refresh();
     return result;
   }
 
@@ -292,6 +333,10 @@ export function openRuntimeProjection(transport: ApplicationTransport) {
       return () => { subscribers.delete(notify); };
     },
     refresh,
+    suspendRecords() {
+      readRequest?.abort();
+      clearRecordsView(false);
+    },
     emergency,
     serverTime,
     clearRemovedResult(sessionId: string) {

@@ -1,4 +1,6 @@
 import { expect, test } from "vitest";
+import eventContract from "../../../../backend/contracts/v1/events.json";
+import frameContract from "../../../../backend/contracts/v1/frames.json";
 import { compatibleProfile, compatibleQualification, conforms, type Definition } from "../fixture-contracts";
 import { parseFrame } from "./frame";
 import { protectedHeaders, socketOffer, type ReadResult } from "../transport";
@@ -23,6 +25,33 @@ function data<T>(result: ReadResult<T>, status = 200) {
 function contract(definition: Definition, value: unknown) {
   expect(conforms(definition, value), definition).toBe(true);
 }
+
+test("matches the backend's realtime manifest against fixture socket offers and frame bytes", () => {
+  const events = eventContract["x-laf-websocket"];
+  const frames = frameContract["x-laf-websocket"];
+  const eventsOffer = socketOffer("events", leaseId);
+  expect(eventsOffer).toEqual({ path: events.path, protocols: [events.protocol, events.ticket_offer_prefix + leaseId] });
+  expect(eventVectors[0].type).toBe(events.initial_message_type);
+  const [prefix, metadata, image] = frames.binary_envelope;
+  expect(prefix).toMatchObject({ encoding: "uint32", byte_order: "big-endian", bytes: 4 });
+  const prefixBytes = prefix.bytes;
+  if (typeof prefixBytes !== "number") throw new Error("Frame manifest is missing the length prefix width");
+  expect(metadata.encoding).toBe("UTF-8 JSON");
+  expect(image.encoding).toBe("JPEG");
+  for (const source of ["robot", "webcam"] as const) {
+    const offer = socketOffer(source === "robot" ? "robot-video" : "webcam-video", leaseId);
+    expect(frames.paths).toContain(offer.path);
+    expect(offer.protocols).toEqual([frames.protocol, frames.ticket_offer_prefix + leaseId]);
+    const binary = frameVector(source, fixtureProfile)!;
+    const headerBytes = new DataView(binary.buffer).getUint32(0);
+    const imageOffset = prefixBytes + headerBytes;
+    const content = new TextDecoder("utf-8", { fatal: true }).decode(binary.subarray(prefixBytes, imageOffset));
+    const frame: unknown = JSON.parse(content);
+    contract("FrameMetadata", frame);
+    expect(frame).toMatchObject({ source });
+    expect(Array.from(binary.subarray(imageOffset, imageOffset + 2))).toEqual([0xff, 0xd8]);
+  }
+});
 
 test.each(scenarioIds)("validates the %s fixture's bootstrap, snapshot, health and owned records", async (scenario) => {
   const transport = createFixtureTransport({ scenario });

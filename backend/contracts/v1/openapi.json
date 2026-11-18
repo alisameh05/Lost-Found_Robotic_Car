@@ -1,0 +1,1835 @@
+{
+  "openapi": "3.1.1",
+  "info": {
+    "title": "Lost and Found API",
+    "version": "1.1"
+  },
+  "servers": [
+    {
+      "url": "http://127.0.0.1:8000/api/v1"
+    }
+  ],
+  "paths": {
+    "/bootstrap": {
+      "get": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/BootstrapResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [],
+        "x-laf-records-runtime": true
+      }
+    },
+    "/websocket-tickets": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/TicketResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/TicketRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/control-lease": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeaseAcquire"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/control-lease/release": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Persistence pending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/LeaseResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/LeaseRelease"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/health": {
+      "get": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Health"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Diagnostics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/Health"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": true
+      }
+    },
+    "/snapshot": {
+      "get": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-App-Client-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Snapshot"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": true
+      }
+    },
+    "/objects": {
+      "get": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-App-Client-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            }
+          },
+          {
+            "name": "name",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "description": "At most 120 code points after trimming Unicode whitespace and normalizing to NFC."
+            }
+          },
+          {
+            "name": "status",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "enum": [
+                "Lost",
+                "Found"
+              ]
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/ObjectPage"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": true
+      },
+      "post": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-App-Client-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          },
+          {
+            "name": "X-Action-Created-At-Ms",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "$ref": "#/components/schemas/UtcMs"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutationResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Persistence pending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutationResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "multipart/form-data": {
+              "schema": {
+                "type": "object",
+                "additionalProperties": false,
+                "required": [
+                  "action_id",
+                  "name",
+                  "roi",
+                  "reference_image"
+                ],
+                "properties": {
+                  "action_id": {
+                    "$ref": "#/components/schemas/RequestId"
+                  },
+                  "name": {
+                    "$ref": "#/components/schemas/Name"
+                  },
+                  "roi": {
+                    "type": "string",
+                    "contentMediaType": "application/json",
+                    "contentSchema": {
+                      "$ref": "#/components/schemas/Rect"
+                    }
+                  },
+                  "reference_image": {
+                    "type": "string",
+                    "format": "binary"
+                  }
+                }
+              },
+              "encoding": {
+                "roi": {
+                  "contentType": "text/plain; charset=utf-8"
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/objects/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Object"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false
+      }
+    },
+    "/objects/{id}/sessions": {
+      "get": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          },
+          {
+            "name": "X-App-Client-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/SessionPage"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false
+      }
+    },
+    "/sessions": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "201": {
+            "description": "Created",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutationResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "Location": {
+                "schema": {
+                  "type": "string"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Persistence pending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutationResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/StartRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/sessions/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Session"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false
+      }
+    },
+    "/sessions/{id}/matches": {
+      "get": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          },
+          {
+            "name": "X-App-Client-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          },
+          {
+            "name": "limit",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "integer",
+              "minimum": 1,
+              "maximum": 100,
+              "default": 25
+            }
+          },
+          {
+            "name": "cursor",
+            "in": "query",
+            "required": false,
+            "schema": {
+              "type": "string",
+              "pattern": "^[A-Za-z0-9_-]{43}$"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MatchPage"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false
+      }
+    },
+    "/sessions/{id}/actions": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutationResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Persistence pending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutationResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/SessionAction"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/emergency-stop": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmergencyStopResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Persistence pending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/EmergencyStopResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "503": {
+            "description": "Diagnostics",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "oneOf": [
+                    {
+                      "$ref": "#/components/schemas/EmergencyStopResponse"
+                    },
+                    {
+                      "$ref": "#/components/schemas/Error"
+                    }
+                  ]
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/EmergencyStopRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/settings": {
+      "get": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Settings"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": true
+      }
+    },
+    "/settings/retention-preview": {
+      "post": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-App-Client-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/RetentionPreview"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetentionPreviewRequest"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/settings/retention": {
+      "put": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "X-App-Client-Id",
+            "in": "header",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutationResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "202": {
+            "description": "Persistence pending",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/MutationResponse"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false,
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "$ref": "#/components/schemas/RetentionChange"
+              }
+            }
+          }
+        }
+      }
+    },
+    "/media/{id}": {
+      "get": {
+        "parameters": [
+          {
+            "name": "Origin",
+            "in": "header",
+            "required": false,
+            "schema": {
+              "type": "string"
+            }
+          },
+          {
+            "name": "id",
+            "in": "path",
+            "required": true,
+            "schema": {
+              "type": "string",
+              "minLength": 1,
+              "maxLength": 128,
+              "pattern": "^[A-Za-z0-9_-]+$"
+            }
+          }
+        ],
+        "responses": {
+          "default": {
+            "description": "API failure",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "$ref": "#/components/schemas/Error"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              }
+            }
+          },
+          "200": {
+            "description": "Success",
+            "content": {
+              "image/png": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              },
+              "image/jpeg": {
+                "schema": {
+                  "type": "string",
+                  "format": "binary"
+                }
+              }
+            },
+            "headers": {
+              "Cache-Control": {
+                "schema": {
+                  "const": "no-store"
+                }
+              },
+              "X-Content-Type-Options": {
+                "schema": {
+                  "const": "nosniff"
+                }
+              },
+              "Accept-Ranges": {
+                "schema": {
+                  "const": "none"
+                }
+              }
+            }
+          }
+        },
+        "security": [
+          {
+            "Capability": []
+          }
+        ],
+        "x-laf-records-runtime": false
+      }
+    }
+  },
+  "components": {
+    "schemas": {
+      "Id": {
+        "$ref": "./schemas.json#/$defs/Id"
+      },
+      "RequestId": {
+        "$ref": "./schemas.json#/$defs/RequestId"
+      },
+      "Counter": {
+        "$ref": "./schemas.json#/$defs/Counter"
+      },
+      "UtcMs": {
+        "$ref": "./schemas.json#/$defs/UtcMs"
+      },
+      "Name": {
+        "$ref": "./schemas.json#/$defs/Name"
+      },
+      "Token": {
+        "$ref": "./schemas.json#/$defs/Token"
+      },
+      "FrontendProfile": {
+        "$ref": "./schemas.json#/$defs/FrontendProfile"
+      },
+      "ControlMode": {
+        "$ref": "./schemas.json#/$defs/ControlMode"
+      },
+      "Channel": {
+        "$ref": "./schemas.json#/$defs/Channel"
+      },
+      "Rect": {
+        "$ref": "./schemas.json#/$defs/Rect"
+      },
+      "EndReason": {
+        "$ref": "./schemas.json#/$defs/EndReason"
+      },
+      "FailureCause": {
+        "$ref": "./schemas.json#/$defs/FailureCause"
+      },
+      "PauseCause": {
+        "$ref": "./schemas.json#/$defs/PauseCause"
+      },
+      "Failure": {
+        "$ref": "./schemas.json#/$defs/Failure"
+      },
+      "Media": {
+        "$ref": "./schemas.json#/$defs/Media"
+      },
+      "Object": {
+        "$ref": "./schemas.json#/$defs/Object"
+      },
+      "Session": {
+        "$ref": "./schemas.json#/$defs/Session"
+      },
+      "Match": {
+        "$ref": "./schemas.json#/$defs/Match"
+      },
+      "Settings": {
+        "$ref": "./schemas.json#/$defs/Settings"
+      },
+      "ErrorCode": {
+        "$ref": "./schemas.json#/$defs/ErrorCode"
+      },
+      "FieldError": {
+        "$ref": "./schemas.json#/$defs/FieldError"
+      },
+      "Error": {
+        "$ref": "./schemas.json#/$defs/Error"
+      },
+      "DeletionProgress": {
+        "$ref": "./schemas.json#/$defs/DeletionProgress"
+      },
+      "MutationResult": {
+        "$ref": "./schemas.json#/$defs/MutationResult"
+      },
+      "MutationResponse": {
+        "$ref": "./schemas.json#/$defs/MutationResponse"
+      },
+      "Operation": {
+        "$ref": "./schemas.json#/$defs/Operation"
+      },
+      "ComponentName": {
+        "$ref": "./schemas.json#/$defs/ComponentName"
+      },
+      "Component": {
+        "$ref": "./schemas.json#/$defs/Component"
+      },
+      "Readiness": {
+        "$ref": "./schemas.json#/$defs/Readiness"
+      },
+      "RuntimeState": {
+        "$ref": "./schemas.json#/$defs/RuntimeState"
+      },
+      "PublicLease": {
+        "$ref": "./schemas.json#/$defs/PublicLease"
+      },
+      "Proximity": {
+        "$ref": "./schemas.json#/$defs/Proximity"
+      },
+      "RetentionState": {
+        "$ref": "./schemas.json#/$defs/RetentionState"
+      },
+      "Snapshot": {
+        "$ref": "./schemas.json#/$defs/Snapshot"
+      },
+      "Health": {
+        "$ref": "./schemas.json#/$defs/Health"
+      },
+      "BootstrapResponse": {
+        "$ref": "./schemas.json#/$defs/BootstrapResponse"
+      },
+      "TicketRequest": {
+        "$ref": "./schemas.json#/$defs/TicketRequest"
+      },
+      "TicketResponse": {
+        "$ref": "./schemas.json#/$defs/TicketResponse"
+      },
+      "LeaseAcquire": {
+        "$ref": "./schemas.json#/$defs/LeaseAcquire"
+      },
+      "LeaseRelease": {
+        "$ref": "./schemas.json#/$defs/LeaseRelease"
+      },
+      "LeaseResponse": {
+        "$ref": "./schemas.json#/$defs/LeaseResponse"
+      },
+      "StartRequest": {
+        "$ref": "./schemas.json#/$defs/StartRequest"
+      },
+      "SessionAction": {
+        "$ref": "./schemas.json#/$defs/SessionAction"
+      },
+      "RegistrationFields": {
+        "$ref": "./schemas.json#/$defs/RegistrationFields"
+      },
+      "RetentionPreviewRequest": {
+        "$ref": "./schemas.json#/$defs/RetentionPreviewRequest"
+      },
+      "RetentionImpact": {
+        "$ref": "./schemas.json#/$defs/RetentionImpact"
+      },
+      "RetentionPreview": {
+        "$ref": "./schemas.json#/$defs/RetentionPreview"
+      },
+      "RetentionChange": {
+        "$ref": "./schemas.json#/$defs/RetentionChange"
+      },
+      "EmergencyStopRequest": {
+        "$ref": "./schemas.json#/$defs/EmergencyStopRequest"
+      },
+      "EmergencyStopResponse": {
+        "$ref": "./schemas.json#/$defs/EmergencyStopResponse"
+      },
+      "ObjectPage": {
+        "$ref": "./schemas.json#/$defs/ObjectPage"
+      },
+      "SessionPage": {
+        "$ref": "./schemas.json#/$defs/SessionPage"
+      },
+      "MatchPage": {
+        "$ref": "./schemas.json#/$defs/MatchPage"
+      },
+      "DisplayedFrame": {
+        "$ref": "./schemas.json#/$defs/DisplayedFrame"
+      },
+      "WorkspaceHeartbeat": {
+        "$ref": "./schemas.json#/$defs/WorkspaceHeartbeat"
+      },
+      "FrameMetadata": {
+        "$ref": "./schemas.json#/$defs/FrameMetadata"
+      },
+      "SessionChanged": {
+        "$ref": "./schemas.json#/$defs/SessionChanged"
+      },
+      "ReadinessChanged": {
+        "$ref": "./schemas.json#/$defs/ReadinessChanged"
+      },
+      "CandidatePending": {
+        "$ref": "./schemas.json#/$defs/CandidatePending"
+      },
+      "RecoveryChanged": {
+        "$ref": "./schemas.json#/$defs/RecoveryChanged"
+      },
+      "RetentionChanged": {
+        "$ref": "./schemas.json#/$defs/RetentionChanged"
+      },
+      "ObjectRemoved": {
+        "$ref": "./schemas.json#/$defs/ObjectRemoved"
+      },
+      "StorageFault": {
+        "$ref": "./schemas.json#/$defs/StorageFault"
+      },
+      "ProximityWarningChanged": {
+        "$ref": "./schemas.json#/$defs/ProximityWarningChanged"
+      },
+      "EventEnvelope": {
+        "$ref": "./schemas.json#/$defs/EventEnvelope"
+      },
+      "QualificationProfile": {
+        "$ref": "./schemas.json#/$defs/QualificationProfile"
+      }
+    },
+    "securitySchemes": {
+      "Capability": {
+        "type": "apiKey",
+        "in": "header",
+        "name": "X-App-Capability"
+      }
+    }
+  },
+  "x-laf-local-protection": {
+    "default_frontend_origin": "http://127.0.0.1:3000",
+    "no_origin_requires_capability": true,
+    "preflight": {
+      "status": 204,
+      "credentials": false,
+      "request_headers": [
+        "content-type",
+        "x-app-capability",
+        "x-app-client-id",
+        "x-action-created-at-ms"
+      ],
+      "vary": [
+        "Origin",
+        "Access-Control-Request-Method",
+        "Access-Control-Request-Headers"
+      ]
+    },
+    "body_limits_bytes": {
+      "json": 65536,
+      "multipart": 11534336,
+      "multipart_text": 65536,
+      "reference_image": 10485760
+    }
+  }
+}

@@ -4,7 +4,7 @@ import { createRequire } from "node:module";
 const require = createRequire(import.meta.url);
 const command = process.argv[2];
 const port = process.env.LAF_FRONTEND_PORT ?? "3000";
-if (!/^[0-9]+$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
+if (!/^[0-9]{1,5}$/.test(port) || Number(port) < 1 || Number(port) > 65535) {
   throw new Error("LAF_FRONTEND_PORT must be an integer from 1 to 65535.");
 }
 

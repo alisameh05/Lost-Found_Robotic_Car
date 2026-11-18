@@ -1,14 +1,8 @@
-import Ajv2020 from "ajv/dist/2020";
 import seed from "@/generated/api-v1.seed.json";
 import type { FrontendProfile, QualificationProfile } from "@/generated/api-v1";
+import { conforms } from "./wire-contracts";
 
-const validator = new Ajv2020({ strict: false });
-validator.addSchema(seed, "api-v1");
-export type Definition = keyof typeof seed.$defs;
-
-export function conforms(definition: Definition, value: unknown): boolean {
-  return validator.validate(`api-v1#/$defs/${definition}`, value);
-}
+export { conforms, type Definition } from "./wire-contracts";
 
 export function compatibleProfile(value: unknown): value is FrontendProfile {
   if (!conforms("FrontendProfile", value)) return false;

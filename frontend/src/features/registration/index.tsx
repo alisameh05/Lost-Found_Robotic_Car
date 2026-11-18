@@ -19,6 +19,13 @@ const labels = { x: "X", y: "Y", width: "Width", height: "Height" };
 
 export function RegistrationScreen() {
   const state = useRuntime();
+  const { recordsMode } = useRuntimeView();
+  if (recordsMode) return <>
+    <PageHeader title="Register Object" />
+    <Notice title="Registration unavailable" tone="warning">
+      This records build supports browsing and viewing saved settings. <Link href="/objects">Return to Objects</Link>.
+    </Notice>
+  </>;
   return <RegistrationForm key={state?.selection.generation} runtime={state?.connection?.runtime} />;
 }
 

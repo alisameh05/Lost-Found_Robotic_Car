@@ -1,8 +1,8 @@
 # Lost & Found frontend
 
-The fixture application runs locally on Windows with synthetic records and device observations. The fixture shell requires Node and a browser.
+The frontend runs locally on Windows. Records mode connects to the protected SQLite backend. Fixture mode uses labeled synthetic records and device observations and requires only Node and a browser.
 
-Phases 01–03 are completed at the fixture boundary. The 2026-11-17 amendment changes gesture guidance and fixture feedback to finger counts while retaining the screens, API shapes and recovery workflow. Real backend, AI, webcam/controller capture, serial devices and firmware remain phases 04–08 work; see the [roadmap](../docs/IMPLEMENTATION_PLAN.md) and [reuse/environment assessment](../docs/TRD.md#21-reuse-and-license-assessment).
+Phases 01–03 are completed at the fixture boundary. The 2026-11-17 amendment changes gesture guidance and fixture feedback to finger counts while retaining the screens, API shapes and recovery workflow. The [roadmap](../docs/IMPLEMENTATION_PLAN.md) and [reuse/environment assessment](../docs/TRD.md#21-reuse-and-license-assessment) cover the device and qualification phases.
 
 ## Setup and startup
 
@@ -25,13 +25,13 @@ In **Shared control specimens**, choose **Commit** or **Fail**, enter a sample l
 
 Choose **searching**, **paused** or **expiry grace** to exercise **Return to Active Search** and **Emergency Stop**. Try **emergency pending**, **emergency failed** and **emergency network** while the sample save is held open. The shell reports logical motion permission separately from save progress. Press **Emergency Stop** again after an unconfirmed request to retry the same request ID. The opt-in **Fixture mutation requests** log shows the dispatches accepted by the fixture adapter. **Retry snapshot** reads the current snapshot and health again.
 
-Omit `LAF_MODE` or set it to `disconnected` for the unavailable application state. The reserved backend base address is `http://127.0.0.1:8000/api/v1`. Change its port using `LAF_BACKEND_PORT`. Backend connection support is planned for a later phase. Fixture bootstrap context and the scripted cursor, preview and media paths use only in-memory synthetic values.
+Set `LAF_MODE=records` to connect to the local backend at `http://127.0.0.1:8000/api/v1`. Follow the [records setup guide](../backend/README.md) to install the backend and coordinate custom ports. Omit `LAF_MODE` or set it to `disconnected` for the unavailable application state. Fixture bootstrap context and the scripted cursor, preview and media paths use only in-memory synthetic values.
 
 Install dependencies and the test browser while online. Normal fixture use works with local assets. Node.js 24 is an LTS line and Next.js 16 supports Node.js 20.9 or later. Exact direct dependency versions, including Next.js, React, TypeScript and testing tools, are recorded in [package.json](package.json). [Node.js release schedule](https://nodejs.org/en/about/previous-releases), [Next.js installation requirements](https://nextjs.org/docs/app/getting-started/installation).
 
 ## Verification
 
-Run verification from PowerShell 7. Set the script shell for this process so npm's Windows command shims do not split the `&` in the repository path. Install the browser required by the pinned Playwright version before the first run:
+Run verification from PowerShell 7 with the [locked records environment](../backend/README.md#install) installed. Set the script shell for this process so npm's Windows command shims do not split the `&` in the repository path. Install the browser required by the pinned Playwright version before the first run:
 
 ```powershell
 $env:npm_config_script_shell = (Get-Process -Id $PID).Path
@@ -41,16 +41,16 @@ npm.cmd run verify
 
 | Command | Checks |
 | --- | --- |
-| `npm run contracts:generate` | Extract the v1 schema and endpoint catalogue from `docs/API.md` and regenerate HTTP, event and frame TypeScript types. |
+| `npm run contracts:generate` | Regenerate HTTP, event and frame TypeScript types from backend-owned exports. |
 | `npm run contracts:check` | Fail on seed or generated TypeScript drift or on fixture validation failures. |
 | `npm run lint` | Check lint and frontend import directions. |
 | `npm run typecheck` | Generate Next.js route types and check strict TypeScript. |
 | `npm test` | Verify accessible navigation, fields, pending actions and read retry, and validate fixture responses and binary vectors. |
 | `npm run contracts:fixtures` | Run the public contract and fixture checks on their own. |
 | `npm run build` | Create the local production build. |
-| `npm run test:e2e` | Test the production build on loopback ports 3100 (fixture with harness), 3101 (disconnected), and 3102 (fixture without harness). |
+| `npm run test:e2e` | Test the production build on ports 3100 (fixture with harness), 3101 (disconnected), 3102 (fixture without harness) and 3103 (records). Records tests start real temporary backends on 8110. |
 
-The seed records the API document version, its line-ending-normalized SHA-256 and the endpoint catalogue. Ajv verifies the complete Draft 2020-12 definitions against fixture payloads. The contract checks also validate relationships between resources, readiness and profile bounds, and binary frame envelopes. Deliberately invalid vectors are exercised separately. In Phase 04, replace the documentation-derived generation input with backend-owned OpenAPI plus event and frame exports. Compare wire fields, required/nullability rules, enums, limits and fixture validation against this baseline before removing the seed.
+The seed records the backend contract version and an export digest. Ajv validates fixture payloads against the published Draft 2020-12 definitions. The contract checks also validate relationships between resources, readiness and profile bounds, and binary frame envelopes. Backend tests compare these exports independently with the approved API, including the wire fields, required and nullable values, enums, and limits.
 
 Search Setup decodes bounded fixture robot frames and reports successful display through the controlling workspace heartbeat. Open Setup from an eligible Lost record, inspect the preview, then select **Acquire control** to check readiness. The opt-in Search Setup fixture controls can freeze or disconnect the preview and restore fresh frames. Registration validates JPEG and PNG files locally and saves their normalized references in fixture memory. Select **registration recovery** to exercise a failed save followed by a Pending request and a lost response. **Retry Same Request** recovers the matching receipt. Playwright uses generated images for registration checks.
 

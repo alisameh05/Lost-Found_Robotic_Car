@@ -1,4 +1,4 @@
-export { readFixtureShell } from "./read-application";
+export { readFixtureShell, readRecordsShell } from "./read-application";
 export { DashboardFixtureControls } from "./dashboard-fixture-controls";
 export { RuntimeProvider, useApplicationRead, useRefreshRuntime, useRuntime, useRuntimeRead, useRuntimeView } from "./runtime-provider";
 export type { RegistrationAction, RuntimeProjection, RuntimeView } from "./projection";

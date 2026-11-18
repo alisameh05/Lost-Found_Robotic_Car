@@ -165,7 +165,7 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
           <ArrowRight size={18} aria-hidden="true" /> Return to Search Setup
         </Link>}
       </nav>
-      {!view.disconnected && <p className={layout.sample}>Sample device observations. No live device check.</p>}
+      {!view.disconnected && !view.recordsMode && <p className={layout.sample}>Sample device observations. No live device check.</p>}
     </div>
   );
 }

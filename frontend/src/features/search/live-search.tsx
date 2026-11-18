@@ -19,10 +19,16 @@ import { ActionFeedback } from "./action-feedback";
 import { MatchReview } from "./match-review";
 import { ProximityAdvisory, RecoveryPanel } from "./recovery-panel";
 import { InputControls } from "./search-fixture-controls";
+import { SearchUnavailable } from "./search-unavailable";
 import { duration, searchMode } from "./session-facts";
 import styles from "./session.module.css";
 
 export function LiveSearchScreen({ sessionId }: { sessionId: string }) {
+  const { recordsMode } = useRuntimeView();
+  return recordsMode ? <SearchUnavailable title="Live Search Workspace" /> : <LiveSearch sessionId={sessionId} />;
+}
+
+function LiveSearch({ sessionId }: { sessionId: string }) {
   const { health, snapshot, searchActions, removedSessionId, workspace } = useRuntimeView();
   const router = useRouter();
   const stop = searchActions?.[searchActionKey("stop", sessionId)];

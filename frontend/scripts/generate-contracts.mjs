@@ -2,25 +2,25 @@ import { createHash } from "node:crypto";
 import { mkdir, readFile, writeFile } from "node:fs/promises";
 import { compile } from "json-schema-to-typescript";
 
-const source = new URL("../../docs/API.md", import.meta.url);
-const document = (await readFile(source, "utf8")).replaceAll("\r\n", "\n");
-const version = document.match(/^version: "([^"]+)"/m)?.[1];
-const section = document.match(/## 7\. JSON Schemas\n[\s\S]*?```json\n([\s\S]*?)\n```/)?.[1];
-if (!version || !section) throw new Error("Could not extract the API version and public JSON Schema.");
-const schema = JSON.parse(section);
+const path = "backend/contracts/v1";
+const source = new URL(`../../${path}/`, import.meta.url);
+const documents = await Promise.all(["openapi.json", "schemas.json", "events.json", "frames.json"].map(async (name) =>
+  (await readFile(new URL(name, source), "utf8")).replaceAll("\r\n", "\n")));
+const [openapi, schema, events, frames] = documents.map((document) => JSON.parse(document));
 const definitions = schema.$defs;
 
-const endpoints = [...document.matchAll(/^\| `((?:GET|POST|PUT|WS) \/[^ ]+)` \| (.*?) \| (.*?) \|$/gm)]
-  .map(([, route, request, response]) => ({ route, request, response }));
-if (!endpoints.length) throw new Error("Could not extract the endpoint catalogue.");
+const referenceName = (value) => value?.$ref?.split("/").at(-1);
+for (const definition of [events, events["x-laf-websocket"].incoming, frames, frames["x-laf-websocket"].bounds]) {
+  if (!definitions[referenceName(definition)]) throw new Error("Missing realtime contract schema.");
+}
 
 const provenance = {
-  path: "docs/API.md",
-  version,
-  sha256: createHash("sha256").update(document).digest("hex"),
+  path,
+  version: openapi.info.version,
+  sha256: createHash("sha256").update(documents.join("\n")).digest("hex"),
 };
-const seed = { ...schema, $comment: JSON.stringify({ ...provenance, endpoints }) };
-const bannerComment = `// Generated from ${provenance.path} v${version} (SHA-256 ${provenance.sha256}). Do not edit.`;
+const seed = { ...schema, $comment: JSON.stringify(provenance) };
+const bannerComment = `// Generated from ${path} (SHA-256 ${provenance.sha256}). Do not edit.`;
 
 // Expand object conditions into TypeScript variants while retaining the
 // original Draft 2020-12 constraints in the executable seed.
@@ -64,15 +64,17 @@ const typeDefinitions = Object.fromEntries(Object.entries(definitions).map(([nam
   return [name, choices.length === 1 ? choices[0] : { anyOf: choices }];
 }));
 
-const http = endpoints.filter(({ route }) => !route.startsWith("WS ") && route !== "GET /media/{id}").map(({ route, request, response }) => {
-  const name = response.match(/`\d+(?:\/\d+)? (\w+)`/)?.[1];
+const http = Object.entries(openapi.paths).flatMap(([path, methods]) => Object.entries(methods).flatMap(([method, operation]) => {
+  if (path === "/media/{id}") return [];
+  const route = `${method.toUpperCase()} ${path}`;
+  const success = Object.entries(operation.responses).find(([status]) => status.startsWith("2"))?.[1];
+  const name = referenceName(success?.content["application/json"].schema);
   if (!definitions[name]) throw new Error(`Missing response schema for ${route}.`);
-  const requestType = route === "POST /objects" ? "RegistrationFields"
-    : route.startsWith("GET ") ? undefined : request.match(/`(\w+)`/)?.[1];
-  if (!route.startsWith("GET ") && !requestType) throw new Error(`Could not extract request schema for ${route}.`);
-  if (requestType && !definitions[requestType]) throw new Error(`Missing request schema for ${route}.`);
-  return { route, name, requestType };
-});
+  const request = operation.requestBody?.content;
+  const requestType = request?.["multipart/form-data"] ? "RegistrationFields" : referenceName(request?.["application/json"]?.schema);
+  if (request && !definitions[requestType]) throw new Error(`Missing request schema for ${route}.`);
+  return [{ route, name, requestType }];
+}));
 const types = await compile({
   ...seed,
   title: "HttpResponses",
@@ -85,11 +87,22 @@ const types = await compile({
 const requestMap = `export interface HttpBodies {\n${http.filter(({ requestType }) => requestType).map(({ route, requestType }) =>
   `  "${route}": ${requestType};`).join("\n")}\n}`;
 const componentNames = `export const componentNames = ${JSON.stringify(definitions.ComponentName.enum)} as const;`;
+const media = openapi.paths["/media/{id}"].get.responses["200"];
+const mediaResponse = `export interface HttpMediaResponses {
+  "GET /media/{id}": {
+    bytes: Uint8Array<ArrayBuffer>;
+    headers: {
+      "Content-Type": ${Object.keys(media.content).map((mime) => JSON.stringify(mime)).join(" | ")};
+${Object.entries(media.headers).map(([name, header]) =>
+  `      ${JSON.stringify(name)}: ${JSON.stringify(header.schema.const)};`).join("\n")}
+    };
+  };
+}`;
 
 const directory = new URL("../src/generated/", import.meta.url);
 const outputs = {
   "api-v1.seed.json": JSON.stringify(seed, null, 2) + "\n",
-  "api-v1.ts": `${types.trimEnd()}\n\n${requestMap}\n\n${componentNames}\n`,
+  "api-v1.ts": `${types.trimEnd()}\n\n${requestMap}\n\n${mediaResponse}\n\n${componentNames}\n`,
 };
 
 const check = process.argv.includes("--check");
