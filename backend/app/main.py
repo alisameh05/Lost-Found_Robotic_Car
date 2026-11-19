@@ -111,10 +111,13 @@ def create_app(
             app.state.runtime = runtime
             realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked)
             startup = asyncio.create_task(runtime.initialize())
-            tasks = (
+            tasks: tuple[asyncio.Task[None], ...] = (
                 asyncio.create_task(realtime.capture()), asyncio.create_task(realtime.maintain_projection()),
                 asyncio.create_task(realtime.maintain_control()),
+                asyncio.create_task(runtime.maintain_safety_storage(realtime)),
             ) if simulation else ()
+            if simulation and simulation.inference:
+                tasks += (asyncio.create_task(realtime.maintain_inference()),)
             try:
                 yield
             finally:

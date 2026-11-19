@@ -1,8 +1,9 @@
 """Versioned fixture composition and bounded observations for the connected preview."""
 
 import json
+import math
 import re
-from collections.abc import Mapping
+from collections.abc import Callable, Mapping
 from dataclasses import dataclass
 from hashlib import sha256
 from io import BytesIO
@@ -15,6 +16,7 @@ from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from PIL import Image
 
 from .http import BODY_LIMIT, HttpError, json_fields, reject_nonfinite
+from .motion import CommandSink, InputSample, InputScope, controller_intent, gesture_intent
 from .registration_input import SAFE_INTEGER
 
 FIXTURES = Path(__file__).with_name("preview_fixture")
@@ -104,10 +106,84 @@ class Observation:
     inference: bool
     controller_sample_at: float | None = None
     gesture_sample_at: float | None = None
+    controller_input: InputSample | None = None
+    gesture_input: InputSample | None = None
+    proximity: "ProximitySample | None" = None
 
 
 class PreviewAdapter(Protocol):
-    def observe(self, now: float) -> Observation: ...
+    def observe(self, now: float, scope: InputScope | None = None) -> Observation: ...
+
+
+@dataclass(frozen=True)
+class ProximitySample:
+    source_epoch: str
+    sequence: int
+    observed_at: float
+    distance_mm: int | None
+
+
+class ProximityAdvisory:
+    def __init__(self, profile: QualificationProfile):
+        self.profile = profile
+        self.latest: ProximitySample | None = None
+        self.clear_count = 0
+        self.payload: dict[str, object] = {
+            "state": "Unknown", "warning_latched": False, "distance_mm": None,
+            "sample_seq": None, "source_epoch": None, "observed_at_ms": None,
+        }
+
+    def observe(self, sample: ProximitySample | None, now: float, utc: int) -> None:
+        if sample is None:
+            self.expire(now)
+            return
+        previous = self.latest
+        limit = self.profile.bound("proximity_sample_deadline_ms") / 1000
+        if (previous and type(sample.sequence) is int and sample.source_epoch == previous.source_epoch
+                and sample.sequence <= previous.sequence):
+            self.expire(now)
+            return
+        if (not isinstance(sample.source_epoch, str) or not ID.fullmatch(sample.source_epoch) or type(sample.sequence) is not int
+                or not 1 <= sample.sequence <= SAFE_INTEGER or not math.isfinite(sample.observed_at)
+                or not 0 <= now - sample.observed_at < limit
+                or (previous is not None and sample.observed_at <= previous.observed_at)):
+            self.unknown()
+            return
+        if (previous is None or sample.source_epoch != previous.source_epoch
+                or sample.sequence != previous.sequence + 1 or sample.observed_at - previous.observed_at >= limit):
+            self.clear_count = 0
+        self.latest = sample
+        distance = sample.distance_mm
+        state = self.payload["state"]
+        latched = self.payload["warning_latched"]
+        if type(distance) is not int or not 0 <= distance <= self.profile.bound("proximity_max_distance_mm"):
+            self.unknown()
+            return
+        if distance <= self.profile.bound("proximity_warning_mm"):
+            state, latched = "Warning", True
+        if distance >= self.profile.bound("proximity_clear_mm"):
+            count = self.profile.bound("proximity_clear_samples")
+            self.clear_count = min(count, self.clear_count + 1)
+            if self.clear_count == count:
+                state, latched = "Clear", False
+        else:
+            self.clear_count = 0
+        if latched:
+            state = "Warning"
+        self.payload = {
+            "state": state, "warning_latched": latched, "distance_mm": distance,
+            "sample_seq": sample.sequence, "source_epoch": sample.source_epoch,
+            "observed_at_ms": max(0, utc - math.ceil((now - sample.observed_at) * 1000)),
+        }
+
+    def unknown(self) -> None:
+        self.clear_count = 0
+        self.payload = {**self.payload, "state": "Unknown", "distance_mm": None,
+                        "sample_seq": None, "source_epoch": None, "observed_at_ms": None}
+
+    def expire(self, now: float) -> None:
+        if self.latest and now - self.latest.observed_at >= self.profile.bound("proximity_sample_deadline_ms") / 1000:
+            self.unknown()
 
 
 @dataclass(frozen=True)
@@ -140,22 +216,42 @@ class StaticScene:
         self._samples = (robot, webcam)
         self._epochs = (token_urlsafe(18), token_urlsafe(18))
         self._sequence = 0
+        self._scope: InputScope | None = None
+        self._scope_started = 0.0
 
-    def observe(self, now: float) -> Observation:
+    def observe(self, now: float, scope: InputScope | None = None) -> Observation:
         self._sequence += 1
         robot, webcam = (
             Capture(epoch, epoch, self._sequence, int(now * 1_000_000), now, 1, sample.width, sample.height,
                     sample.jpeg)
             for epoch, sample in zip(self._epochs, self._samples, strict=True)
         )
-        return Observation(robot, webcam, command=True, controller=True, inference=True,
-                           controller_sample_at=now, gesture_sample_at=now)
+        if scope != self._scope:
+            self._scope, self._scope_started = scope, now
+        elapsed = now - self._scope_started
+        held = 1.2 <= elapsed < 4.2
+        return Observation(
+            robot, webcam, command=True, controller=True, inference=True,
+            controller_sample_at=now, gesture_sample_at=now,
+            controller_input=InputSample(scope, now, controller_intent(("forward",) if held else ())) if scope else None,
+            gesture_input=InputSample(scope, now, gesture_intent(1 if held else 0)) if scope else None,
+            proximity=ProximitySample(self._epochs[0], self._sequence, now, 120 if held else 300) if scope else None,
+        )
+
+
+@dataclass(frozen=True)
+class InferenceSample:
+    scope: InputScope | None
+    frame_id: str | None
+    capture: Capture | None
 
 
 @dataclass(frozen=True)
 class Simulation:
     profile: QualificationProfile
     adapter: PreviewAdapter
+    command_sink: CommandSink | None = None
+    inference: Callable[[InferenceSample], bool] | None = None
 
 
 def load_simulation(selection: str | None) -> Simulation | None:

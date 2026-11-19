@@ -293,6 +293,15 @@ class RecordsStorage:
         except (OSError, sqlite3.Error):
             return Inspection(problem="Records storage cannot be read. Check local storage and restart the backend.")
 
+    def safety_storage_healthy(self, preparing: Collection[str]) -> bool:
+        # Health for live permission must never wait for the serialized writer.
+        try:
+            with self.connect() as db, read_transaction(db):
+                now, valid = self.now()
+                return valid and not self._inspect(db, now, preparing).problem
+        except (OSError, sqlite3.Error):
+            return False
+
     def now(self) -> tuple[int, bool]:
         with self._clock_lock:
             wall = self.clock()

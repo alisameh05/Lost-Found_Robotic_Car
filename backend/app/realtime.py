@@ -10,6 +10,7 @@ from dataclasses import dataclass, field
 from hashlib import sha256
 from secrets import compare_digest, token_urlsafe
 from typing import Literal, cast
+from uuid import uuid4
 
 from fastapi import Request, WebSocket
 from PIL import Image
@@ -33,10 +34,13 @@ from .control import (
     token,
 )
 from .http import DOMAIN_ID, HEADER_LIMIT, HttpError, authorize_address, header, json_fields, read_json
+from .motion import FixtureCommandSink, InputScope, Motion
 from .registration_input import SAFE_INTEGER, canonical_json
 from .simulation import (
     SOURCES,
     Capture,
+    InferenceSample,
+    ProximityAdvisory,
     QualificationProfile,
     Simulation,
     Source,
@@ -57,7 +61,21 @@ CAPTURE_INTERVAL = 0.1
 PROJECTION_INTERVAL = 0.25
 Projection = dict[str, object]
 EventKind = Literal["snapshot", "session_changed", "recovery_changed", "readiness_changed",
-                    "retention_changed", "storage_fault", "object_removed"]
+                    "retention_changed", "storage_fault", "object_removed", "proximity_warning_changed"]
+PATH_FAILURES = {
+    "Command": "CommandUnavailable", "AI": "AIUnavailable", "RobotVideo": "RobotVideoUnavailable",
+    "Controller": "InputUnavailable", "Webcam": "InputUnavailable", "Storage": "StorageFault",
+}
+REVOCATION_FAILURES = {
+    "EventConnectionLost": "WorkspaceDisconnected", "RobotVideoLost": "RobotVideoUnavailable",
+    "CameraEpochChanged": "CameraEpochChanged", "WorkspaceHidden": "WorkspaceHidden",
+    "WorkspaceUnfocused": "WorkspaceUnfocused", "WorkspaceUnusable": "WorkspaceUnusable",
+    "HeartbeatExpired": "HeartbeatExpired", "DisplayStale": "DisplayStale",
+    "ProtocolMismatch": "ProtocolMismatch", "InputUnavailable": "InputUnavailable",
+    "AIUnavailable": "AIUnavailable", "StorageUnavailable": "StorageFault", "StorageFault": "StorageFault",
+    "CommandUnavailable": "CommandUnavailable", "CommandExpired": "CommandExpired",
+    "RobotVideoUnavailable": "RobotVideoUnavailable",
+}
 
 
 @dataclass(repr=False)
@@ -140,6 +158,8 @@ class Realtime:
         project: Callable[[], Awaitable[Projection | None]],
         invalidate: Callable[[str, Channel], None], expire_clients: Callable[[], None],
         on_control_revoked: Callable[[Revocation], None],
+        on_failure_changed: Callable[[Projection], None],
+        on_simulated_emergency: Callable[[], None],
     ):
         self.simulation = simulation
         self.unavailable_code = unavailable_code
@@ -151,6 +171,8 @@ class Realtime:
         self.invalidate = invalidate
         self.expire_clients = expire_clients
         self.on_control_revoked = on_control_revoked
+        self.on_failure_changed = on_failure_changed
+        self.on_simulated_emergency = on_simulated_emergency
         self.sequence = 1
         self._tickets: dict[bytes, Ticket] = {}
         self._connections: dict[tuple[str, Channel], Connection] = {}
@@ -164,14 +186,32 @@ class Realtime:
         self._starting_session: str | None = None
         self._active_session: str | None = None
         self._active_owner: str | None = None
+        self._active_mode: str | None = None
+        self._active_state: str | None = None
         self.active_revision: int | None = None
         self.emergency_requests: set[str] = set()
-        self.failure: Projection | None = None
+        self._failures: dict[str, Projection] = {}
+        self._outstanding: dict[tuple[str | None, str], str] = {}
         self._receipts: dict[str, LeaseReceipt] = {}
         self._projection: Projection | None = None
         self._projection_lock = asyncio.Lock()
         self._projection_revision = 0
         self._closed = False
+        self._storage_ready = False
+        self._storage_until = 0.0
+        self._inference_until = 0.0
+        self._motion = None
+        self._proximity = None
+        self._fixture_sink = None
+        self._published_permission = "Disarmed"
+        if simulation:
+            self._proximity = ProximityAdvisory(simulation.profile)
+            if simulation.command_sink is None:
+                self._fixture_sink = FixtureCommandSink(simulation.profile, monotonic)
+                self._fixture_sink.start()
+            sink = simulation.command_sink or self._fixture_sink
+            assert sink is not None
+            self._motion = Motion(sink, simulation.profile)
 
     @property
     def profile(self) -> QualificationProfile | None:
@@ -217,7 +257,7 @@ class Realtime:
             raise HttpError(409, "OWNERSHIP_MISMATCH", "The active search changed.")
         if mode:
             self.requires_profile()
-            required = ("Command", "RobotVideo", "AI", "Webcam" if mode == "Gestures" else "Controller")
+            required = ("Command", "RobotVideo", "AI", "Storage", "Webcam" if mode == "Gestures" else "Controller")
             if (not lease.workspace or not lease.displayed or
                     any(self.component_cause(name) is not None for name in required)):
                 raise HttpError(503, "NOT_READY", "Restore the required search paths and displayed preview.", True)
@@ -240,6 +280,8 @@ class Realtime:
             self._pause_required_for = None
 
     def suspend_search(self, session: str) -> None:
+        if self._motion:
+            self._motion.stop("SearchSuspended")
         self._pause_required_for = session
         if self._projection is not None:
             self._publish("readiness_changed", None)
@@ -257,6 +299,8 @@ class Realtime:
         if session["state"] != "Ended":
             self._active_session = str(session["id"])
             self._active_owner = str(session["object_id"])
+            self._active_mode = str(session["control_mode"])
+            self._active_state = str(session["state"])
             self.active_revision = cast(int, session["revision"])
             return
         self.search_ended(str(session["id"]))
@@ -264,15 +308,18 @@ class Realtime:
     def search_ended(self, session: str) -> None:
         if self._active_session == session:
             self._active_session = self._active_owner = None
+            self._active_mode = self._active_state = None
             self.active_revision = None
         if self._pause_required_for == session:
             self._pause_required_for = None
-        if self.failure is not None and self.failure["session_id"] == session:
-            self.failure = None
+        self._failures = {key: failure for key, failure in self._failures.items() if failure["session_id"] != session}
+        self._outstanding = {key: value for key, value in self._outstanding.items() if key[0] != session}
         if self._lease is not None and self._lease.session == session:
             self._revoke("SessionEnded")
 
     def _revoke(self, reason: str, request_id: str | None = None) -> None:
+        if self._motion:
+            self._motion.stop(reason)
         lease, self._lease = self._lease, None
         if lease is None:
             return
@@ -280,6 +327,8 @@ class Realtime:
         session = lease.session or self._starting_session
         if session is not None and reason != "SessionEnded":
             self._pause_required_for = session
+        if cause := REVOCATION_FAILURES.get(reason):
+            self.record_failure(cause, session, publish=False)
         if reason != "SessionEnded":
             # A new generation needs its public lease snapshot before any correlated delta.
             self._publish_snapshot()
@@ -288,17 +337,55 @@ class Realtime:
     def _expire_lease(self, now: float) -> None:
         lease = self._lease
         if lease is not None:
-            if now >= lease.heartbeat_deadline:
-                self._revoke("HeartbeatExpired")
-            elif now >= lease.display_deadline:
+            if now >= lease.display_deadline and lease.display_deadline <= lease.heartbeat_deadline:
                 self._revoke("DisplayStale")
+            elif now >= lease.heartbeat_deadline:
+                self._revoke("HeartbeatExpired")
 
     async def maintain_control(self) -> None:
         profile = self.requires_profile()
-        interval = min(50, profile.bound("heartbeat_deadline_ms"), profile.bound("display_deadline_ms")) / 2000
+        interval = min(20, profile.bound("command_renewal_interval_ms") / 4,
+                       profile.bound("heartbeat_deadline_ms") / 2, profile.bound("display_deadline_ms") / 2) / 1000
         while not self._closed:
-            self._expire_lease(self.monotonic())
+            now = self.monotonic()
+            self._evaluate_motion(now)
+            if self._proximity:
+                before = self._proximity.payload
+                self._proximity.expire(now)
+                self._publish_proximity(before)
             await asyncio.sleep(interval)
+
+    def _input_scope(self) -> InputScope | None:
+        lease = self._lease
+        if lease and lease.session and lease.session == self._active_session:
+            return InputScope(self.boot, lease.session, self._generation)
+        return None
+
+    def _motion_scope(self) -> InputScope | None:
+        lease = self._lease
+        if (lease and lease.workspace and lease.displayed and not lease.setup_handoff
+                and self._active_state == "Searching" and self._pause_required_for != self._active_session):
+            return self._input_scope()
+        return None
+
+    def _evaluate_motion(self, now: float) -> None:
+        self._expire_lease(now)
+        scope = self._motion_scope()
+        if scope and self._motion:
+            selected = self._selected_input()
+            assert selected is not None
+            required = ("RobotVideo", "Command", selected, "AI", "Storage")
+            failed = next((PATH_FAILURES[name] for name in required if self.component_cause(name)), None)
+            if failed or (failed := self._motion.tick(scope, now, self.monotonic)):
+                self._revoke(failed)
+        self._publish_permission()
+
+    def _publish_permission(self) -> None:
+        permission = self._motion.permission if self._motion else "Disarmed"
+        if self._published_permission != permission:
+            self._published_permission = permission
+            if self._projection is not None:
+                self._publish("readiness_changed", None)
 
     def _can_acquire(self, client: str | None) -> bool:
         return bool(client and self.profile and not self._closed and self._generation < SAFE_INTEGER - 1
@@ -434,7 +521,16 @@ class Realtime:
             return self.unavailable_code if name == "QualificationProfile" else "NOT_READY"
         if name == "QualificationProfile":
             return None
-        if name in ("Webcam", "Controller") and self.monotonic() >= self._input_deadlines.get(name, 0):
+        now = self.monotonic()
+        if name == "Storage":
+            return None if self._storage_ready and now < self._storage_until else "STORAGE_UNAVAILABLE"
+        if name == "RobotVideo":
+            frame = self._frames.get("robot")
+            if "robot" not in self._live_sources or frame is None or frame.age(now) >= self.profile.bound("capture_age_limit_ms"):
+                return "NOT_READY"
+        if name == "AI" and self.simulation and self.simulation.inference and now >= self._inference_until:
+            return "NOT_READY"
+        if name in ("Webcam", "Controller") and now >= self._input_deadlines.get(name, 0):
             return "NOT_READY"
         return None if self._readiness.get(name, False) else "NOT_READY"
 
@@ -447,21 +543,20 @@ class Realtime:
             del self._connections[key]
             self._invalidate_channel(*key)
 
-    def _invalidate_channel(self, client: str, channel: Channel) -> None:
+    def _invalidate_channel(self, client: str, channel: Channel, reason: str | None = None) -> None:
         if self._lease and self._lease.client == client:
             if channel == "events":
-                self._revoke("EventConnectionLost")
+                self._revoke(reason or "EventConnectionLost")
             elif channel == "robot-video":
-                self._revoke("RobotVideoLost")
+                self._revoke(reason or "RobotVideoLost")
             elif channel == "webcam-video" and self._selected_input() == "Webcam":
-                self._revoke("RequiredPathUnavailable")
+                self._revoke("InputUnavailable")
         self.invalidate(client, channel)
 
     def _selected_input(self) -> str | None:
-        session = self._projection.get("active_session") if self._projection else None
-        if not self._lease or not isinstance(session, dict) or session["id"] != self._lease.session:
+        if not self._active_mode or not self._active_session:
             return None
-        return "Webcam" if session["control_mode"] == "Gestures" else "Controller"
+        return "Webcam" if self._active_mode == "Gestures" else "Controller"
 
     def _envelope(self, kind: EventKind, payload: object) -> bytes:
         session = (payload.get("session") if kind == "session_changed" and isinstance(payload, dict)
@@ -530,12 +625,12 @@ class Realtime:
         next_state["event_seq"] = self.sequence
         self._projection = next_state
         session = next_state["active_session"]
-        next_state["failures"] = [self.failure] if self.failure and next_state["session_id"] == self.failure["session_id"] else []
+        next_state["failures"] = self.failures_for(cast(str | None, next_state["session_id"]))
         if isinstance(session, dict):
-            self._active_session = str(session["id"])
-            self._active_owner = str(session["object_id"])
-            self.active_revision = cast(int, session["revision"])
+            self.search_committed(session)
         elif not next_state["storage_problem"]:
+            if self._active_session:
+                self.search_ended(self._active_session)
             self._active_session = self._active_owner = None
             self.active_revision = None
         if self._pause_required_for is not None and not next_state["storage_problem"] and (
@@ -571,11 +666,63 @@ class Realtime:
             return "Paused"
         return state or "Idle"
 
-    def set_failure(self, failure: Projection) -> None:
-        self.failure = failure
-        if self._projection is not None and failure["session_id"] == self._projection["session_id"]:
-            self._projection["failures"] = [failure]
-            self._publish("recovery_changed", {"failures": [failure], "runtime": self._runtime(self._projection)})
+    def failures_for(self, session: str | None) -> list[Projection]:
+        return [failure for failure in self._failures.values() if failure["session_id"] == session]
+
+    def failure_for(self, session: str | None, cause: str) -> Projection | None:
+        identity = self._outstanding.get((session, cause))
+        return self._failures.get(identity) if identity else None
+
+    def record_failure(self, cause: str, session: str | None, *, publish: bool = True) -> Projection:
+        if previous := self.failure_for(session, cause):
+            return previous
+        identity = uuid4().hex
+        failure: Projection = {"failure_id": identity, "session_id": session, "cause": cause,
+                               "observed_at_ms": self.utc(), "restored": False, "acknowledged": False}
+        self._outstanding[session, cause] = identity
+        self._failures[identity] = failure
+        if session is not None and cause != "EmergencyStop":
+            self.on_failure_changed(failure)
+        if publish:
+            self._publish_failures()
+        return failure
+
+    def _publish_failures(self) -> None:
+        if self._projection is not None:
+            failures = self.failures_for(cast(str | None, self._projection["session_id"]))
+            self._projection["failures"] = failures
+            self._publish("recovery_changed", {"failures": failures, "runtime": self._runtime(self._projection)})
+
+    def _restore_failures(self) -> None:
+        lease = self._lease
+        workspace = bool(lease and lease.workspace)
+        displayed = bool(workspace and lease and lease.displayed)
+        available = {
+            "WorkspaceDisconnected": workspace, "WorkspaceHidden": workspace, "WorkspaceUnfocused": workspace,
+            "WorkspaceUnusable": workspace, "HeartbeatExpired": workspace, "DisplayStale": displayed,
+            "ProtocolMismatch": workspace, "RobotVideoUnavailable": self.component_cause("RobotVideo") is None,
+            "CameraEpochChanged": displayed,
+            "InputUnavailable": self.component_cause(self._selected_input() or "Webcam") is None,
+            "CommandExpired": self.component_cause("Command") is None,
+            "CommandUnavailable": self.component_cause("Command") is None,
+            "AIUnavailable": self.component_cause("AI") is None,
+            "StorageFault": self.component_cause("Storage") is None,
+        }
+        changed = False
+        for key, identity in tuple(self._outstanding.items()):
+            session, cause = key
+            if not available.get(cause):
+                continue
+            del self._outstanding[key]
+            if session is None:
+                del self._failures[identity]
+            else:
+                failure = {**self._failures[identity], "restored": True}
+                self._failures[identity] = failure
+                self.on_failure_changed(failure)
+            changed = True
+        if changed:
+            self._publish_failures()
 
     @staticmethod
     def _project_operation(state: Projection, operation: Projection) -> bool:
@@ -627,7 +774,7 @@ class Realtime:
             self._project_operation(state, operation)
         state.update(active_session=None if ended else session, active_object=None if ended else target,
                      session_id=None if ended else session["id"],
-                     failures=[self.failure] if self.failure and not ended else [])
+                     failures=self.failures_for(None if ended else str(session["id"])))
         runtime = cast(Projection, state["runtime"])
         runtime.update(effective_session_state=None if ended else session["state"], persistence_pending=pending)
         retention = cast(Projection, state["retention"])
@@ -640,7 +787,8 @@ class Realtime:
         self._publish("session_changed", {"session": session, "operation": operation, "runtime": self._runtime(state)})
 
     def _runtime(self, state: Projection) -> Projection:
-        runtime = {**cast(Projection, state["runtime"]), "control_generation": self._generation}
+        runtime = {**cast(Projection, state["runtime"]), "control_generation": self._generation,
+                   "motion_permission": self._motion.permission if self._motion else "Disarmed"}
         if self._pause_required_for == state["session_id"] and runtime["effective_session_state"] == "Searching":
             runtime["effective_session_state"] = "Paused"
             runtime["persistence_pending"] = True
@@ -654,7 +802,8 @@ class Realtime:
         readiness = cast(Projection, state["readiness"])
         live = {"Workspace": bool(owns and lease and lease.workspace),
                 "DisplayedRobotVideo": bool(owns and lease and lease.displayed),
-                **{name: self.component_cause(name) is None for name in ("Webcam", "Controller")}}
+                **{name: self.component_cause(name) is None for name in
+                   ("Webcam", "Controller", "RobotVideo", "Command", "AI")}}
         components = [
             {"component": name, "status": "Ready" if live[name] else "Unavailable",
              "cause_codes": [] if live[name] else ["NOT_READY"]}
@@ -668,6 +817,9 @@ class Realtime:
                               "can_start": {"Gestures": shared and statuses["Webcam"],
                                             "Controller": shared and statuses["Controller"]}}
         state["runtime"] = self._runtime(projection)
+        state["failures"] = self.failures_for(cast(str | None, projection["session_id"]))
+        if self._proximity:
+            state["proximity"] = self._proximity.payload
         state["lease"] = public_lease(lease.client if lease else None, self._generation,
                                       self._can_acquire(client) and not self.request_at_capacity())
         return state
@@ -716,30 +868,118 @@ class Realtime:
         simulation = self.simulation
         if simulation is None:
             return
+        profile = simulation.profile
+        deadline = profile.bound("input_sample_deadline_ms") / 1000
+        try:
+            while not self._closed:
+                sampled_at, scope = self.monotonic(), self._input_scope()
+                try:
+                    observation = await asyncio.to_thread(simulation.adapter.observe, sampled_at, scope)
+                except (OSError, ValueError):
+                    self._revoke("ProtocolMismatch")
+                    self._set_readiness(dict.fromkeys(PATH_FAILURES.keys() - {"Storage"}, False))
+                    await asyncio.sleep(CAPTURE_INTERVAL)
+                    continue
+                now = self.monotonic()
+                self._expire_lease(now)
+                for source, capture in zip(SOURCES, (observation.robot, observation.webcam), strict=True):
+                    self._observe_source(source, capture, now, profile)
+                for name, reported_at, sample in (
+                    ("Controller", observation.controller_sample_at, observation.controller_input),
+                    ("Webcam", observation.gesture_sample_at, observation.gesture_input),
+                ):
+                    at = reported_at
+                    if scope is not None and name == self._selected_input():
+                        if scope != self._input_scope():
+                            continue
+                        if sample is None or sample.scope != scope:
+                            if at is not None and now - at < deadline:
+                                # An invalid identity cannot refresh the last accepted deadline.
+                                continue
+                        else:
+                            at = min(sample.at, at) if at is not None else None
+                    if at is not None and math.isfinite(at) and at <= now:
+                        self._input_deadlines[name] = at + deadline
+                    else:
+                        self._input_deadlines.pop(name, None)
+                self._set_readiness({
+                    "Command": observation.command, "AI": observation.inference,
+                    "Controller": observation.controller and now < self._input_deadlines.get("Controller", now),
+                    "RobotVideo": "robot" in self._live_sources,
+                    "Webcam": "webcam" in self._live_sources and now < self._input_deadlines.get("Webcam", now),
+                })
+                motion = self._motion
+                if motion and scope and scope == self._input_scope():
+                    selected = self._selected_input()
+                    sample = observation.gesture_input if selected == "Webcam" else observation.controller_input
+                    # Circle is routed through the same latch even after a manual Pause.
+                    if (selected == "Controller" and sample and sample.scope == scope and sample.intent == "emergency"
+                            and 0 <= now - sample.at < deadline):
+                        self.on_simulated_emergency()
+                    elif scope == self._motion_scope():
+                        if lost := motion.loss(now):
+                            self._revoke(lost)
+                        else:
+                            motion.accept(scope, sample, now)
+                self._evaluate_motion(now)
+                self._restore_failures()
+                if self._proximity:
+                    before = self._proximity.payload
+                    self._proximity.observe(observation.proximity, now, self.utc())
+                    self._publish_proximity(before)
+                await asyncio.sleep(min(CAPTURE_INTERVAL, deadline / 2))
+        finally:
+            if self._motion:
+                self._motion.stop("AdapterStopped")
+
+    async def maintain_inference(self) -> None:
+        simulation = self.simulation
+        assert simulation and simulation.inference
+        limit = simulation.profile.bound("capture_age_limit_ms") / 1000
         while not self._closed:
-            now = self.monotonic()
-            observation = simulation.adapter.observe(now)
-            for source, capture in zip(SOURCES, (observation.robot, observation.webcam), strict=True):
-                self._observe_source(source, capture, now, simulation.profile)
-            deadline = simulation.profile.bound("input_sample_deadline_ms") / 1000
-            controller_time, gesture_time = observation.controller_sample_at, observation.gesture_sample_at
-            self._input_deadlines = {name: at + deadline for name, at in
-                                     (("Controller", controller_time), ("Webcam", gesture_time))
-                                     if at is not None and at <= now}
-            self._set_readiness({
-                "Command": observation.command, "AI": observation.inference,
-                "Controller": observation.controller and now < self._input_deadlines.get("Controller", now),
-                "RobotVideo": "robot" in self._live_sources,
-                "Webcam": "webcam" in self._live_sources and now < self._input_deadlines.get("Webcam", now),
-            })
+            frame = self._frames.get("robot")
+            scope = self._motion_scope()
+            if frame and "robot" in self._live_sources:
+                sample = InferenceSample(scope, frame.id if scope else None, frame.capture if scope else None)
+                started = self.monotonic()
+                try:
+                    available = await asyncio.to_thread(simulation.inference, sample)
+                except (OSError, ValueError):
+                    available = False
+                if scope == self._motion_scope() and started + limit > self.monotonic():
+                    self._inference_until = started + limit if available else 0
             await asyncio.sleep(CAPTURE_INTERVAL)
+
+    def observe_storage(self, available: bool, started: float) -> None:
+        if not self.profile:
+            return
+        was_ready = self._storage_ready
+        self._storage_ready = available
+        self._storage_until = started + self.profile.bound("capture_age_limit_ms") / 1000
+        if was_ready and not available:
+            self._path_lost("Storage")
+        if was_ready != available and self._projection is not None:
+            self._publish("readiness_changed", None)
+
+    def _publish_proximity(self, before: Projection) -> None:
+        if self._proximity and self._projection is not None and before != self._proximity.payload:
+            self._publish("proximity_warning_changed", {"proximity": self._proximity.payload})
+
+    def _path_lost(self, name: str) -> None:
+        cause = PATH_FAILURES[name]
+        if self._lease and (self.safety_session is not None or name in ("Command", "AI", "Storage")):
+            self._revoke(cause)
+        elif self.safety_session is not None:
+            self.record_failure(cause, self.safety_session)
 
     def _set_readiness(self, observations: dict[str, bool]) -> None:
         if observations == self._readiness:
             return
-        required_loss = any(self._readiness.get(name) and not available
-                            for name, available in observations.items() if name in ("Command", "AI", self._selected_input()))
+        previous = self._readiness
         self._readiness = observations
+        for name in ("Command", "AI", self._selected_input()):
+            if name and previous.get(name) and not observations[name]:
+                self._path_lost(name)
         if self._projection is not None:
             current = cast(Projection, self._projection["readiness"])
             components = cast(list[Projection], current["components"])
@@ -751,10 +991,7 @@ class Realtime:
             ]}
             if updated != current:
                 self._projection["readiness"] = updated
-                if required_loss and self._lease:
-                    self._revoke("RequiredPathUnavailable")
-                else:
-                    self._publish("readiness_changed", None)
+                self._publish("readiness_changed", None)
 
     def _observe_source(self, source: Source, capture: Capture | None, now: float,
                         profile: QualificationProfile) -> None:
@@ -764,10 +1001,13 @@ class Realtime:
         if frame:
             self._frames[source] = frame
             self._live_sources.add(source)
+            epoch_changed = bool(old and old.capture.stream_epoch != frame.capture.stream_epoch)
             for connection in tuple(self._connections.values()):
                 if connection.channel != channel:
                     continue
-                if old and old.capture.stream_epoch != frame.capture.stream_epoch:
+                if epoch_changed:
+                    if source == "robot" and self._lease and self._lease.client == connection.client:
+                        self._revoke("CameraEpochChanged")
                     self.remove(connection, 1008)
                 else:
                     connection.waiting = frame
@@ -811,6 +1051,8 @@ class Realtime:
     def stop(self, code: int = 1000) -> None:
         self._closed = True
         self._revoke("ServiceStopped")
+        if self._fixture_sink:
+            self._fixture_sink.close()
         for connection in tuple(self._connections.values()):
             self.remove(connection, code)
         self._tickets.clear()
@@ -948,6 +1190,14 @@ class Realtime:
             return False
         indication = data["displayed_robot_frame"]
         setup_heartbeat = lease.setup_handoff and data["session_id"] is None
+        for flag, reason in (("workspace_visible", "WorkspaceHidden"), ("workspace_focused", "WorkspaceUnfocused"),
+                             ("workspace_operational", "WorkspaceUnusable")):
+            if not data[flag]:
+                self._revoke(reason)
+                return True
+        if indication is None and lease.displayed and lease.session and not setup_heartbeat:
+            self._revoke("DisplayStale")
+            return True
         if indication is not None:
             video = self._connections.get((connection.client, "robot-video"))
             if (not isinstance(indication, dict) or indication.keys() != {"frame_id", "stream_epoch"}
@@ -960,9 +1210,6 @@ class Realtime:
             # The deadline is anchored to acquisition, so receiving the same identity never extends it.
             if not setup_heartbeat:
                 lease.display_deadline = frame.display_deadline
-        if not all(data[flag] for flag in WORKSPACE_FLAGS):
-            self._revoke("WorkspaceUnavailable")
-            return True
         changed = not lease.workspace or lease.displayed != (indication is not None)
         lease.heartbeat_seq = data["heartbeat_seq"]
         if setup_heartbeat:
@@ -980,24 +1227,39 @@ class Realtime:
         while not connection.close.done():
             message = await socket.receive()
             if message["type"] == "websocket.disconnect":
+                if message.get("code") in (1002, 1003, 1007, 1009):
+                    self._protocol_failure(connection)
                 return None
             value = message.get("text") if connection.channel == "events" else message.get("bytes")
             if value is None:
+                self._protocol_failure(connection)
                 return 1003
             size = len(value.encode("utf-8")) if isinstance(value, str) else len(value)
             if size > profile.bound("max_client_message_bytes"):
+                self._protocol_failure(connection)
                 return 1009
             if not isinstance(value, str):
+                self._protocol_failure(connection)
                 return 1008
             try:
                 data = json.loads(value, object_pairs_hook=json_fields, parse_constant=_reject_json_constant)
             except (ValueError, RecursionError):
+                self._protocol_failure(connection)
                 return 1007
             except HttpError:
+                self._protocol_failure(connection)
                 return 1008
             if not self._heartbeat(connection, data, profile):
+                self._protocol_failure(connection)
                 return 1008
         return None
+
+    def _protocol_failure(self, connection: Connection) -> None:
+        if self._lease and self._lease.client == connection.client and (
+            self._connections.get((connection.client, connection.channel)) is connection
+            and (connection.channel in ("events", "robot-video") or self._selected_input() == "Webcam")
+        ):
+            self._revoke("ProtocolMismatch")
 
 
 def _operation_owner(operation: Projection) -> object:

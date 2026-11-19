@@ -77,17 +77,10 @@ def advance_revision(row: sqlite3.Row) -> None:
         raise HttpError(503, "COUNTER_EXHAUSTED", "The session revision cannot advance.")
 
 
-def pause(db: sqlite3.Connection, row: sqlite3.Row, failure_id: str | None) -> None:
-    causes = json.loads(row["pause_causes"])
-    if failure_id is not None:
-        cause = {"cause": "RecoveryRequired", "failure_id": failure_id}
-        if cause in causes:
-            return
-        causes.append(cause)
-    elif row["state"] == "Paused":
+def pause(db: sqlite3.Connection, row: sqlite3.Row) -> None:
+    if row["state"] == "Paused":
         return
-    else:
-        causes.append({"cause": "ManualPause", "failure_id": None})
+    causes = [{"cause": "ManualPause", "failure_id": None}]
     advance_revision(row)
     db.execute("UPDATE sessions SET state = 'Paused', pause_causes = ?, revision = revision + 1 WHERE id = ?",
                (canonical_json(causes), row["id"]))
@@ -128,7 +121,7 @@ def save_search(
                     VALUES (?, ?, ?, 'Searching', ?, 1)
                 """, (session_id, owner, request.mode, max(now, row["registered_at_ms"])))
             elif request.action == "pause":
-                pause(db, row, None)
+                pause(db, row)
             else:
                 advance_revision(row)
                 pending = db.execute("""
@@ -169,19 +162,35 @@ def save_search(
             db.row_factory = None
 
 
-def save_safety_pause(storage: RecordsStorage, session_id: str, failure: Payload | None) -> SavedSearch:
+def save_safety_pause(storage: RecordsStorage, session_id: str, failures: tuple[Payload, ...]) -> SavedSearch:
     with storage.mutation_connection() as db, write_transaction(db):
         db.row_factory = sqlite3.Row
         try:
             row = db.execute("SELECT * FROM sessions WHERE id = ? AND state <> 'Ended'", (session_id,)).fetchone()
             if row is None:
                 return SavedSearch(None, None)
-            if failure is not None:
-                db.execute("""
-                    INSERT INTO session_emergencies (failure_id, session_id, observed_at_ms)
-                    VALUES (?, ?, ?) ON CONFLICT (failure_id) DO NOTHING
-                """, (failure["failure_id"], session_id, failure["observed_at_ms"]))
-            pause(db, row, str(failure["failure_id"]) if failure else None)
+            if not failures:
+                pause(db, row)
+            else:
+                causes = json.loads(row["pause_causes"])
+                changed = False
+                for failure in failures:
+                    updated = db.execute("""
+                        INSERT INTO session_failures (failure_id, session_id, observed_at_ms, cause, restored)
+                        VALUES (?, ?, ?, ?, ?)
+                        ON CONFLICT (failure_id) DO UPDATE SET restored = excluded.restored
+                        WHERE session_failures.restored < excluded.restored
+                    """, (failure["failure_id"], session_id, failure["observed_at_ms"], failure["cause"],
+                          failure["restored"]))
+                    if updated.rowcount:
+                        changed = True
+                        cause = {"cause": "RecoveryRequired", "failure_id": failure["failure_id"]}
+                        if cause not in causes:
+                            causes.append(cause)
+                if changed:
+                    advance_revision(row)
+                    db.execute("UPDATE sessions SET state = 'Paused', pause_causes = ?, revision = revision + 1 WHERE id = ?",
+                               (canonical_json(causes), session_id))
             storage.checkpoint("before_safety_pause_commit")
             saved = db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
             return SavedSearch(storage.session_payload(saved), saved["object_id"])
