@@ -17,6 +17,7 @@ class Config:
     data_root: Path
     frontend_port: int = 3000
     backend_port: int = 8000
+    simulation_profile: str | None = None
 
     @property
     def host(self) -> str:
@@ -50,4 +51,4 @@ class Config:
         backend = read_port("LAF_BACKEND_PORT", 8000)
         if frontend == backend:
             raise ValueError("LAF_FRONTEND_PORT and LAF_BACKEND_PORT must be different.")
-        return cls(root, frontend, backend)
+        return cls(root, frontend, backend, os.environ.get("LAF_SIMULATION_PROFILE"))

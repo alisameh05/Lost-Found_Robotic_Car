@@ -102,11 +102,14 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
   }
 
   function loseRecordsAuthority() {
+    workspace?.dispose();
+    workspace = undefined;
+    surface = undefined;
     context = undefined;
     clock = undefined;
     resetProtectedScope();
     update({ loading: false, connected: false, health: undefined, snapshot: undefined, recordSnapshot: undefined,
-      removedOwners: undefined, failedRead: { kind: "unavailable" },
+      removedOwners: undefined, profile: undefined, workspace: undefined, failedRead: { kind: "unavailable" },
       authority: (view.authority ?? 0) + 1, cursorAuthority: (view.cursorAuthority ?? 0) + 1 });
   }
 
@@ -116,7 +119,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     const controller = new AbortController();
     readRequest = controller;
     const signal = AbortSignal.any([lifetime.signal, controller.signal]);
-    if (recordsMode && revalidate) {
+    if (recordsMode && revalidate && !workspace) {
       clearRecordsView(true);
     } else if (!recordsMode || !view.connected) update({ loading: true });
     try {
@@ -142,7 +145,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
           return;
         }
         const candidate = bootstrap.data.qualification_profile;
-        const profile = !recordsMode && compatibleProfile(candidate) ? candidate : undefined;
+        const profile = compatibleProfile(candidate) ? candidate : undefined;
         const sameAuthority = context?.backend_boot_id === bootstrap.data.backend_boot_id &&
           context.client_id === bootstrap.data.client_id && context.capability === bootstrap.data.capability;
         const sameProfile = sameAuthority && JSON.stringify(profile) === JSON.stringify(view.profile);
@@ -377,7 +380,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       const reusable = sessionId && workspace?.canHandOff(sessionId) ? workspace : undefined;
       if (!reusable) workspace?.dispose();
       const active = reusable ?? openWorkspace({
-        transport, context, profile: view.profile, serverTime,
+        transport, context, profile: view.profile, serverTime, readOnly: recordsMode,
         update: (observation) => update({ workspace: observation }),
         snapshot: (next, removedOwner) => {
           if (removedOwner) removeRecords([removedOwner]);
@@ -391,9 +394,10 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
           reconcileEmergency(next);
         },
         recover: () => {
-          update({ recovering: true, reconnectingSessionId: view.snapshot?.active_session?.id });
+          update({ recovering: true, reconnectingSessionId: view.snapshot?.active_session?.id,
+            ...(recordsMode && { snapshot: undefined }) });
           searchActions.suspend();
-          resetProtectedScope();
+          if (!recordsMode) resetProtectedScope();
           if (view.emergency?.kind === "sending") update({ emergency: { kind: "unavailable" } });
           void refresh({ readBootstrap: true });
         },

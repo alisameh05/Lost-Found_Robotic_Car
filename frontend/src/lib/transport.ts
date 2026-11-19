@@ -3,7 +3,8 @@ import type {
   FrameMetadata, HttpMediaResponses, HttpResponses, Object as LostObject, Token, WorkspaceHeartbeat,
 } from "@/generated/api-v1";
 
-export type ClientContext = Pick<BootstrapResponse, "backend_boot_id" | "capability" | "client_id">;
+export type ClientContext = Pick<BootstrapResponse, "backend_boot_id" | "capability" | "client_id"> &
+  Partial<Pick<BootstrapResponse, "qualification_profile">>;
 
 export type ReadResult<T> =
   | { kind: "ok"; status: number; data: T; location?: string }

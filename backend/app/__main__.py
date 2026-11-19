@@ -22,9 +22,12 @@ def main() -> int:
                       file=sys.stderr)
                 return 1
             with own_data_root(config.data_root):
+                app = create_app(config, held_owner=True)
                 server = uvicorn.Server(uvicorn.Config(
-                    create_app(config, held_owner=True), host=LOOPBACK, port=config.backend_port,
-                    workers=1, reload=False, proxy_headers=False, access_log=False, http="httptools", ws="none",
+                    app, host=LOOPBACK, port=config.backend_port,
+                    workers=1, reload=False, proxy_headers=False, access_log=False, http="httptools", ws="websockets",
+                    ws_max_size=app.state.socket_message_limit, ws_max_queue=1, ws_per_message_deflate=False,
+                    log_level="warning",
                 ))
                 server.run(sockets=[listener])
                 return 0 if server.started else 1

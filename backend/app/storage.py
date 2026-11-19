@@ -372,7 +372,10 @@ class RecordsStorage:
             """, (uuid4().hex, owner, canonical_json(self.owned_paths(db, owner)), now))
         return bool(owners)
 
-    def purge_owner(self, db: sqlite3.Connection, operation: str, owner: str | None, encoded_paths: str) -> None:
+    def purge_owner(
+        self, db: sqlite3.Connection, operation: str, owner: str | None, encoded_paths: str,
+        on_removed: Callable[[str], None] | None,
+    ) -> None:
         paths = json.loads(encoded_paths)
         if owner is None or paths != self.owned_paths(db, owner):
             raise OSError("Purge journal does not own the recorded media")
@@ -396,11 +399,13 @@ class RecordsStorage:
         with write_transaction(db):
             db.execute("DELETE FROM objects WHERE id = ?", (owner,))
             db.execute("UPDATE storage_operations SET generated_paths = '[]' WHERE id = ?", (operation,))
+        if exists is not None and on_removed is not None:
+            on_removed(owner)
         self.checkpoint("purge_rows_removed")
         db.execute("DELETE FROM storage_operations WHERE id = ?", (operation,))
         self.checkpoint("purge_journal_removed")
 
-    def purge_expired(self, db: sqlite3.Connection) -> None:
+    def purge_expired(self, db: sqlite3.Connection, on_removed: Callable[[str], None] | None = None) -> None:
         try:
             now, _ = self.now()
             # Commit this separately so a crash or rollback during journal creation
@@ -423,7 +428,7 @@ class RecordsStorage:
                 SELECT id, owner_object_id, generated_paths FROM storage_operations WHERE kind = 'Purge'
             """).fetchall():
                 try:
-                    self.purge_owner(db, operation, owner, paths)
+                    self.purge_owner(db, operation, owner, paths, on_removed)
                 except (OSError, sqlite3.Error):
                     db.execute("""
                         UPDATE storage_operations SET phase = 'Failed', last_error_code = 'STORAGE_UNAVAILABLE'
@@ -435,7 +440,7 @@ class RecordsStorage:
             # apply the clock cutoff, and the next pass retries the durable intent.
             self._purge_fault = True
 
-    def service_retention(self) -> float:
+    def service_retention(self, on_removed: Callable[[str], None] | None = None) -> float:
         """Check deadlines and retry cleanup. The caller never needs an HTTP request."""
         try:
             with self.connect() as db, read_transaction(db):
@@ -452,7 +457,7 @@ class RecordsStorage:
             deadline = int(oldest) + duration if oldest is not None else None
             if pending or self._purge_fault or self._repair_needed or (deadline is not None and deadline <= now):
                 with self.mutation_connection() as db:
-                    self.purge_expired(db)
+                    self.purge_expired(db, on_removed)
                     if self._startup_cleanup_pending:
                         self._startup_cleanup_pending = self._inspect(db, self.now()[0], ()).cleanup_pending
                 return RETENTION_RECHECK_SECONDS

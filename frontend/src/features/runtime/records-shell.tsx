@@ -7,8 +7,9 @@ import { createHttpTransport } from "@/lib/http-transport";
 import { RuntimeProvider, useRuntimeView } from "./runtime-provider";
 
 function RecordsFrame({ children }: { children: ReactNode }) {
-  const { connected, loading, health, failedRead } = useRuntimeView();
-  const status = connected ? "Records connected · Search unavailable"
+  const { connected, loading, health, failedRead, profile } = useRuntimeView();
+  const connectedLabel = profile ? "Backend simulation · Read-only" : "Records connected · Search unavailable";
+  const status = connected ? connectedLabel
     : health?.initialization === "Starting" || loading ? "Connecting to local records" : "Local records unavailable";
   return <AppShell fixtureEnabled={false} modeLabel={status}>
     {failedRead?.kind === "api-error" && failedRead.error.code === "STORAGE_UNAVAILABLE" &&

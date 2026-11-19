@@ -1,5 +1,5 @@
 import type { FrameMetadata, FrontendProfile } from "@/generated/api-v1";
-import { conforms } from "./fixture-contracts";
+import { conforms } from "./wire-contracts";
 
 type Source = FrameMetadata["source"];
 type Frame = { metadata: FrameMetadata; jpeg: Uint8Array<ArrayBuffer> };
@@ -66,7 +66,7 @@ type DecodedFrame = { width: number; height: number; close(): void };
 type Queued = { frame: Frame; expires: number };
 
 export function openFrameDisplay<Image extends DecodedFrame>({
-  profile, source, serverTime, monotonic, decode, present, changed, epochChanged,
+  profile, source, serverTime, monotonic, decode, present, changed, epochChanged, timingLost,
 }: {
   profile: FrontendProfile;
   source: Source;
@@ -76,6 +76,7 @@ export function openFrameDisplay<Image extends DecodedFrame>({
   present(image: Image): boolean;
   changed(live: boolean): void;
   epochChanged(): void;
+  timingLost?(): void;
 }) {
   let lifetime = 0;
   let latest: FrameMetadata | undefined;
@@ -142,9 +143,15 @@ export function openFrameDisplay<Image extends DecodedFrame>({
         metadata.source_capture_us <= latest.source_capture_us)) return;
       latest = metadata;
       const time = serverTime();
-      if (time === undefined || metadata.received_at_ms > time) return;
-      const age = metadata.capture_age_bound_ms + time - metadata.received_at_ms;
-      const expires = received + Math.min(profile.capture_age_limit_ms, profile.display_deadline_ms) - age;
+      if (time === undefined) return;
+      const budget = Math.min(profile.capture_age_limit_ms, profile.display_deadline_ms);
+      if (metadata.capture_age_bound_ms >= budget) return;
+      const elapsed = time - metadata.received_at_ms;
+      if (elapsed < 0 || metadata.capture_age_bound_ms + elapsed >= budget) {
+        timingLost?.();
+        return;
+      }
+      const expires = received + budget - metadata.capture_age_bound_ms - elapsed;
       if (expires <= monotonic()) return;
       waiting = { frame, expires };
       void drain();

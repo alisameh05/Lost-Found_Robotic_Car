@@ -17,7 +17,7 @@ test.use({ baseURL: frontend });
 
 async function startBackend(options: {
   initializationGate?: string; crashAfterCommit?: boolean; registrationGate?: string; clockOffset?: string;
-  cleanupFault?: string; settingsGate?: string;
+  cleanupFault?: string; settingsGate?: string; simulation?: boolean;
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
@@ -30,6 +30,7 @@ async function startBackend(options: {
     cwd: repo, windowsHide: true, env: {
       ...process.env, LOCALAPPDATA: parent, LAF_DATA_ROOT: join(parent, "records"),
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
+      LAF_SIMULATION_PROFILE: options.simulation ? "fixture-v1" : undefined,
     },
   });
   backendProcess = child;
@@ -157,6 +158,116 @@ test("opens connected empty records and editable settings with one page identity
   expect(requests.filter((value) => value === "GET /api/v1/bootstrap")).toHaveLength(1);
   expect(requests.every((value) => /^(GET|OPTIONS) \/api\/v1\/(bootstrap|snapshot|health|objects|settings)$/.test(value))).toBe(true);
   expect(sockets).toEqual([]);
+});
+
+type PreviewProbe = { events?: WebSocket; initialSnapshot?: string; repeatFrames: boolean };
+type PreviewWindow = Window & { previewProbe: PreviewProbe };
+
+async function observePreviewFrames(page: Page) {
+  await page.addInitScript(() => {
+    const probe: PreviewProbe = { repeatFrames: false };
+    (window as unknown as PreviewWindow).previewProbe = probe;
+    const NativeSocket = window.WebSocket;
+    window.WebSocket = class extends NativeSocket {
+      constructor(url: string | URL, protocols?: string | string[]) {
+        super(url, protocols);
+        const path = new URL(url).pathname;
+        if (path === "/api/v1/events") {
+          probe.events = this;
+          this.addEventListener("message", ({ data }) => {
+            if (typeof data === "string" && JSON.parse(data).type === "snapshot") probe.initialSnapshot = data;
+          });
+        } else if (path === "/api/v1/video/robot") {
+          let previous: ArrayBuffer | undefined;
+          this.addEventListener("message", (event) => {
+            if (!event.isTrusted) return;
+            if (probe.repeatFrames && previous) {
+              event.stopImmediatePropagation();
+              this.dispatchEvent(new MessageEvent("message", { data: previous }));
+            } else if (event.data instanceof ArrayBuffer) {
+              previous = event.data;
+            }
+          });
+        }
+      }
+    };
+  });
+}
+
+test("watches a protected simulated preview from a saved Lost target across tabs and restart", async ({ page, context }) => {
+  test.setTimeout(60_000);
+  const clockOffset = join(parent, "preview-clock-offset");
+  writeFileSync(clockOffset, "0");
+  await startBackend({ simulation: true, clockOffset });
+  await observePreviewFrames(page);
+  const source = sourceImage();
+  await selectTarget(page, source, "Preview registration");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await expect(page.getByRole("heading", { name: "Object Details" })).toBeVisible();
+  const { requests, sockets } = observe(page);
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  const preview = page.getByRole("region", { name: "Simulated robot preview" });
+  await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
+  await expect(preview.getByText("Backend simulation · Disarmed")).toBeVisible();
+  await expect(preview.locator("canvas")).toHaveAttribute("width", "480");
+  await expect(page.getByRole("button", { name: "Acquire control" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Start Search" })).toBeDisabled();
+  await page.getByRole("radio", { name: "PS4 controller" }).check();
+  await expect(page.getByRole("listitem").filter({ hasText: "Laptop webcam" }).getByText("Inactive")).toBeVisible();
+  expect(sockets).toEqual(expect.arrayContaining([
+    "ws://127.0.0.1:8110/api/v1/events", "ws://127.0.0.1:8110/api/v1/video/robot",
+  ]));
+
+  const screenshot = await preview.locator("canvas").evaluate((element: HTMLCanvasElement) => element.toDataURL());
+  await page.evaluate(() => { (window as unknown as PreviewWindow).previewProbe.repeatFrames = true; });
+  await expect(preview.getByText("Not live", { exact: true })).toBeVisible();
+  expect(await preview.locator("canvas").evaluate((element: HTMLCanvasElement) => element.toDataURL())).toBe(screenshot);
+  await page.evaluate(() => { (window as unknown as PreviewWindow).previewProbe.repeatFrames = false; });
+  await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
+
+  const eventSockets = () => sockets.filter((url) => url.endsWith("/events")).length;
+  const connectedEvents = eventSockets();
+  await page.evaluate(() => {
+    const { events, initialSnapshot } = (window as unknown as PreviewWindow).previewProbe;
+    if (!events || !initialSnapshot) throw new Error("The event channel has no initial snapshot");
+    const snapshot = JSON.parse(initialSnapshot);
+    events.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
+      ...snapshot, event_seq: snapshot.event_seq + 2, type: "readiness_changed",
+      payload: { readiness: snapshot.payload.readiness, runtime: snapshot.payload.runtime },
+    }) }));
+  });
+  await expect.poll(eventSockets).toBeGreaterThan(connectedEvents);
+  await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
+
+  const videoSockets = () => sockets.filter((url) => url.endsWith("/video/robot")).length;
+  const connectedVideo = videoSockets();
+  writeFileSync(clockOffset, "5000");
+  await expect.poll(videoSockets).toBeGreaterThan(connectedVideo);
+  await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
+
+  const spectator = await context.newPage();
+  const spectatorTraffic = observe(spectator);
+  await spectator.goto(page.url());
+  await expect(spectator.getByText("Backend simulation · Disarmed")).toBeVisible();
+  await expect(spectator.getByText("Live preview", { exact: true })).toBeVisible();
+  await spectator.reload();
+  await expect(spectator.getByText("Live preview", { exact: true })).toBeVisible();
+  await expect(spectator.getByRole("button", { name: "Acquire control" })).toBeDisabled();
+  await spectator.close();
+  await page.bringToFront();
+
+  await stopBackend();
+  await expect(preview.getByText("Live preview", { exact: true })).toHaveCount(0);
+  await startBackend({ simulation: true, clockOffset });
+  await expect(preview.getByText("Live preview", { exact: true })).toBeVisible({ timeout: 20_000 });
+  await expect(page.getByRole("region", { name: "Saved search target" }).getByText("Preview registration")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Search" })).toBeDisabled();
+  for (const traffic of [requests, spectatorTraffic.requests]) {
+    expect(traffic.filter((request) => request.startsWith("POST ")).every(
+      (request) => request === "POST /api/v1/websocket-tickets",
+    )).toBe(true);
+  }
 });
 
 test("keeps Start, Resume and acquisition unavailable on direct routes", async ({ page }) => {

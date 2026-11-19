@@ -1,15 +1,16 @@
 from __future__ import annotations
 
+import json
 import re
 from collections.abc import Collection
 from dataclasses import dataclass
 from secrets import compare_digest
-from typing import TYPE_CHECKING
+from typing import TYPE_CHECKING, NoReturn
 from urllib.parse import parse_qsl
 
 from fastapi import Request
 from fastapi.responses import JSONResponse, Response
-from starlette.requests import ClientDisconnect
+from starlette.requests import ClientDisconnect, HTTPConnection
 
 from .config import Config
 
@@ -22,6 +23,7 @@ HEADER_LIMIT = 16_384
 QUERY_LIMIT = 8_192
 APP_HEADERS = ("content-type", "x-app-capability", "x-app-client-id", "x-action-created-at-ms")
 RECORDS_ROUTES = {
+    "/websocket-tickets": ("POST",),
     "/bootstrap": ("GET",), "/health": ("GET",), "/snapshot": ("GET",),
     "/objects": ("GET", "POST"), "/objects/{id}": ("GET",),
     "/objects/{id}/sessions": ("GET",), "/sessions/{id}": ("GET",), "/sessions/{id}/matches": ("GET",),
@@ -56,7 +58,7 @@ class HttpError(Exception):
         return JSONResponse(data, status_code=self.status)
 
 
-def header(request: Request, name: str, status: int, code: str) -> str | None:
+def header(request: HTTPConnection, name: str, status: int, code: str) -> str | None:
     values = request.headers.getlist(name)
     if len(values) > 1:
         raise HttpError(status, code, "The request contains an ambiguous header.")
@@ -75,7 +77,7 @@ def route_path(request: Request) -> str:
     return ""
 
 
-def authorize_address(request: Request, config: Config, origin_required: bool) -> None:
+def authorize_address(request: HTTPConnection, config: Config, origin_required: bool) -> None:
     host = header(request, "host", 403, "HOST_REJECTED")
     if host != config.host or "x-forwarded-host" in request.headers or "forwarded" in request.headers:
         raise HttpError(403, "HOST_REJECTED", "Use the configured local backend address.")
@@ -148,6 +150,44 @@ def body_length(request: Request, limit: int) -> int | None:
         return int(digits or "0")
     return None
 
+
+def bad_json() -> HttpError:
+    return HttpError(400, "INVALID_JSON", "Use a valid UTF-8 JSON request.")
+
+
+def json_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+    result: dict[str, object] = {}
+    for key, value in pairs:
+        if key in result:
+            raise HttpError(422, "VALIDATION_FAILED", "Duplicate JSON fields are unsupported.",
+                            field=("/", "DUPLICATE_FIELD"))
+        result[key] = value
+    return result
+
+
+def reject_nonfinite(_: str) -> NoReturn:
+    raise bad_json()
+
+
+async def read_json(request: Request) -> object:
+    length = body_length(request, BODY_LIMIT)
+    content = header(request, "content-type", 415, "UNSUPPORTED_MEDIA_TYPE") or ""
+    if not re.fullmatch(r'application/json(?:[ \t]*;[ \t]*charset=(?:utf-8|"utf-8"))?[ \t]*',
+                        content, re.IGNORECASE):
+        raise HttpError(415, "UNSUPPORTED_MEDIA_TYPE", "Use application/json with UTF-8 encoding.")
+    raw = bytearray()
+    try:
+        async for chunk in request.stream():
+            if len(raw) + len(chunk) > BODY_LIMIT:
+                raise HttpError(413, "PAYLOAD_TOO_LARGE", "The request body exceeds the supported size.")
+            raw.extend(chunk)
+        if length is not None and length != len(raw):
+            raise bad_json()
+        data = json.loads(raw.decode("utf-8"), object_pairs_hook=json_fields, parse_constant=reject_nonfinite,
+                          parse_int=lambda value: int(value) if len(value) <= 17 else 2**53)
+        return data
+    except (ValueError, RecursionError, ClientDisconnect) as exc:
+        raise bad_json() from exc
 
 async def require_empty_body(request: Request) -> None:
     length = body_length(request, BODY_LIMIT)
