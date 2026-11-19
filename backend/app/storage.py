@@ -37,6 +37,10 @@ OBJECT_ROWS = f"""
            {GRACE} AS grace, {DELETING} AS deleting
     FROM objects AS o JOIN media AS m ON m.id = o.reference_media_id
 """
+MATCH_ROWS = """
+    SELECT c.*, m.relative_path, m.byte_length, m.checksum, m.created_at_ms
+    FROM match_events AS c JOIN media AS m ON m.id = c.evidence_media_id
+"""
 SESSION_FIELDS = ("id", "object_id", "control_mode", "state", "started_at_ms", "ended_at_ms", "end_reason", "revision")
 HistoryKind = Literal["sessions", "matches"]
 
@@ -700,7 +704,9 @@ class RecordsStorage:
             items = [self.object_payload(row, days, now) for row in rows[:limit]]
         return items, (rows[limit - 1]["registered_at_ms"], rows[limit - 1]["id"]) if len(rows) > limit else None
 
-    def search_setup(self) -> tuple[dict[str, object] | None, dict[str, object] | None, bool]:
+    def search_setup(self) -> tuple[
+        dict[str, object] | None, dict[str, object] | None, dict[str, object] | None, bool,
+    ]:
         with self.connect() as db, read_transaction(db):
             db.row_factory = sqlite3.Row
             now, _ = self.now()
@@ -710,15 +716,20 @@ class RecordsStorage:
             if active is not None:
                 row = db.execute(OBJECT_ROWS + f" WHERE o.id = ? AND {ELIGIBLE}",
                                  (active["object_id"], cutoff)).fetchone()
-                return self.session_payload(active), self.object_payload(row, days, now) if row else None, False
+                if row is None:
+                    return None, None, None, False
+                pending = db.execute(MATCH_ROWS + " WHERE c.session_id = ? AND c.disposition = 'Pending'",
+                                     (active["id"],)).fetchone()
+                return (self.session_payload(active), self.object_payload(row, days, now),
+                        self.match_payload(pending) if pending else None, False)
             for path, length, checksum in db.execute(f"""
                 SELECT m.relative_path, m.byte_length, m.checksum
                 FROM objects AS o JOIN media AS m ON m.id = o.reference_media_id
                 WHERE {ELIGIBLE} AND o.status = 'Lost' AND m.lifecycle = 'Ready'
             """, (cutoff,)):
                 if self.files.read(path, length, checksum, metadata_only=True)[0] == "Available":
-                    return None, None, True
-            return None, None, False
+                    return None, None, None, True
+            return None, None, None, False
 
     @staticmethod
     def session_payload(row: sqlite3.Row) -> dict[str, object]:
@@ -895,6 +906,31 @@ class RecordsStorage:
         self.files.discard(staging)
         db.execute("DELETE FROM storage_operations WHERE id = ? AND kind = 'Prepare'", (operation,))
 
+    def prepare_media(
+        self, db: sqlite3.Connection, operation: str, owner: str, staging: str, final: str, data: bytes,
+        *, boundary: str = "",
+    ) -> str:
+        checksum = self.files.stage(staging, data)
+        self.checkpoint(boundary + "staged")
+        with write_transaction(db):
+            db.execute("""
+                INSERT INTO storage_operations
+                VALUES (?, 'Prepare', ?, ?, 'Pending', ?, NULL)
+            """, (operation, owner, canonical_json([staging, final]), self.now()[0]))
+        self.checkpoint(boundary + "journaled")
+        self.files.promote(staging, final)
+        self.checkpoint(boundary + "promoted")
+        return checksum
+
+    def discard_preparation(
+        self, db: sqlite3.Connection, operation: str, owner: str, staging: str, final: str,
+    ) -> None:
+        try:
+            self.recover_preparation(db, operation, owner, [staging, final])
+        except (OSError, sqlite3.Error):
+            self._repair_needed = True
+            raise
+
     def save_registration(self, request: Registration, reference: Reference, fingerprint: str) -> tuple[Receipt, str]:
         owner, media_id = uuid4().hex, uuid4().hex
         extension = "jpg" if reference.content_type == "image/jpeg" else "png"
@@ -903,16 +939,7 @@ class RecordsStorage:
         with self.mutation_connection() as db:
             invalid_clock_at = None
             try:
-                checksum = self.files.stage(staging, reference.data)
-                self.checkpoint("staged")
-                with write_transaction(db):
-                    db.execute("""
-                        INSERT INTO storage_operations
-                        VALUES (?, 'Prepare', ?, ?, 'Pending', ?, NULL)
-                    """, (request.action_id, owner, canonical_json([staging, final]), self.now()[0]))
-                self.checkpoint("journaled")
-                self.files.promote(staging, final)
-                self.checkpoint("promoted")
+                checksum = self.prepare_media(db, request.action_id, owner, staging, final, reference.data)
                 with write_transaction(db):
                     now, valid = self.now()
                     if not valid:
@@ -959,7 +986,7 @@ class RecordsStorage:
                 try:
                     if invalid_clock_at is not None:
                         self.persist_clock(db, invalid_clock_at)
-                    self.recover_preparation(db, request.action_id, owner, [staging, final])
+                    self.discard_preparation(db, request.action_id, owner, staging, final)
                 except (OSError, sqlite3.Error):
                     self._repair_needed = True
                     raise

@@ -171,9 +171,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     (lease.can_acquire || !!workspace.retryAcquisition);
   const canLeavePaused = session.state === "Paused" && state === "Paused" && !effective.persistence_pending;
   const waitingToLeave = leaving && (unresolved(pause) || canLeavePaused);
-  const saving = recordsMode
-    ? snapshot.operations.some(({ persistence }) => persistence === "Pending")
-    : effective.persistence_pending;
+  const saving = effective.persistence_pending || snapshot.operations.some(({ persistence }) => persistence === "Pending");
   const unsavedEmergency = failures.some(({ cause, failure_id }) => cause === "EmergencyStop" &&
     !session.pause_causes.some((pauseCause) => pauseCause.failure_id === failure_id));
   const emergencySaveFailed = unsavedEmergency && (recordsMode

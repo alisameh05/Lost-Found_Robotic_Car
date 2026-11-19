@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import replace
+from io import BytesIO
 from pathlib import Path
 from queue import Empty, Full, Queue
 from shutil import copytree
@@ -19,6 +20,7 @@ import pytest
 import uvicorn
 from fastapi.testclient import TestClient
 from jsonschema import Draft202012Validator
+from PIL import Image
 from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import ClientConnection, connect
@@ -40,7 +42,9 @@ from backend.app.motion import (
 from backend.app.realtime import Channel
 from backend.app.simulation import (
     FIXTURES,
+    CandidateObservation,
     Capture,
+    Inference,
     InferenceSample,
     Observation,
     ProximitySample,
@@ -116,6 +120,7 @@ class Observations:
         self.controller_sample = True
         self.gesture_sample = True
         self.robot = "live"
+        self.robot_jpeg: bytes | None = None
         self.latest: Capture | None = None
         self.command = True
         self.storage = True
@@ -136,7 +141,7 @@ class Observations:
             raise ValueError("Simulated incompatible adapter")
         base = self.adapter.observe(now, scope)
         if self.robot == "live":
-            self.latest = base.robot
+            self.latest = replace(base.robot, jpeg=self.robot_jpeg) if base.robot and self.robot_jpeg else base.robot
         robot = self.latest
         if self.robot == "missing":
             robot = None
@@ -304,7 +309,7 @@ def test_control_is_exclusive_and_historical_retries_do_not_reacquire(tmp_path: 
 @contextmanager
 def service(root: Path, *, blocked: bool = False, event_limit: int | None = None,
             frame_limit: int | None = None, revocations: list[Revocation] | None = None,
-            inference: Callable[[InferenceSample], bool] | None = None, blocked_connection: int = 1,
+            inference: Inference | None = None, blocked_connection: int = 1,
             checkpoint: Callable[[str], None] | None = None, wall: Callable[[], int] | None = None) -> Iterator[Loopback]:
     clock = Clock()
     simulation = load_simulation("fixture-v1")
@@ -1729,6 +1734,62 @@ def test_emergency_revokes_while_an_ordinary_writer_is_blocked(tmp_path: Path, m
         again = laf.http.post(path, headers=headers, json={"request_id": str(uuid4())})
         assert same.status_code == again.status_code == 200
         assert same.json()["failure_id"] == again.json()["failure_id"] == reply.json()["failure_id"]
+
+
+def test_candidate_saves_exact_frame_before_review(tmp_path: Path) -> None:
+    trigger, entered, release = Event(), Event(), Event()
+    sampled: list[InferenceSample] = []
+
+    def infer(sample: InferenceSample) -> bool | CandidateObservation:
+        if not trigger.is_set() or sampled or not sample.scope:
+            return True
+        assert sample.capture and sample.frame_id
+        sampled.append(sample)
+        entered.set()
+        assert release.wait(2)
+        return CandidateObservation(
+            sample.scope, sample.frame_id, sample.capture.stream_epoch, sample.capture.clock_epoch,
+            sample.capture.sequence, (2.25, 3.5, 4.0, 6.0),
+        )
+
+    with service(tmp_path, inference=infer) as laf, driving_search(laf) as (headers, driver):
+        arm(laf, headers)
+        trigger.set()
+        assert entered.wait(2)
+        try:
+            sample = sampled[0].capture
+            assert sample is not None
+            changed = BytesIO()
+            Image.new("RGB", (sample.width, sample.height), (200, 10, 30)).save(changed, format="JPEG")
+            laf.observations.robot_jpeg = changed.getvalue()
+            wait_for(laf.http, "/snapshot", headers,
+                     lambda _: driver.latest and driver.latest["capture_seq"] > sample.sequence
+                     and laf.observations.latest and laf.observations.latest.jpeg == changed.getvalue())
+        finally:
+            release.set()
+        state = wait_for(laf.http, "/snapshot", headers, lambda value: value["pending_candidate"] is not None)
+        match, session = state["pending_candidate"], state["active_session"]
+        validate("Snapshot", state)
+        assert match["frame_id"] == sampled[0].frame_id
+        assert match["stream_epoch"] == sampled[0].capture.stream_epoch
+        assert match["box"] == {"x": 2, "y": 3, "width": 5, "height": 7}
+        assert session["state"] == "Paused"
+        assert session["pause_causes"] == [{"cause": "CandidateReview", "failure_id": None}]
+        assert state["active_object"]["status"] == "Lost"
+        assert state["runtime"]["motion_permission"] == "Disarmed"
+        assert not state["readiness"]["can_resume"]
+        while (candidate := driver.messages.get(timeout=2))["type"] != "candidate_pending":
+            pass
+        validate("EventEnvelope", candidate)
+        assert candidate["session_revision"] == session["revision"]
+        assert candidate["payload"]["match"] == match
+        wait_output(laf, None)
+        media = laf.http.get(f"{API}/media/{match['evidence_media']['id']}", headers=headers)
+        assert media.status_code == 200, media.text
+        with Image.open(BytesIO(media.content)) as png, Image.open(BytesIO(sampled[0].capture.jpeg)) as jpeg:
+            assert png.format == "PNG"
+            assert png.size == jpeg.size
+            assert png.convert("RGB").tobytes() == jpeg.convert("RGB").tobytes()
 
 
 def test_inference_stall_cannot_renew_held_motion(tmp_path: Path) -> None:

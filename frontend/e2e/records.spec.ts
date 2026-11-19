@@ -1,9 +1,10 @@
 import { expect, test, type Page } from "@playwright/test";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
 import { existsSync, linkSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
-import { rm } from "node:fs/promises";
+import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { SessionAction } from "../src/generated/api-v1";
 
 const frontend = "http://127.0.0.1:3103";
 const backend = "http://127.0.0.1:8110/api/v1";
@@ -18,12 +19,14 @@ test.use({ baseURL: frontend });
 async function startBackend(options: {
   initializationGate?: string; crashAfterCommit?: boolean; registrationGate?: string; clockOffset?: string;
   cleanupFault?: string; settingsGate?: string; stopGate?: string; simulation?: boolean;
+  reviewSimulation?: boolean; crashCandidate?: boolean;
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
     : options.registrationGate ? ["backend.tests.crash_registration", "journaled", options.registrationGate]
     : options.settingsGate ? ["backend.tests.crash_registration", "retention_before_commit", options.settingsGate]
     : options.stopGate ? ["backend.tests.crash_registration", "before_stop_commit", options.stopGate]
+    : options.crashCandidate ? ["backend.tests.crash_registration", "candidate_promoted"]
     : options.clockOffset ? ["backend.tests.crash_registration", "clock", options.clockOffset,
       ...(options.cleanupFault ? ["deny-purge", options.cleanupFault] : [])]
     : ["backend.app"];
@@ -31,7 +34,7 @@ async function startBackend(options: {
     cwd: repo, windowsHide: true, env: {
       ...process.env, LOCALAPPDATA: parent, LAF_DATA_ROOT: join(parent, "records"),
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
-      LAF_SIMULATION_PROFILE: options.simulation ? "fixture-v1" : undefined,
+      LAF_SIMULATION_PROFILE: options.reviewSimulation ? "fixture-review-v1" : options.simulation ? "fixture-v1" : undefined,
     },
   });
   backendProcess = child;
@@ -1230,3 +1233,137 @@ test("marks the last connected Workspace frame Not live and stops a held command
   await expect(robot.getByText("Live sample", { exact: true })).toBeVisible();
   await expect(feedback.getByText("Motion permission · Disarmed", { exact: true })).toBeVisible();
 });
+
+async function startReviewSearch(page: Page, mode: "Gestures" | "PS4 controller") {
+  await selectTarget(page, sourceImage(), "Review target");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  await page.getByRole("radio", { name: mode }).check();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  await page.getByRole("button", { name: "Start Search" }).click();
+  await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
+  return new URL(page.url()).pathname.replace(/\/live$/, "");
+}
+
+async function replayReviewAction(page: Page, action: SessionAction) {
+  return page.evaluate(async ({ backend, action }) => {
+    const bootstrap = await fetch(`${backend}/bootstrap`).then((response) => response.json());
+    const client_id = bootstrap.client_id;
+    const post = (path: string, body: object) => fetch(backend + path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-App-Client-Id": client_id,
+        "X-App-Capability": bootstrap.capability,
+      },
+      body: JSON.stringify(body),
+    });
+    const { ticket } = await post("/websocket-tickets", { client_id, channel: "events" }).then((response) => response.json());
+    const events = new URL(`${backend}/events`);
+    events.protocol = "ws:";
+    const socket = new WebSocket(events, ["laf.v1", `laf.ticket.${ticket}`]);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("The replacement event connection timed out")), 5_000);
+        socket.onmessage = () => { clearTimeout(timer); resolve(); };
+        socket.onclose = () => { clearTimeout(timer); reject(new Error("The replacement event connection closed")); };
+      });
+      const lease = await post("/control-lease", {
+        request_id: crypto.randomUUID(), client_id, session_id: null, takeover: false,
+      });
+      if (!lease.ok) throw new Error("The replacement client could not acquire control");
+      const { client_lease_id } = await lease.json();
+      const same = await post(`/sessions/${action.session_id}/actions`, { ...action, client_id, client_lease_id });
+      return {
+        status: same.status,
+        receipt: await same.text(),
+        replacedClient: client_id !== action.client_id,
+        replacedLease: client_lease_id !== action.client_lease_id,
+      };
+    } finally {
+      socket.close();
+    }
+  }, { backend, action });
+}
+
+for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const) {
+  test(`saved candidate review recovers ${outcome} through a backend restart`, async ({ page }) => {
+    test.setTimeout(60_000);
+    await startBackend({ reviewSimulation: true, crashCandidate: outcome === "uncommitted" });
+    const session = await startReviewSearch(page, outcome === "confirm" ? "Gestures" : "PS4 controller");
+    const panel = page.getByRole("region", { name: "Review potential match" });
+    let confirm: SessionAction | undefined;
+    let receipt: string | undefined;
+    if (outcome === "uncommitted") {
+      await expect.poll(() => backendProcess?.exitCode).toBe(84);
+      await expect(panel).toHaveCount(0);
+    } else {
+      await expect(panel.getByText("Paused", { exact: true })).toBeVisible();
+      await expect(panel.getByRole("img", { name: "Selected target from Reference for Review target" })).toBeVisible();
+      await expect(panel.getByText("Captured", { exact: true })).toBeVisible();
+      const image = panel.getByRole("img", { name: "Captured evidence", exact: true });
+      await expect(image).toBeVisible();
+      await expect(image.locator("+ span")).toBeAttached();
+      const overlay = await image.locator("+ span").evaluate((box) => ({
+        left: box.style.left, top: box.style.top, width: box.style.width, height: box.style.height,
+      }));
+      expect(parseFloat(overlay.left)).toBeCloseTo(100 * 303 / 480, 4);
+      expect(parseFloat(overlay.width)).toBeCloseTo(100 * 83 / 480, 4);
+      expect(parseFloat(overlay.top)).toBeCloseTo(100 * 203 / 262, 4);
+      expect(parseFloat(overlay.height)).toBeCloseTo(100 * 41 / 262, 4);
+      await expect(panel.getByRole("button", { name: "Reject Match" })).toHaveCount(0);
+      await expect(page.getByRole("button", { name: "Resume", exact: true })).toBeDisabled();
+      await expect(page.getByRole("button", { name: "Emergency Stop", exact: true })).toBeEnabled();
+      if (outcome === "confirm") {
+        await page.route(`${backend}${session}/actions`, async (route) => {
+          confirm = route.request().postDataJSON();
+          let response = await route.fetch();
+          if (response.status() === 202) {
+            await expect.poll(async () => {
+              response = await route.fetch();
+              return response.status();
+            }).toBe(200);
+          }
+          expect(response.ok()).toBe(true);
+          receipt = await response.text();
+          await route.abort("connectionreset");
+        }, { times: 1 });
+        await panel.getByRole("button", { name: "Confirm Match" }).click();
+      } else if (outcome === "stop") {
+        await panel.getByRole("button", { name: "Stop Search" }).click();
+      }
+      if (outcome === "confirm" || outcome === "stop") {
+        await expect(page).toHaveURL(`${frontend}${session}/result`);
+        await expect(page.getByRole("heading", { name: outcome === "confirm"
+          ? "Match confirmed and saved" : "Search ended without confirmation" })).toBeVisible();
+      }
+    }
+    if (outcome === "confirm") await expect.poll(() => receipt).toBeDefined();
+
+    await stopBackend();
+    await startBackend({ reviewSimulation: true });
+    await page.goto(`${session}/result`);
+    const summary = page.getByRole("region", { name: "Session summary" });
+    await expect(summary).toContainText(outcome === "confirm" ? "Match confirmed" :
+      outcome === "stop" ? "Stopped by operator" : "Interrupted");
+    if (outcome === "confirm") {
+      await expect(page.getByText("Found", { exact: true })).toBeVisible();
+      expect(await replayReviewAction(page, confirm!)).toEqual({
+        status: 200, receipt, replacedClient: true, replacedLease: true,
+      });
+    } else {
+      await expect(page.getByText("The object remains Lost.", { exact: true })).toBeVisible();
+    }
+    await page.getByRole("link", { name: "View Session Details" }).click();
+    const history = page.getByRole("region", { name: "Captured matches" });
+    if (outcome === "uncommitted") {
+      await expect(history.getByText("No captured matches", { exact: true })).toBeVisible();
+      expect(await readdir(join(parent, "records", "media"))).toHaveLength(1);
+      expect(await readdir(join(parent, "records", "staging"))).toHaveLength(0);
+    } else {
+      await expect(history.getByText(outcome === "confirm" ? "Confirmed" : "Not reviewed", { exact: true })).toBeVisible();
+      await expect(history.getByRole("img", { name: "Captured evidence", exact: true })).toBeVisible();
+    }
+  });
+}

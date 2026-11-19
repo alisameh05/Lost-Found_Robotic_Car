@@ -13,6 +13,7 @@ from .storage import (
     DELETING,
     ELIGIBLE,
     GRACE,
+    MATCH_ROWS,
     OBJECT_ROWS,
     Receipt,
     RecordsStorage,
@@ -35,6 +36,7 @@ class SavedSearch:
     target: Payload | None = None
     acknowledged: tuple[str, ...] = ()
     restored: tuple[str, ...] = ()
+    match: Payload | None = None
 
 
 def search_record(db: sqlite3.Connection, request: SearchRequest, now: int, days: int) -> sqlite3.Row:
@@ -67,6 +69,18 @@ def verify_transition(
     if row["revision"] != request.revision and not resume_committed:
         raise HttpError(409, "REVISION_CONFLICT", "The saved record changed. Refresh and try again.",
                         revision=row["revision"])
+    if request.candidate_id:
+        candidate = db.execute(f"""
+            SELECT c.session_id, c.disposition
+            FROM match_events AS c JOIN objects AS o ON o.id = c.object_id
+            WHERE c.id = ? AND {ELIGIBLE}
+        """, (request.candidate_id, now - retention_ms(days))).fetchone()
+        if not candidate:
+            raise HttpError(404, "NOT_FOUND", "The referenced candidate could not be found.")
+        if candidate["session_id"] != row["id"]:
+            raise HttpError(409, "OWNERSHIP_MISMATCH", "The candidate belongs to a different session.")
+        if candidate["disposition"] != "Pending" or row["state"] != "Paused":
+            raise HttpError(409, "INVALID_TRANSITION", "The candidate is no longer pending review.")
     if request.action == "resume":
         if row["state"] != "Paused":
             raise HttpError(409, "INVALID_TRANSITION", "Pause the search before resuming.")
@@ -132,6 +146,34 @@ def acknowledge(db: sqlite3.Connection, row: sqlite3.Row, ids: tuple[str, ...]) 
         db.execute("UPDATE sessions SET revision = revision + 1 WHERE id = ?", (row["id"],))
 
 
+def confirm_candidate(
+    storage: RecordsStorage, db: sqlite3.Connection, row: sqlite3.Row, candidate_id: str,
+) -> Payload:
+    candidate = db.execute("SELECT captured_at_ms FROM match_events WHERE id = ?", (candidate_id,)).fetchone()
+    owner = db.execute("SELECT status, revision FROM objects WHERE id = ?", (row["object_id"],)).fetchone()
+    if owner["status"] != "Lost":
+        raise HttpError(409, "INVALID_TRANSITION", "The target is already Found.")
+    advance_revision(row)
+    advance_revision(owner)
+    reviewed = max(storage.now()[0], row["started_at_ms"], candidate["captured_at_ms"])
+    db.execute("""
+        UPDATE match_events SET disposition = 'Confirmed', reviewed_at_ms = ? WHERE id = ?
+    """, (reviewed, candidate_id))
+    db.execute("""
+        UPDATE objects SET status = 'Found', found_at_ms = ?, revision = revision + 1 WHERE id = ?
+    """, (reviewed, row["object_id"]))
+    db.execute("""
+        UPDATE sessions SET state = 'Ended', ended_at_ms = ?, end_reason = 'Confirmed', pause_causes = '[]',
+                            revision = revision + 1 WHERE id = ?
+    """, (reviewed, row["id"]))
+    storage.checkpoint("before_confirm_commit")
+    match = storage.match_payload(db.execute(MATCH_ROWS + " WHERE c.id = ?", (candidate_id,)).fetchone())
+    evidence = match["evidence_media"]
+    if not isinstance(evidence, dict) or evidence["availability"] != "Available":
+        raise HttpError(503, "MEDIA_UNAVAILABLE", "The saved capture is missing or corrupt.", True)
+    return match
+
+
 def save_search(
     storage: RecordsStorage, request: SearchRequest, fingerprint: str, session_id: str,
     preparing: Collection[str], authorize: Callable[[bool], None], superseded_resume: str | None,
@@ -152,10 +194,11 @@ def save_search(
             authorize(False)
             match = None
             target = None
-            if request.mode:
+            if request.mode or request.action == "confirm":
                 inspection = storage._inspect(db, now, preparing)
                 if inspection.problem:
                     raise storage_unavailable(inspection.problem)
+            if request.mode:
                 if not clock_valid:
                     raise HttpError(503, "NOT_READY", "The local clock is unavailable.", True)
                 target = storage.object_payload(row, days, now)
@@ -176,11 +219,8 @@ def save_search(
                            (session_id,))
             elif request.action == "stop":
                 advance_revision(row)
-                pending = db.execute("""
-                    SELECT c.*, m.relative_path, m.byte_length, m.checksum, m.created_at_ms
-                    FROM match_events AS c JOIN media AS m ON m.id = c.evidence_media_id
-                    WHERE c.session_id = ? AND c.disposition = 'Pending'
-                """, (session_id,)).fetchone()
+                pending = db.execute(MATCH_ROWS + " WHERE c.session_id = ? AND c.disposition = 'Pending'",
+                                     (session_id,)).fetchone()
                 if pending:
                     db.execute("UPDATE match_events SET disposition = 'NotReviewed' WHERE id = ?", (pending["id"],))
                 db.execute("""
@@ -190,17 +230,25 @@ def save_search(
                 """, (now, session_id, session_id))
                 if pending and row["registered_at_ms"] + retention_ms(days) > now:
                     match = {**storage.match_payload(pending), "disposition": "NotReviewed"}
+            if request.action == "confirm":
+                assert request.candidate_id is not None
+                match = confirm_candidate(storage, db, row, request.candidate_id)
 
             saved = db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
             session = storage.session_payload(saved)
-            storage.checkpoint(f"before_{request.action}_commit")
+            if request.action != "confirm":
+                storage.checkpoint(f"before_{request.action}_commit")
+            found = None
+            if request.action == "confirm":
+                object_row = db.execute(OBJECT_ROWS + " WHERE o.id = ?", (owner,)).fetchone()
+                found = storage.object_payload(object_row, days, now)
             authorize(True)
             now, _ = storage.now()
             expired = row["registered_at_ms"] + retention_ms(days) <= now
             if request.mode and expired:
                 raise HttpError(410, "EXPIRED", "The retention period for this record has ended.")
-            removed = request.action == "stop" and expired
-            result = EMPTY_RESULT if removed else {**EMPTY_RESULT, "session": session, "match": match}
+            removed = request.action in ("confirm", "stop") and expired
+            result = EMPTY_RESULT if removed else {**EMPTY_RESULT, "object": found, "session": session, "match": match}
             receipt = Receipt(canonical_json({
                 "action_id": request.action_id, "persistence": "Committed", "result": result, "error": None,
             }), 201 if request.mode else 200, f"/api/v1/sessions/{session_id}" if request.mode else None)

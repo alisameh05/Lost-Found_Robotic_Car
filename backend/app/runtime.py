@@ -115,6 +115,7 @@ class RecordsRuntime:
                                  self.storage.clock, self.touch_client, self.realtime_projection, invalidate,
                                  self.expire_clients, revoked, failure_changed, emergency)
         self.sessions = SessionCoordinator(self, self.realtime)
+        self.realtime.on_candidate = self.sessions.admit_candidate
         return self.realtime
 
     def frontend_profile(self) -> dict[str, int | str] | None:
@@ -173,7 +174,7 @@ class RecordsRuntime:
 
         def removed(owner: str) -> None:
             if realtime:
-                loop.call_soon_threadsafe(realtime.object_removed, owner)
+                loop.call_soon_threadsafe(self.hide_removed_owner, owner)
 
         while not self._stop_retention.is_set():
             self._retention_changed.clear()
@@ -189,7 +190,7 @@ class RecordsRuntime:
             return None
         if self._startup_fault:
             return self._startup_fault
-        return await asyncio.to_thread(self.storage.inspect, tuple(self._pending))
+        return await asyncio.to_thread(self.storage.inspect, self.preparing())
 
     async def maintain_safety_storage(self, realtime: Realtime) -> None:
         while not self._stopping:
@@ -211,7 +212,8 @@ class RecordsRuntime:
         return sum(op.slot == "ordinary" for op, _ in self._pending.values())
 
     def preparing(self) -> tuple[str, ...]:
-        return tuple(self._pending)
+        candidate = self.sessions.preparing_candidate if self.sessions else None
+        return (*self._pending, candidate) if candidate else tuple(self._pending)
 
     async def page(self, route: str, client: str, query: dict[str, str], parent: str | None) -> dict[str, object]:
         scope = CursorScope(self.boot_id, client, casefold(query.get("name", "")), query.get("status", ""),
@@ -481,6 +483,21 @@ class RecordsRuntime:
         if len(self._terminal) > MAX_TERMINAL:
             self._terminal.popitem(last=False)
 
+    def hide_removed_owner(self, owner: str, action_id: str | None = None) -> None:
+        hidden = set()
+        for key, (operation, task) in tuple(self._pending.items()):
+            if operation.owner == owner:
+                hidden.add(operation.request_id or key)
+                self._pending[key] = (replace(operation, visible=False), task)
+        for key, operation in tuple(self._terminal.items()):
+            if operation.owner == owner:
+                hidden.add(operation.request_id or key)
+                del self._terminal[key]
+        if action_id:
+            hidden.add(action_id)
+        if self.realtime:
+            self.realtime.object_removed(owner, hidden)
+
     async def prune_terminal(self) -> None:
         records = {key: operation for key, operation in self._terminal.items() if operation.owner is not None}
         if records:
@@ -546,16 +563,17 @@ class RecordsRuntime:
         storage = await self.inspect()
         if storage is None:
             return None
-        session, target, available = (None, None, False)
+        session, target, candidate, available = (None, None, None, False)
         if storage.settings is not None and (not storage.problem or storage.active_session_state is not None):
             try:
-                session, target, available = await asyncio.to_thread(self.storage.search_setup)
+                session, target, candidate, available = await asyncio.to_thread(self.storage.search_setup)
             except (OSError, sqlite3.Error):
                 storage = replace(storage, problem="Search setup storage is unavailable.")
         state = await self.snapshot(storage)
         if session and target:
             state["active_session"] = session
             state["active_object"] = target
+            state["pending_candidate"] = candidate
             runtime = state["runtime"]
             assert isinstance(runtime, dict)
             runtime["effective_session_state"] = session["state"]

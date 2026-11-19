@@ -24,6 +24,7 @@ class SearchRequest:
     secret: str
     mode: Mode | None
     failure_ids: tuple[str, ...] = ()
+    candidate_id: str | None = None
 
     @property
     def safety_action(self) -> bool:
@@ -35,6 +36,8 @@ class SearchRequest:
             payload["control_mode"] = self.mode
         if self.failure_ids:
             payload["failure_ids"] = self.failure_ids
+        if self.candidate_id:
+            payload["candidate_id"] = self.candidate_id
         return sha256(canonical_json({
             "scope": "Object", "action_type": self.action, "resource_id": self.resource_id,
             "expected_revision": self.revision, "payload": payload,
@@ -90,10 +93,10 @@ async def parse_search(request: Request, session: str | None) -> SearchRequest:
             or not token(data.get("client_lease_id"))):
         raise invalid
     check_identity(request, data["client_id"])
-    if action in ("confirm", "reject"):
+    if action == "reject":
         raise HttpError(503, "NOT_READY", "This search action is unavailable in the simulation.")
     return SearchRequest(data["action_id"], action, cast(str, resource), data["expected_revision"],
-                         data["client_id"], data["client_lease_id"], mode, failure_ids)
+                         data["client_id"], data["client_lease_id"], mode, failure_ids, data.get("candidate_id"))
 
 
 async def parse_emergency(request: Request) -> tuple[str, str | None]:
