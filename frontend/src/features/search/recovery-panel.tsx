@@ -24,11 +24,13 @@ const causeLabels: Record<FailureCause, string> = {
   ProtocolMismatch: "Service protocol incompatible",
 };
 
-export function RecoveryPanel({ failures, blockers, searching, canAcknowledge, feedback, acknowledge, retry }: {
+export function RecoveryPanel({ failures, blockers, searching, manuallyPaused, canAcknowledge, feedback, acknowledge, retry }: {
   failures: Failure[]; blockers: string[]; searching: boolean; canAcknowledge: boolean;
+  manuallyPaused: boolean;
   feedback?: SearchFeedback; acknowledge(id: string): void; retry(): void;
 }) {
   return <ModelessPanel id="search-recovery" title="Recovery">
+    {manuallyPaused && <p>Paused by operator.</p>}
     <p role="status">{searching ? "Search is running." : blockers.length ?
       `Resume unavailable. ${blockers.join(" ")}` : "Recovery complete. Choose Resume, then release to neutral and hold a direction again."}</p>
     {failures.length > 0 && <ul className={styles.recoveryList}>
@@ -42,7 +44,7 @@ export function RecoveryPanel({ failures, blockers, searching, canAcknowledge, f
         <span className="visually-hidden" id={`cause-${failure.failure_id}`}>{causeLabels[failure.cause]}</span>
       </li>)}
     </ul>}
-    <ActionFeedback label="Acknowledging failure" feedback={feedback} retry={retry} />
+    <ActionFeedback label="Acknowledging failure" feedback={feedback} canRetryFailed={canAcknowledge} retry={retry} />
   </ModelessPanel>;
 }
 

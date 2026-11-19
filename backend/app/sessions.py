@@ -77,7 +77,9 @@ class SessionCoordinator:
                     if self._path_failures.get(key) == failure:
                         del self._path_failures[key]
                 if saved.session:
-                    self.realtime.publish_search_commit(saved.session, None, None, bool(runtime._pending))
+                    recovery_changed = self.realtime.reconcile_failures((), saved.restored)
+                    self.realtime.publish_search_commit(saved.session, None, None, bool(runtime._pending),
+                                                        recovery_changed=recovery_changed)
         finally:
             self._failure_task = None
 
@@ -92,7 +94,8 @@ class SessionCoordinator:
         runtime.check_started()
         session_id = uuid4().hex if request.mode else request.resource_id
         fingerprint = request.fingerprint()
-        if (not request.mode and session_id == self.realtime.safety_session
+        if (request.safety_action and session_id == self.realtime.safety_session
+                and request.action_id not in runtime._pending and request.action_id not in runtime._terminal
                 and request.revision == self.realtime.active_revision):
             # Safety cannot wait for a records read, an occupied admission lock, or the writer.
             try:
@@ -111,6 +114,9 @@ class SessionCoordinator:
                 raise HttpError(409, "ACTION_ID_CONFLICT", "This action ID already belongs to a different request.")
             if pending:
                 return pending[0].response
+            if request.action == "resume" and previous and 400 <= previous.response.status < 500:
+                # An identical transport retry cannot reopen a superseded Resume.
+                return previous.response
             # Validate new work against current domain facts after the pending/receipt checks.
             prior, owner = await asyncio.to_thread(inspect_search, runtime.storage, request, fingerprint, transition=True)
             if prior:
@@ -118,17 +124,19 @@ class SessionCoordinator:
             generation = self.realtime.authorize_search(
                 request.client, request.secret, None if request.mode else session_id, request.mode,
             )
-            if not request.mode:
+            if request.safety_action:
                 self.realtime.suspend_search(session_id)
-            full = (runtime.ordinary_pending() >= MAX_ORDINARY_PENDING
-                    if request.mode else self._safety_occupied)
+            full = (self._safety_occupied if request.safety_action
+                    else runtime.ordinary_pending() >= MAX_ORDINARY_PENDING)
             if runtime._stopping or full:
                 raise HttpError(503, "CAPACITY_REACHED", "Search saving capacity is occupied. Retry shortly.", True,
-                                permission_revoked=not request.mode)
+                                permission_revoked=request.safety_action)
 
             operation = Operation(fingerprint, mutation(request.action_id, "Pending", 202), owner,
-                                  slot="ordinary" if request.mode else "safety")
-            if not request.mode:
+                                  slot="safety" if request.safety_action else "ordinary")
+            if request.action == "resume":
+                self.realtime.begin_resume(session_id, request.revision)
+            if request.safety_action:
                 self._safety_occupied = True
             task = asyncio.create_task(self.finish_action(request, operation, session_id, generation))
             runtime._pending[request.action_id] = (operation, task)
@@ -143,17 +151,22 @@ class SessionCoordinator:
         runtime = self.runtime
         loop = asyncio.get_running_loop()
 
-        async def authorize(final: bool) -> None:
+        def authorize(final: bool) -> None:
             current = self.realtime.authorize_search(
                 request.client, request.secret, None if request.mode else session, request.mode,
             )
             if generation != current:
                 raise HttpError(403, "LEASE_EXPIRED", "The control lease is no longer current.")
+            if request.action == "resume":
+                self.realtime.check_resume(session, request.revision)
             if final and request.mode:
                 self.realtime.prepare_start(session)
 
+        async def authorize_on_loop(final: bool) -> None:
+            authorize(final)
+
         def check(final: bool) -> None:
-            asyncio.run_coroutine_threadsafe(authorize(final), loop).result()
+            asyncio.run_coroutine_threadsafe(authorize_on_loop(final), loop).result()
 
         saved: SavedSearch | None = None
         uncertain = False
@@ -185,12 +198,30 @@ class SessionCoordinator:
                     except (OSError, sqlite3.Error, HttpError):
                         # A later eligible projection can still reconcile the committed receipt.
                         pass
-                saved = SavedSearch(recovered, owner, removed=recovered is None, receipt=existing, target=target)
+                saved = SavedSearch(recovered, owner, removed=recovered is None, receipt=existing, target=target,
+                                    acknowledged=request.failure_ids)
         finally:
             runtime._pending.pop(request.action_id, None)
             if request.mode:
                 self.realtime.resolve_start(session, saved is not None and saved.session is not None, uncertain=uncertain)
-            else:
+            if request.action == "resume":
+                grant = False
+                if saved and saved.session:
+                    try:
+                        authorize(False)
+                    except HttpError:
+                        self.realtime.suspend_search(session)
+                        self._deferred_pause = session
+                        self.save_deferred_pause()
+                    else:
+                        grant = True
+                elif uncertain:
+                    # A lost writer result cannot grant authority. Ensure a possibly saved Resume is paused.
+                    self.realtime.suspend_search(session)
+                    self._deferred_pause = session
+                    self.save_deferred_pause()
+                self.realtime.finish_resume(session, grant)
+            if request.safety_action:
                 self.safety_slot_released()
 
         complete = replace(operation, response=response)
@@ -202,7 +233,9 @@ class SessionCoordinator:
         else:
             runtime.publish_terminal(request.action_id, complete)
             if saved and saved.session:
-                self.realtime.publish_search_commit(saved.session, complete.payload(), saved.target, bool(runtime._pending))
+                recovery_changed = self.realtime.reconcile_failures(saved.acknowledged, saved.restored)
+                self.realtime.publish_search_commit(saved.session, complete.payload(), saved.target, bool(runtime._pending),
+                                                    recovery_changed=recovery_changed)
             else:
                 self.realtime.operation_changed(session, complete.payload())
         return response
@@ -296,8 +329,10 @@ class SessionCoordinator:
             job.owner = saved.owner
             if operation.visible:
                 runtime.publish_terminal(key, complete)
+            recovery_changed = self.realtime.reconcile_failures((), saved.restored)
             self.realtime.publish_search_commit(
                 saved.session, complete.payload() if operation.visible else None, None, bool(runtime._pending),
+                recovery_changed=recovery_changed,
             )
         elif operation.visible:
             # If Stop won, acknowledge the request without publishing an owner payload.
@@ -363,7 +398,8 @@ class SessionCoordinator:
             self.emergency_results[request] = (client, job)
         else:
             job = previous[1]
-            if job is None or job.session != session:
+            failure = self.realtime.failure_for(session, "EmergencyStop")
+            if job is None or job.session != session or (failure and job.failure != failure["failure_id"]):
                 self.persist_emergency(str(uuid4()), session)
         await self.wait_for_save(job)
         eligible = job is not None and job.session == self.realtime.safety_session

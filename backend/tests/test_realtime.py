@@ -51,6 +51,7 @@ from backend.app.simulation import (
 )
 from backend.app.storage import RecordsStorage
 from backend.tests.test_registration import submit
+from backend.tests.test_session_history import captured_png, insert_match
 
 ORIGIN = "http://127.0.0.1:3000"
 API = "/api/v1"
@@ -1017,7 +1018,7 @@ def test_saved_search_lifecycle_and_historical_retry(tmp_path: Path) -> None:
 
 @contextmanager
 def ready_search(
-    laf: Loopback, mode: str = "Controller", acquired: dict | None = None,
+    laf: Loopback, mode: str = "Controller", acquired: dict | None = None, *, takeover: bool = False,
 ) -> Iterator[tuple[dict, dict, ClientConnection, ClientConnection]]:
     owner = laf.bootstrap()
     headers = auth(owner)
@@ -1026,7 +1027,7 @@ def ready_search(
     with laf.open("/events", laf.ticket(headers, "events")) as events, \
             laf.open("/video/robot", laf.ticket(headers, "robot-video")) as video:
         event(events)
-        lease = acquire_control(laf, owner)
+        lease = acquire_control(laf, owner, takeover=takeover)
         if acquired is not None:
             acquired.update(lease)
         events.send(json.dumps(heartbeat(owner, lease, 1, frame(video)[0])))
@@ -1085,10 +1086,12 @@ class WorkspaceDriver:
 
 
 @contextmanager
-def driving_search(laf: Loopback, mode: str = "Controller") -> Iterator[tuple[dict, WorkspaceDriver]]:
+def driving_search(
+    laf: Loopback, mode: str = "Controller", *, takeover: bool = False,
+) -> Iterator[tuple[dict, WorkspaceDriver]]:
     laf.observations.webcam = mode == "Gestures"
     lease: dict = {}
-    with ready_search(laf, mode, lease) as (owner, start, events, video):
+    with ready_search(laf, mode, lease, takeover=takeover) as (owner, start, events, video):
         headers = auth(owner)
         driver = WorkspaceDriver(owner, lease, events, video)
         worker = Thread(target=driver.run, daemon=True)
@@ -1116,6 +1119,264 @@ def wait_output(laf: Loopback, expected: Direction | None) -> None:
             return
         sleep(0.005)
     assert laf.command.output == expected, laf.command.journal
+
+
+def search_action(laf: Loopback, headers: dict, driver: WorkspaceDriver, action: str, revision: int, **extra):
+    session = driver.session["id"]
+    return laf.http.post(f"{API}/sessions/{session}/actions", headers=headers, json={
+        "action_id": str(uuid4()), "session_id": session, "expected_revision": revision, "action": action,
+        "client_id": driver.owner["client_id"], "client_lease_id": driver.lease["client_lease_id"], **extra,
+    })
+
+
+@contextmanager
+def recover_workspace(laf: Loopback, session: dict) -> Iterator[tuple[dict, WorkspaceDriver]]:
+    owner = laf.bootstrap()
+    headers = auth(owner)
+    with laf.open("/events", laf.ticket(headers, "events")) as events, \
+            laf.open("/video/robot", laf.ticket(headers, "robot-video")) as video:
+        assert event(events)["payload"]["active_session"]["id"] == session["id"]
+        acquisition = {**acquire_body(owner), "session_id": session["id"]}
+        denied = laf.http.post(API + "/control-lease", headers=headers, json=acquisition)
+        assert denied.status_code == 409 and denied.json()["code"] == "INVALID_TRANSITION"
+        accepted = laf.http.post(API + "/control-lease", headers=headers, json={**acquisition, "takeover": True})
+        assert accepted.status_code == 200, accepted.text
+        lease = accepted.json()
+        driver = WorkspaceDriver(owner, lease, events, video)
+        driver.session = session
+        events.send(json.dumps(heartbeat(owner, lease, 1, frame(video)[0], session_id=session["id"])))
+        worker = Thread(target=driver.run, daemon=True)
+        observer = Thread(target=driver.observe_events, daemon=True)
+        worker.start()
+        observer.start()
+        try:
+            wait_for(laf.http, "/snapshot", headers, lambda state: status(state, "DisplayedRobotVideo") == "Ready")
+            yield headers, driver
+        finally:
+            driver.stop.set()
+            video.close()
+            worker.join(2)
+            observer.join(2)
+
+
+def test_manual_resume_requires_fresh_neutral_and_keeps_the_saved_search(tmp_path: Path) -> None:
+    with service(tmp_path) as laf, driving_search(laf, "Gestures") as (headers, driver):
+        arm(laf, headers, "Gestures")
+        pause = search_action(laf, headers, driver, "pause", 1)
+        assert pause.status_code == 200, pause.text
+        wait_output(laf, None)
+        wait_for(laf.http, "/snapshot", headers, lambda state: state["readiness"]["can_resume"])
+        action_id = str(uuid4())
+        response = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
+        assert response.status_code == 200, response.text
+        resumed = {**driver.session, "state": "Searching", "revision": 3, "pause_causes": []}
+        assert response.json()["result"]["session"] == resumed
+        assert laf.http.get(f"{API}/sessions/{resumed['id']}", headers=headers).json() == resumed
+        previous_sequence = None
+        while True:
+            update = driver.messages.get(timeout=3)
+            if previous_sequence is not None:
+                assert update["event_seq"] == previous_sequence + 1
+            previous_sequence = update["event_seq"]
+            operation = update["payload"].get("operation")
+            if update["type"] == "session_changed" and operation and operation["action_id"] == action_id and (
+                operation["persistence"] == "Committed"
+            ):
+                validate("EventEnvelope", update)
+                assert update["session_revision"] == 3 and update["payload"]["session"] == resumed
+                break
+        since_pause = len(laf.command.journal)
+        for fingers, hands in ((1, 1), (5, 1), (0, 0), (0, 2), (1, 1)):
+            laf.observations.fingers, laf.observations.hands = fingers, hands
+            sleep(0.25)
+            assert laf.command.output is None
+        assert all(entry.output is None for entry in laf.command.journal[since_pause:])
+        assert search_action(laf, headers, driver, "resume", 2, action_id=action_id).content == response.content
+        laf.observations.fingers = 0
+        arm(laf, headers, "Gestures")
+
+
+def test_recovery_reconciles_independent_occurrences_in_both_orders(tmp_path: Path) -> None:
+    with service(tmp_path) as laf, driving_search(laf) as (old_headers, old_driver):
+        arm(laf, old_headers)
+        laf.observations.inference = False
+        laf.observations.command = False
+        paused = wait_for(laf.http, "/snapshot", old_headers, lambda state:
+                          len(state["active_session"]["pause_causes"]) == 2)["active_session"]
+        with recover_workspace(laf, paused) as (headers, driver):
+            def snapshot(check=lambda _: True):
+                return wait_for(laf.http, "/snapshot", headers, check)
+
+            before = snapshot()
+            ids = {f["cause"]: f["failure_id"] for f in before["failures"]}
+            ai, command = ids["AIUnavailable"], ids["CommandUnavailable"]
+            revision = paused["revision"]
+            assert search_action(laf, old_headers, old_driver, "acknowledge", revision,
+                                 failure_ids=[ai]).json()["code"] == "LEASE_REQUIRED"
+            for invalid in ([], [ai, ai], [str(uuid4()) for _ in range(65)]):
+                assert search_action(laf, headers, driver, "acknowledge", revision, failure_ids=invalid).status_code == 422
+            assert search_action(laf, headers, driver, "acknowledge", revision,
+                                 failure_ids=[uuid4().hex]).json()["code"] == "NOT_FOUND"
+            assert search_action(laf, headers, driver, "acknowledge", revision - 1,
+                                 failure_ids=[ai]).json()["code"] == "REVISION_CONFLICT"
+            assert search_action(laf, headers, driver, "pause", revision).json()["result"]["session"] == paused
+            acknowledged = search_action(laf, headers, driver, "acknowledge", revision, failure_ids=[ai])
+            assert acknowledged.status_code == 200, acknowledged.text
+            assert acknowledged.json()["result"]["session"]["revision"] == revision + 1
+            assert search_action(laf, headers, driver, "resume", revision + 1).json()["code"] == "RECOVERY_REQUIRED"
+            assert {f["failure_id"]: (f["restored"], f["acknowledged"]) for f in snapshot()["failures"]} == {
+                ai: (False, True), command: (False, False),
+            }
+
+            laf.observations.command = True
+            restored = snapshot(lambda s: s["active_session"]["revision"] == revision + 2)
+            assert not restored["readiness"]["can_resume"]
+            assert next(f for f in restored["failures"] if f["failure_id"] == command)["restored"]
+            action_id = str(uuid4())
+            both = search_action(laf, headers, driver, "acknowledge", revision + 2,
+                                 action_id=action_id, failure_ids=[command, ai])
+            assert both.status_code == 200, both.text
+            assert both.json()["result"]["session"]["pause_causes"] == paused["pause_causes"]
+            assert [f["failure_id"] for f in snapshot()["failures"]] == [ai]
+            retry = search_action(laf, headers, driver, "acknowledge", revision + 2,
+                                  action_id=action_id, failure_ids=[ai, command])
+            assert retry.content == both.content
+
+            laf.observations.inference = True
+            ready = snapshot(lambda s: s["readiness"]["can_resume"])
+            assert ready["active_session"]["revision"] == revision + 4 and ready["failures"] == []
+            no_op = search_action(laf, headers, driver, "acknowledge", revision + 4, failure_ids=[ai, command])
+            assert no_op.json()["result"]["session"] == ready["active_session"]
+            assert laf.command.output is None
+
+            laf.observations.inference = False
+            recurrent = snapshot(lambda s: s["active_session"]["revision"] == revision + 5)
+            [failure] = recurrent["failures"]
+            assert failure["cause"] == "AIUnavailable" and failure["failure_id"] != ai
+            assert not failure["acknowledged"] and not recurrent["readiness"]["can_resume"]
+
+
+
+@pytest.mark.parametrize(("barrier", "interruption"), [
+    ("before_resume_commit", "pause"),
+    ("before_resume_commit", "stop"),
+    ("before_resume_commit", "storage"),
+    ("after_resume_commit", "camera"),
+    ("after_resume_commit", "emergency"),
+])
+def test_pending_resume_yields_to_safety(tmp_path: Path, barrier: str, interruption: str) -> None:
+    entered, release = Event(), Event()
+
+    def checkpoint(point):
+        if point == barrier:
+            entered.set()
+            assert release.wait(5)
+            if interruption == "storage":
+                raise OSError("Simulated writer unavailable")
+
+    with service(tmp_path, checkpoint=checkpoint) as laf, driving_search(laf) as (headers, driver):
+        arm(laf, headers)
+        assert search_action(laf, headers, driver, "pause", 1).status_code == 200
+        wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_resume"])
+        action_id = str(uuid4())
+        try:
+            pending = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
+            assert entered.is_set() and pending.status_code == 202, pending.text
+            identical = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
+            if barrier == "before_resume_commit":
+                assert identical.content == pending.content
+            else:
+                assert identical.json()["persistence"] == "Committed"
+            changed = search_action(laf, headers, driver, "resume", 1, action_id=action_id)
+            assert changed.status_code == 409 and changed.json()["code"] == "ACTION_ID_CONFLICT"
+
+            if interruption in ("pause", "stop"):
+                safety = search_action(laf, headers, driver, interruption, 2)
+                assert safety.status_code == 202, safety.text
+            elif interruption == "camera":
+                laf.observations.robot = "missing"
+                wait_for(laf.http, "/snapshot", headers, lambda s: s["lease"]["state"] == "Unowned")
+            elif interruption == "emergency":
+                emergency = laf.http.post(API + "/emergency-stop", headers=headers, json={"request_id": str(uuid4())})
+                assert emergency.status_code == 202 and emergency.json()["permission_revoked"]
+            halted = wait_for(laf.http, "/snapshot", headers)
+            assert halted["runtime"]["effective_session_state"] == "Paused"
+            assert halted["runtime"]["motion_permission"] == "Disarmed"
+            assert laf.command.output is None
+        finally:
+            release.set()
+
+        def completed(state):
+            return next((operation for operation in state["operations"] if operation["action_id"] == action_id
+                         and operation["persistence"] != "Pending"), None)
+
+        terminal = wait_for(laf.http, "/snapshot", headers, completed)
+        completion = completed(terminal)
+        if barrier == "after_resume_commit":
+            assert completion["persistence"] == "Committed"
+            final = wait_for(laf.http, "/snapshot", headers, lambda s:
+                             s["active_session"]["state"] == "Paused" and s["active_session"]["revision"] >= 4)
+            retry = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
+            assert retry.content == identical.content
+            assert final["runtime"]["motion_permission"] == "Disarmed"
+            assert final["lease"]["state"] == "Unowned"
+        else:
+            assert completion["persistence"] == "Failed"
+            assert completion["error"]["code"] == ("STORAGE_UNAVAILABLE" if interruption == "storage" else "INVALID_TRANSITION")
+            path = "/sessions/" + driver.session["id"]
+            if interruption == "stop":
+                wait_for(laf.http, path, headers, lambda s: s["state"] == "Ended")
+            else:
+                durable = wait_for(laf.http, path, headers)
+                assert durable["state"] == "Paused" and durable["revision"] == 2
+            if interruption == "pause":
+                retry = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
+                assert retry.json()["persistence"] == "Failed"
+                assert retry.json()["error"]["code"] == "INVALID_TRANSITION"
+        assert laf.command.output is None
+
+
+def test_acknowledgment_rejects_a_failure_from_another_saved_search(tmp_path: Path) -> None:
+    with service(tmp_path) as laf:
+        with driving_search(laf) as (headers, driver):
+            emergency = laf.http.post(API + "/emergency-stop", headers=headers, json={"request_id": str(uuid4())})
+            assert emergency.status_code == 200, emergency.text
+            failure_id = emergency.json()["failure_id"]
+            paused = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+            with recover_workspace(laf, driver.session) as (owner, recovered):
+                settled = wait_for(laf.http, "/snapshot", owner, lambda s: s["failures"][0]["restored"] and
+                                   s["active_session"]["revision"] > paused["active_session"]["revision"])
+                assert search_action(laf, owner, recovered, "stop", settled["active_session"]["revision"]).status_code == 200
+        with driving_search(laf, takeover=True) as (headers, driver):
+            rejected = search_action(laf, headers, driver, "acknowledge", 1, failure_ids=[failure_id])
+            assert rejected.status_code == 409 and rejected.json()["code"] == "OWNERSHIP_MISMATCH"
+
+
+def test_pending_review_blocks_resume_even_with_current_control(tmp_path: Path) -> None:
+    with service(tmp_path) as laf, driving_search(laf) as (headers, driver):
+        assert search_action(laf, headers, driver, "pause", 1).status_code == 200
+        session = driver.session
+        with closing(sqlite3.connect(tmp_path / "records.sqlite3")) as db, db:
+            db.execute("PRAGMA foreign_keys = ON")
+            insert_match(db, tmp_path, "pending-match", session["id"], session["object_id"],
+                         session["started_at_ms"], "Pending", None, captured_png())
+        blocked = search_action(laf, headers, driver, "resume", 2)
+        assert blocked.status_code == 409 and blocked.json()["code"] == "PENDING_REVIEW"
+        assert laf.command.output is None
+
+
+def test_presession_failure_settles_without_a_session_action(tmp_path: Path) -> None:
+    with service(tmp_path) as laf, ready_search(laf) as (owner, _, events, _):
+        headers = auth(owner)
+        baseline = wait_for(laf.http, "/snapshot", headers)
+        laf.observations.command = False
+        diagnostic = wait_for(laf.http, "/snapshot", headers, lambda s: bool(s["failures"]))
+        assert lease_event(events, "Unowned")["payload"]["active_session"] is None
+        [failure] = diagnostic["failures"]
+        assert failure["cause"] == "CommandUnavailable" and failure["session_id"] is None
+        laf.observations.command = True
+        settled = wait_for(laf.http, "/snapshot", headers, lambda s: s["failures"] == [])
+        assert settled["active_session"] is None and settled["operations"] == baseline["operations"]
 
 
 def arm(laf: Loopback, headers: dict, mode: str = "Controller") -> None:

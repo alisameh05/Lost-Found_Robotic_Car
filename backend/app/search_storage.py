@@ -32,6 +32,8 @@ class SavedSearch:
     removed: bool = False
     receipt: Receipt | None = None
     target: Payload | None = None
+    acknowledged: tuple[str, ...] = ()
+    restored: tuple[str, ...] = ()
 
 
 def search_record(db: sqlite3.Connection, request: SearchRequest, now: int, days: int) -> sqlite3.Row:
@@ -49,12 +51,34 @@ def search_record(db: sqlite3.Connection, request: SearchRequest, now: int, days
     return cast(sqlite3.Row, row)
 
 
-def verify_transition(row: sqlite3.Row, request: SearchRequest) -> None:
+def verify_transition(db: sqlite3.Connection, row: sqlite3.Row, request: SearchRequest, now: int, days: int) -> None:
     if (row["status"] != "Lost" if request.mode else row["state"] == "Ended"):
         raise HttpError(409, "INVALID_TRANSITION", "The saved record does not allow this search action.")
     if row["revision"] != request.revision:
         raise HttpError(409, "REVISION_CONFLICT", "The saved record changed. Refresh and try again.",
                         revision=row["revision"])
+    if request.action == "resume":
+        if row["state"] != "Paused":
+            raise HttpError(409, "INVALID_TRANSITION", "Pause the search before resuming.")
+        if db.execute("SELECT 1 FROM match_events WHERE session_id = ? AND disposition = 'Pending'",
+                      (row["id"],)).fetchone():
+            raise HttpError(409, "PENDING_REVIEW", "Complete the pending review before resuming.")
+        if db.execute("""SELECT 1 FROM session_failures WHERE session_id = ? AND (NOT restored OR NOT acknowledged)
+                      """, (row["id"],)).fetchone():
+            raise HttpError(409, "RECOVERY_REQUIRED", "Restore and acknowledge each outstanding failure.")
+    if request.failure_ids:
+        placeholders = ",".join("?" for _ in request.failure_ids)
+        failures = db.execute(f"""
+            SELECT f.session_id, o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting
+            FROM session_failures AS f JOIN sessions AS s ON s.id = f.session_id
+            JOIN objects AS o ON o.id = s.object_id WHERE f.failure_id IN ({placeholders})
+        """, request.failure_ids).fetchall()
+        if len(failures) != len(request.failure_ids) or any(
+            f["deleting"] or (not f["grace"] and f["registered_at_ms"] + retention_ms(days) <= now) for f in failures
+        ):
+            raise HttpError(404, "NOT_FOUND", "A referenced failure could not be found.")
+        if any(f["session_id"] != row["id"] for f in failures):
+            raise HttpError(409, "OWNERSHIP_MISMATCH", "A referenced failure belongs to a different session.")
 
 
 def inspect_search(
@@ -63,12 +87,13 @@ def inspect_search(
     with storage.connect() as db, read_transaction(db):
         db.row_factory = sqlite3.Row
         now, _ = storage.now()
-        row = search_record(db, request, now, storage.settings(db)["retention_days"])
+        days = storage.settings(db)["retention_days"]
+        row = search_record(db, request, now, days)
         prior = storage.find_receipt(db, request.action_id, fingerprint)
         if transition and prior is None:
             if request.mode and storage.active_session_state(db):
                 raise HttpError(409, "ACTIVE_SESSION_EXISTS", "A saved search is already active.")
-            verify_transition(row, request)
+            verify_transition(db, row, request, now, days)
         return prior, row["id" if request.mode else "object_id"]
 
 
@@ -84,6 +109,18 @@ def pause(db: sqlite3.Connection, row: sqlite3.Row) -> None:
     advance_revision(row)
     db.execute("UPDATE sessions SET state = 'Paused', pause_causes = ?, revision = revision + 1 WHERE id = ?",
                (canonical_json(causes), row["id"]))
+
+
+def acknowledge(db: sqlite3.Connection, row: sqlite3.Row, ids: tuple[str, ...]) -> None:
+    placeholders = ",".join("?" for _ in ids)
+    updated = db.execute(f"""
+        UPDATE session_failures SET acknowledged = 1
+        WHERE NOT acknowledged AND failure_id IN ({placeholders})
+    """, ids)
+    if updated.rowcount:
+        # The Paused record retains its causes until the explicit Resume transaction.
+        advance_revision(row)
+        db.execute("UPDATE sessions SET revision = revision + 1 WHERE id = ?", (row["id"],))
 
 
 def save_search(
@@ -102,7 +139,7 @@ def save_search(
                 return SavedSearch(None, owner, receipt=prior)
             if request.mode and storage.active_session_state(db):
                 raise HttpError(409, "ACTIVE_SESSION_EXISTS", "A saved search is already active.")
-            verify_transition(row, request)
+            verify_transition(db, row, request, now, days)
             authorize(False)
             match = None
             target = None
@@ -122,7 +159,13 @@ def save_search(
                 """, (session_id, owner, request.mode, max(now, row["registered_at_ms"])))
             elif request.action == "pause":
                 pause(db, row)
-            else:
+            elif request.action == "acknowledge":
+                acknowledge(db, row, request.failure_ids)
+            elif request.action == "resume":
+                advance_revision(row)
+                db.execute("UPDATE sessions SET state = 'Searching', pause_causes = '[]', revision = revision + 1 WHERE id = ?",
+                           (session_id,))
+            elif request.action == "stop":
                 advance_revision(row)
                 pending = db.execute("""
                     SELECT c.*, m.relative_path, m.byte_length, m.checksum, m.created_at_ms
@@ -157,9 +200,13 @@ def save_search(
             """, (request.action_id, owner, session_id, request.action, fingerprint, saved["revision"],
                   now, receipt.status, receipt.body, receipt.location))
             storage.persist_clock(db, now)
-            return SavedSearch(None if removed else session, owner, removed, receipt, target)
+            saved_search = SavedSearch(None if removed else session, owner, removed, receipt, target,
+                                       acknowledged=request.failure_ids)
         finally:
             db.row_factory = None
+    if request.action == "resume":
+        storage.checkpoint("after_resume_commit")
+    return saved_search
 
 
 def save_safety_pause(storage: RecordsStorage, session_id: str, failures: tuple[Payload, ...]) -> SavedSearch:
@@ -193,6 +240,7 @@ def save_safety_pause(storage: RecordsStorage, session_id: str, failures: tuple[
                                (canonical_json(causes), session_id))
             storage.checkpoint("before_safety_pause_commit")
             saved = db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
-            return SavedSearch(storage.session_payload(saved), saved["object_id"])
+            restored = tuple(str(failure["failure_id"]) for failure in failures if failure["restored"])
+            return SavedSearch(storage.session_payload(saved), saved["object_id"], restored=restored)
         finally:
             db.row_factory = None
