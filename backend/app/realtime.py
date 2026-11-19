@@ -56,7 +56,8 @@ MAX_KNOWN_TICKETS = 256
 CAPTURE_INTERVAL = 0.1
 PROJECTION_INTERVAL = 0.25
 Projection = dict[str, object]
-EventKind = Literal["snapshot", "readiness_changed", "retention_changed", "storage_fault", "object_removed"]
+EventKind = Literal["snapshot", "session_changed", "recovery_changed", "readiness_changed",
+                    "retention_changed", "storage_fault", "object_removed"]
 
 
 @dataclass(repr=False)
@@ -160,10 +161,16 @@ class Realtime:
         self._generation = 1
         self._lease: Lease | None = None
         self._pause_required_for: str | None = None
+        self._starting_session: str | None = None
+        self._active_session: str | None = None
+        self._active_owner: str | None = None
+        self.active_revision: int | None = None
+        self.emergency_requests: set[str] = set()
+        self.failure: Projection | None = None
         self._receipts: dict[str, LeaseReceipt] = {}
         self._projection: Projection | None = None
         self._projection_lock = asyncio.Lock()
-        self._removal_revision = 0
+        self._projection_revision = 0
         self._closed = False
 
     @property
@@ -183,15 +190,100 @@ class Realtime:
         if self._generation < SAFE_INTEGER:
             self._generation += 1
 
+    @property
+    def safety_session(self) -> str | None:
+        return self._starting_session or self._active_session
+
+    @property
+    def active_owner(self) -> str | None:
+        return self._active_owner
+
+    def request_at_capacity(self) -> bool:
+        return len(self._receipts) + len(self.emergency_requests) >= MAX_RUNTIME_RECEIPTS
+
+    def lease_request_used(self, request_id: str) -> bool:
+        return request_id in self._receipts
+
+    def authorize_search(self, client: str, secret: str, session: str | None, mode: str | None) -> int:
+        if not self.touch_client(client):
+            raise HttpError(403, "CLIENT_INVALID", "Reconnect to obtain a current page identity.")
+        self._expire_lease(self.monotonic())
+        lease = self._lease
+        if lease is None:
+            raise HttpError(403, "LEASE_EXPIRED", "The control lease is no longer current.")
+        if lease.client != client or not compare_digest(lease.secret, secret):
+            raise HttpError(403, "LEASE_REQUIRED", "Use the current private control lease.")
+        if (client, "events") not in self._connections or lease.session != session:
+            raise HttpError(409, "OWNERSHIP_MISMATCH", "The active search changed.")
+        if mode:
+            self.requires_profile()
+            required = ("Command", "RobotVideo", "AI", "Webcam" if mode == "Gestures" else "Controller")
+            if (not lease.workspace or not lease.displayed or
+                    any(self.component_cause(name) is not None for name in required)):
+                raise HttpError(503, "NOT_READY", "Restore the required search paths and displayed preview.", True)
+        return self._generation
+
+    def prepare_start(self, session: str) -> None:
+        # A loss after the last writer guard still knows which session to pause.
+        self._starting_session = session
+
+    def resolve_start(self, session: str, committed: bool, *, uncertain: bool = False) -> None:
+        if self._starting_session != session:
+            return
+        if uncertain:
+            self._revoke("StorageUnavailable")
+        self._starting_session = None
+        if committed and self._lease is not None:
+            self._lease.session = session
+            self._lease.setup_handoff = True
+        if not committed and not uncertain and self._pause_required_for == session:
+            self._pause_required_for = None
+
+    def suspend_search(self, session: str) -> None:
+        self._pause_required_for = session
+        if self._projection is not None:
+            self._publish("readiness_changed", None)
+
+    def emergency_revoke(self) -> str | None:
+        session = self.safety_session
+        if session:
+            self._pause_required_for = session
+        self._revoke("EmergencyStop")
+        if self._projection is not None:
+            self._publish("readiness_changed", None)
+        return session
+
+    def search_committed(self, session: Projection) -> None:
+        if session["state"] != "Ended":
+            self._active_session = str(session["id"])
+            self._active_owner = str(session["object_id"])
+            self.active_revision = cast(int, session["revision"])
+            return
+        self.search_ended(str(session["id"]))
+
+    def search_ended(self, session: str) -> None:
+        if self._active_session == session:
+            self._active_session = self._active_owner = None
+            self.active_revision = None
+        if self._pause_required_for == session:
+            self._pause_required_for = None
+        if self.failure is not None and self.failure["session_id"] == session:
+            self.failure = None
+        if self._lease is not None and self._lease.session == session:
+            self._revoke("SessionEnded")
+
     def _revoke(self, reason: str, request_id: str | None = None) -> None:
         lease, self._lease = self._lease, None
         if lease is None:
             return
         self._advance_generation()
-        if lease.session is not None:
-            self._pause_required_for = lease.session
-        self.on_control_revoked(Revocation(lease.client, lease.session, self._generation, reason, request_id))
-        self._publish_snapshot()
+        session = lease.session or self._starting_session
+        if session is not None and reason != "SessionEnded":
+            self._pause_required_for = session
+        if reason != "SessionEnded":
+            # A new generation needs its public lease snapshot before any correlated delta.
+            self._publish_snapshot()
+        self.on_control_revoked(Revocation(lease.client, session, self._generation, reason, request_id))
 
     def _expire_lease(self, now: float) -> None:
         lease = self._lease
@@ -224,6 +316,8 @@ class Realtime:
             if not self.touch_client(request.client):
                 raise LeaseRejected("CLIENT_INVALID")
         self._expire_lease(self.monotonic())
+        if request.request_id in self.emergency_requests:
+            raise LeaseRejected("REQUEST_ID_CONFLICT")
         receipt = self._receipts.get(request.request_id)
         if receipt is not None:
             if receipt.fingerprint != fingerprint:
@@ -238,8 +332,8 @@ class Realtime:
     def _change_lease(self, request: LeaseRequest, fingerprint: bytes,
                       profile: QualificationProfile) -> LeaseReceipt:
         lease = self._lease
-        full = len(self._receipts) >= MAX_RUNTIME_RECEIPTS
-        current_session = self._projection.get("session_id") if self._projection else None
+        full = self.request_at_capacity()
+        current_session = self._active_session
         if request.secret is not None:
             if lease is None or request.generation != self._generation:
                 raise LeaseRejected("LEASE_EXPIRED")
@@ -250,10 +344,9 @@ class Realtime:
             if full:
                 self._revoke("Released", request.request_id)
                 raise LeaseRejected("CAPACITY_REACHED", permission_revoked=True)
-            # An active pause needs the following lifecycle slice's durable writer.
             receipt = LeaseReceipt(fingerprint, self._generation + 1, None, None,
-                                   self._can_acquire(request.client) and len(self._receipts) + 1 < MAX_RUNTIME_RECEIPTS,
-                                   "STORAGE_UNAVAILABLE" if request.session is not None else None)
+                                   self._can_acquire(request.client) and
+                                   len(self._receipts) + len(self.emergency_requests) + 1 < MAX_RUNTIME_RECEIPTS)
             self._receipts[request.request_id] = receipt
             self._revoke("Released", request.request_id)
             return receipt
@@ -263,7 +356,7 @@ class Realtime:
         # Leave a generation available to invalidate the authorization on revocation.
         if self._generation >= SAFE_INTEGER - 1:
             raise LeaseRejected("COUNTER_EXHAUSTED")
-        if not self._projection or not self._can_acquire(request.client):
+        if not self._projection or self._starting_session or not self._can_acquire(request.client):
             raise LeaseRejected("NOT_READY")
         if request.session != current_session:
             raise LeaseRejected("OWNERSHIP_MISMATCH")
@@ -371,7 +464,8 @@ class Realtime:
         return "Webcam" if session["control_mode"] == "Gestures" else "Controller"
 
     def _envelope(self, kind: EventKind, payload: object) -> bytes:
-        session = self._projection.get("active_session") if self._projection and kind == "snapshot" else None
+        session = (payload.get("session") if kind == "session_changed" and isinstance(payload, dict)
+                   else self._projection.get("active_session") if self._projection and kind in ("snapshot", "recovery_changed") else None)
         return canonical_json({
             "protocol_version": 1, "backend_boot_id": self.boot, "event_seq": self.sequence,
             "session_id": session["id"] if isinstance(session, dict) else None,
@@ -416,15 +510,18 @@ class Realtime:
     async def _refresh_projection(self) -> Projection | None:
         # The caller holds _projection_lock for the read, commit and initial subscription.
         for _ in range(3):
-            revision = self._removal_revision
+            revision = self._projection_revision
             next_state = await self.project()
-            if revision == self._removal_revision:
+            if revision == self._projection_revision:
                 break
         else:
             return None
         if next_state is None or self._closed:
             return None
         before = self._projection
+        # The writer can become visible to a read just before its main-loop commit publication.
+        if self._starting_session and next_state["session_id"] == self._starting_session:
+            return before
         retention = cast(Projection, next_state["retention"])
         if retention["settings"] is None:
             if before is None:
@@ -433,6 +530,14 @@ class Realtime:
         next_state["event_seq"] = self.sequence
         self._projection = next_state
         session = next_state["active_session"]
+        next_state["failures"] = [self.failure] if self.failure and next_state["session_id"] == self.failure["session_id"] else []
+        if isinstance(session, dict):
+            self._active_session = str(session["id"])
+            self._active_owner = str(session["object_id"])
+            self.active_revision = cast(int, session["revision"])
+        elif not next_state["storage_problem"]:
+            self._active_session = self._active_owner = None
+            self.active_revision = None
         if self._pause_required_for is not None and not next_state["storage_problem"] and (
             next_state["session_id"] != self._pause_required_for
             or (isinstance(session, dict) and session["state"] == "Paused")
@@ -456,10 +561,83 @@ class Realtime:
                 "blocked_capabilities": ["Register", "Start", "Resume", "Review", "RetentionChange"],
                 "deletion": retention["deletion"], "runtime": self._runtime(next_state),
             })
-        if before["operations"] != next_state["operations"]:
+        if before["operations"] != next_state["operations"] or before["failures"] != next_state["failures"]:
             if not self._closed:
-                self._publish("snapshot", None, ordered=False)
+                self._publish_snapshot()
         return next_state
+
+    def effective_state(self, state: str | None) -> str:
+        if state == "Searching" and self._pause_required_for is not None and self._pause_required_for == self._active_session:
+            return "Paused"
+        return state or "Idle"
+
+    def set_failure(self, failure: Projection) -> None:
+        self.failure = failure
+        if self._projection is not None and failure["session_id"] == self._projection["session_id"]:
+            self._projection["failures"] = [failure]
+            self._publish("recovery_changed", {"failures": [failure], "runtime": self._runtime(self._projection)})
+
+    @staticmethod
+    def _project_operation(state: Projection, operation: Projection) -> bool:
+        identity = operation["action_id"], operation["request_id"]
+        operations = [entry for entry in cast(list[Projection], state["operations"])
+                      if (entry["action_id"], entry["request_id"]) != identity]
+        operations.append(operation)
+        pending = [entry for entry in operations if entry["persistence"] == "Pending"]
+        completed = [entry for entry in operations if entry["persistence"] != "Pending"]
+        state["operations"] = pending + completed[-64:]
+        return bool(pending)
+
+    def operation_changed(self, session_id: str, operation: Projection) -> None:
+        if self._projection is None:
+            return
+        self._projection_revision += 1
+        current = self._projection["active_session"]
+        runtime = cast(Projection, self._projection["runtime"])
+        runtime["persistence_pending"] = self._project_operation(self._projection, operation)
+        if isinstance(current, dict) and current["id"] == session_id:
+            error = operation["error"]
+            if isinstance(error, dict) and error["code"] == "STORAGE_UNAVAILABLE":
+                retention = cast(Projection, self._projection["retention"])
+                self._publish("storage_fault", {
+                    "code": "STORAGE_UNAVAILABLE", "message": "The search could not be saved.",
+                    "operation": operation, "blocked_capabilities": ["Register", "Start", "Resume", "Review", "RetentionChange"],
+                    "deletion": retention["deletion"], "runtime": self._runtime(self._projection),
+                })
+            else:
+                self._publish("session_changed", {"session": current, "operation": operation,
+                                                  "runtime": self._runtime(self._projection)})
+        else:
+            self._publish_snapshot()
+
+    def publish_search_commit(
+        self, session: Projection, operation: Projection | None, target: Projection | None, pending: bool,
+    ) -> None:
+        self.search_committed(session)
+        state = self._projection
+        if state is None:
+            return
+        self._projection_revision += 1
+        ended = session["state"] == "Ended"
+        target = target or cast(Projection | None, state["active_object"])
+        if not ended and (target is None or target["id"] != session["object_id"]):
+            # Receipt recovery can establish the commit before an eligible owner projection is available.
+            return
+        if operation is not None:
+            self._project_operation(state, operation)
+        state.update(active_session=None if ended else session, active_object=None if ended else target,
+                     session_id=None if ended else session["id"],
+                     failures=[self.failure] if self.failure and not ended else [])
+        runtime = cast(Projection, state["runtime"])
+        runtime.update(effective_session_state=None if ended else session["state"], persistence_pending=pending)
+        retention = cast(Projection, state["retention"])
+        retention.update(active_object_expires_at_ms=target["expires_at_ms"] if target and not ended else None,
+                         active_object_grace=bool(target and not ended and target["retention_grace"]))
+        if self._pause_required_for == session["id"] and session["state"] == "Paused":
+            self._pause_required_for = None
+        # The full projection introduces a new owner or lease generation before the typed completion.
+        self._publish_snapshot()
+        self._publish("session_changed", {"session": session, "operation": operation, "runtime": self._runtime(state)})
 
     def _runtime(self, state: Projection) -> Projection:
         runtime = {**cast(Projection, state["runtime"]), "control_generation": self._generation}
@@ -491,7 +669,7 @@ class Realtime:
                                             "Controller": shared and statuses["Controller"]}}
         state["runtime"] = self._runtime(projection)
         state["lease"] = public_lease(lease.client if lease else None, self._generation,
-                                      self._can_acquire(client) and len(self._receipts) < MAX_RUNTIME_RECEIPTS)
+                                      self._can_acquire(client) and not self.request_at_capacity())
         return state
 
     async def snapshot(self, client: str | None = None) -> Projection | None:
@@ -609,8 +787,16 @@ class Realtime:
     def object_removed(self, owner: str) -> None:
         if self._closed or not self.profile:
             return
-        self._removal_revision += 1
+        self._projection_revision += 1
         if self._projection is not None:
+            if self._projection["session_id"] is not None and (
+                isinstance(active := self._projection["active_session"], dict) and active["object_id"] == owner
+            ):
+                self._projection.update(active_object=None, active_session=None, session_id=None, failures=[])
+                runtime = cast(Projection, self._projection["runtime"])
+                runtime["effective_session_state"] = None
+                retention = cast(Projection, self._projection["retention"])
+                retention.update(active_object_expires_at_ms=None, active_object_grace=False)
             operations = cast(list[Projection], self._projection["operations"])
             self._projection["operations"] = [
                 operation for operation in operations if _operation_owner(operation) != owner
@@ -752,13 +938,16 @@ class Realtime:
                 or data["type"] != "workspace_heartbeat" or type(data["protocol_version"]) is not int
                 or data["protocol_version"] != 1 or data["backend_boot_id"] != self.boot
                 or data["client_id"] != lease.client or not token(data["client_lease_id"])
-                or not compare_digest(data["client_lease_id"], lease.secret) or data["session_id"] != lease.session
+                or not compare_digest(data["client_lease_id"], lease.secret)
+                or (data["session_id"] != lease.session and not
+                    (data["session_id"] is None and lease.setup_handoff))
                 or not counter(data["control_generation"]) or data["control_generation"] != self._generation
                 or not counter(data["heartbeat_seq"])
                 or (data["heartbeat_seq"] <= lease.heartbeat_seq if lease.heartbeat_seq else data["heartbeat_seq"] != 1)
                 or any(type(data[flag]) is not bool for flag in WORKSPACE_FLAGS)):
             return False
         indication = data["displayed_robot_frame"]
+        setup_heartbeat = lease.setup_handoff and data["session_id"] is None
         if indication is not None:
             video = self._connections.get((connection.client, "robot-video"))
             if (not isinstance(indication, dict) or indication.keys() != {"frame_id", "stream_epoch"}
@@ -769,12 +958,17 @@ class Realtime:
             if frame is None or indication["stream_epoch"] != frame.stream_epoch or now >= frame.display_deadline:
                 return False
             # The deadline is anchored to acquisition, so receiving the same identity never extends it.
-            lease.display_deadline = frame.display_deadline
+            if not setup_heartbeat:
+                lease.display_deadline = frame.display_deadline
         if not all(data[flag] for flag in WORKSPACE_FLAGS):
             self._revoke("WorkspaceUnavailable")
             return True
         changed = not lease.workspace or lease.displayed != (indication is not None)
         lease.heartbeat_seq = data["heartbeat_seq"]
+        if setup_heartbeat:
+            # An in-flight setup heartbeat cannot renew the newly bound session.
+            return True
+        lease.setup_handoff = False
         lease.heartbeat_deadline = now + profile.bound("heartbeat_deadline_ms") / 1000
         lease.workspace = True
         lease.displayed = indication is not None

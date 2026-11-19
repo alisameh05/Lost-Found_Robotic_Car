@@ -89,8 +89,13 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     const receipt = snapshot.operations.find(({ request_id }) => request_id === response.request_id);
     if (receipt?.persistence === "Failed") {
       update({ emergency: { kind: "result", status: 503, response: { ...response, persistence: "Failed", error: receipt.error } } });
-    } else if (receipt?.persistence === "Committed" && receipt.result.session?.id === response.session_id &&
-        receipt.result.session.pause_causes.some(({ failure_id }) => failure_id === response.failure_id)) {
+    } else if (receipt?.persistence === "Committed" && receipt.result.session === null) {
+      update({ emergency: { kind: "result", status: 200, response: { ...response, persistence: "Committed",
+        session_id: null, failure_id: null, error: null } } });
+    } else if ((receipt?.persistence === "Committed" && receipt.result.session?.id === response.session_id &&
+        receipt.result.session.pause_causes.some(({ failure_id }) => failure_id === response.failure_id)) ||
+        (response.session_id === snapshot.active_session?.id && snapshot.active_session?.pause_causes.some(
+          ({ failure_id }) => failure_id === response.failure_id))) {
       update({ emergency: { kind: "result", status: 200, response: { ...response, persistence: "Committed", error: null } } });
     }
   }
@@ -422,7 +427,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     acquireWorkspace: () => workspace?.acquire(),
     releaseWorkspace: () => workspace?.release(),
     submitSearch(intent: SearchIntent) {
-      if (recordsMode) return;
+      if (recordsMode && intent.kind !== "start" && intent.kind !== "pause" && intent.kind !== "stop") return;
       const state = view.snapshot;
       if (!context || !workspace || !state || !view.workspace?.eventsLive) return;
       const active = state.active_session;

@@ -17,6 +17,7 @@ from .http import (
     LIST_QUERIES,
     RECORDS_ROUTES,
     RETENTION_ROUTES,
+    SEARCH_ROUTES,
     HttpError,
     authorize_address,
     authorize_capability,
@@ -33,6 +34,7 @@ from .realtime import CHANNELS, Channel, ticket_request
 from .registration_input import NAME_LIMIT, normalize_name, parse_registration
 from .retention_input import parse_retention
 from .runtime import PageError, RecordsRuntime
+from .search_input import parse_emergency, parse_search
 from .simulation import IncompatibleProfile, Simulation, load_simulation
 from .storage import RecordsStorage, storage_unavailable
 
@@ -83,7 +85,6 @@ def _ignore_invalidation(_: str, __: Channel) -> None:
 
 
 def _ignore_revocation(_: Revocation) -> None:
-    # This slice has no session writer. The lifecycle coordinator receives the stopped generation here.
     pass
 
 
@@ -161,11 +162,11 @@ def create_app(
                         raise HttpError(403, "CLIENT_INVALID", "Provide a page identity for the retention request.")
                 elif registering:
                     header(request, "x-app-client-id", 403, "CLIENT_INVALID")
-                elif path != "/bootstrap" and path not in LEASE_ROUTES:
+                elif path != "/bootstrap" and path not in LEASE_ROUTES | SEARCH_ROUTES:
                     authorize_client(request, runtime, required=path in CLIENT_ROUTES)
                 allowed = LIST_QUERIES.get(path, ()) if not registering else ()
-                query = parse_query(request.scope["query_string"], allowed)
-                if not registering and path not in RETENTION_ROUTES | LEASE_ROUTES | {"/websocket-tickets"}:
+                query = {} if path == "/emergency-stop" else parse_query(request.scope["query_string"], allowed)
+                if not registering and path not in RETENTION_ROUTES | LEASE_ROUTES | SEARCH_ROUTES | {"/websocket-tickets"}:
                     await require_empty_body(request)
                 if path == "/objects" and not registering:
                     validate_objects_query(query)
@@ -212,7 +213,23 @@ def create_app(
         assert runtime.realtime is not None
         parsed = await parse_lease(request, release=route_path(request) == "/control-lease/release")
         try:
-            return JSONResponse(await runtime.realtime.change_lease(parsed))
+            outcome = await runtime.realtime.change_lease(parsed)
+            assert runtime.sessions is not None
+            job = runtime.sessions.release_results.get(parsed.request_id)
+            if job is None:
+                return JSONResponse(outcome)
+            await runtime.sessions.wait_for_save(job)
+            snapshot = await runtime.realtime.snapshot(parsed.client)
+            if snapshot is not None:
+                outcome["snapshot"] = snapshot
+            persistence = job.persistence
+            if persistence == "Failed":
+                assert job.error is not None
+                return JSONResponse({
+                    **job.error, "permission_revoked": True,
+                    **({"snapshot": snapshot} if snapshot is not None else {}),
+                }, status_code=503)
+            return JSONResponse(outcome, status_code=202 if persistence == "Pending" else 200)
         except LeaseRejected as failure:
             status, message, retryable = LEASE_ERRORS[failure.reason]
             error = HttpError(status, failure.reason, message, retryable)
@@ -222,6 +239,31 @@ def create_app(
             if failure.snapshot is not None:
                 details["snapshot"] = failure.snapshot
             return error.response(**details)
+
+    @app.post(API_PREFIX + "/sessions")
+    @app.post(API_PREFIX + "/sessions/{id}/actions")
+    async def change_session(request: Request) -> Response:
+        runtime: RecordsRuntime = request.app.state.runtime
+        assert runtime.sessions is not None
+        parsed = await parse_search(request, request.path_params.get("id"))
+        receipt = await runtime.sessions.action(parsed)
+        return Response(receipt.body, status_code=receipt.status, media_type="application/json",
+                        headers={"Location": receipt.location} if receipt.location else None)
+
+    @app.post(API_PREFIX + "/emergency-stop")
+    async def emergency_stop(request: Request) -> JSONResponse:
+        runtime: RecordsRuntime = request.app.state.runtime
+        assert runtime.sessions is not None
+        session = runtime.sessions.emergency_revoke()
+        try:
+            parse_query(request.scope["query_string"], ())
+            request_id, client = await parse_emergency(request)
+            status, body = await runtime.sessions.emergency(request_id, client, session)
+            return JSONResponse(body, status_code=status)
+        except HttpError as error:
+            return error.response(permission_revoked=True)
+        except (OSError, sqlite3.Error):
+            return storage_unavailable().response(permission_revoked=True)
 
     @app.websocket(API_PREFIX + "/events")
     @app.websocket(API_PREFIX + "/video/robot")

@@ -1,5 +1,4 @@
 import asyncio
-import json
 import re
 import sqlite3
 from collections import OrderedDict
@@ -11,10 +10,12 @@ from typing import Literal
 
 from .control import Revocation
 from .http import HttpError
+from .operations import MAX_ORDINARY_PENDING, MAX_TERMINAL, Operation, mutation
 from .realtime import Channel, Realtime
 from .reference_image import Reference, prepare_reference
-from .registration_input import SAFE_INTEGER, Registration, canonical_json
+from .registration_input import SAFE_INTEGER, Registration
 from .retention_input import RetentionChange, RetentionProposal
+from .sessions import SessionCoordinator
 from .simulation import Simulation
 from .storage import (
     HistoryKind,
@@ -37,8 +38,6 @@ MAX_CURSORS = 1024
 PREVIEW_SECONDS = 60
 MAX_CLIENT_PREVIEWS = 32
 MAX_PREVIEWS = 1024
-MAX_ORDINARY_PENDING = 62
-MAX_TERMINAL = 64
 MAX_QUEUED_REFERENCE_BYTES = 128 * 1024**2
 DEFERRED_COMPONENTS = (
     "Command", "RobotVideo", "DisplayedRobotVideo", "Webcam", "Controller", "AI", "Workspace", "QualificationProfile",
@@ -69,25 +68,6 @@ class PageError(Exception):
         self.reason = reason
 
 
-@dataclass(frozen=True)
-class Operation:
-    fingerprint: str
-    response: Receipt
-    owner: str | None = None
-    retention_client: str | None = None
-
-    def payload(self) -> dict[str, object]:
-        data: dict[str, object] = json.loads(self.response.body)
-        return {"request_id": None, **data}
-
-
-def mutation(action_id: str, persistence: str, status: int, error: HttpError | None = None) -> Receipt:
-    return Receipt(canonical_json({
-        "action_id": action_id, "persistence": persistence, "result": None,
-        "error": json.loads(bytes(error.response().body)) if error else None,
-    }), status, None)
-
-
 def registration_unknown() -> HttpError:
     return HttpError(500, "INTERNAL_ERROR", "The registration outcome is unknown. Retry the same request.", True)
 
@@ -112,14 +92,21 @@ class RecordsRuntime:
     _retention_changed: asyncio.Event = field(default_factory=asyncio.Event, repr=False)
     _retention_task: asyncio.Task[None] | None = field(default=None, repr=False)
     _queued_reference_bytes: int = 0
+    sessions: SessionCoordinator | None = field(default=None, init=False, repr=False)
     realtime: Realtime | None = field(default=None, init=False, repr=False)
 
     def enable_realtime(self, simulation: Simulation | None, unavailable_code: str,
                         invalidate: Callable[[str, Channel], None],
                         on_control_revoked: Callable[[Revocation], None]) -> Realtime:
+        def revoked(revocation: Revocation) -> None:
+            if self.sessions:
+                self.sessions.revoked(revocation)
+            on_control_revoked(revocation)
+
         self.realtime = Realtime(simulation, unavailable_code, self.boot_id, self.storage.monotonic,
                                  self.storage.clock, self.touch_client, self.realtime_projection, invalidate,
-                                 self.expire_clients, on_control_revoked)
+                                 self.expire_clients, revoked)
+        self.sessions = SessionCoordinator(self, self.realtime)
         return self.realtime
 
     def frontend_profile(self) -> dict[str, int | str] | None:
@@ -201,6 +188,9 @@ class RecordsRuntime:
             raise HttpError(503, "INITIALIZING", "Checking records storage. Retry when initialization finishes.", True)
         if self._startup_fault:
             raise storage_unavailable(self._startup_fault.problem or "Records storage could not initialize.")
+
+    def ordinary_pending(self) -> int:
+        return sum(op.slot == "ordinary" for op, _ in self._pending.values())
 
     def preparing(self) -> tuple[str, ...]:
         return tuple(self._pending)
@@ -341,7 +331,7 @@ class RecordsRuntime:
                     or preview is None or preview.client != client or preview.proposal != change.proposal
                     or change.preview_id in self._reserved_previews):
                 raise preview_stale()
-            if self._stopping or len(self._pending) >= MAX_ORDINARY_PENDING:
+            if self._stopping or self.ordinary_pending() >= MAX_ORDINARY_PENDING:
                 raise HttpError(503, "CAPACITY_REACHED", "Settings are busy. Retry the same request shortly.", True)
             operation = Operation(fingerprint, mutation(action, "Pending", 202), retention_client=client)
             self._reserved_previews.add(change.preview_id)
@@ -422,7 +412,7 @@ class RecordsRuntime:
                 if receipt:
                     return receipt
             authorize()
-            if self._stopping or len(self._pending) >= MAX_ORDINARY_PENDING:
+            if self._stopping or self.ordinary_pending() >= MAX_ORDINARY_PENDING:
                 raise HttpError(503, "CAPACITY_REACHED", "Registration is busy. Retry the same request shortly.", True)
             await asyncio.to_thread(self.storage.require_new_registration, registration.submitted_at, self.preparing())
             # Decode under the admission lock so oversized decoded buffers cannot accumulate in parallel.
@@ -486,7 +476,7 @@ class RecordsRuntime:
 
     async def operations(self) -> list[dict[str, object]]:
         await self.prune_terminal()
-        return [operation.payload() for operation, _ in self._pending.values()] + [
+        return [operation.payload() for operation, _ in self._pending.values() if operation.visible] + [
             operation.payload() for operation in self._terminal.values()
         ]
 
@@ -525,7 +515,10 @@ class RecordsRuntime:
             "storage_integrity": "Healthy" if healthy else "Reconciling" if starting else "Unavailable",
             "readiness": self.readiness(storage),
             "active_session_state": storage.active_session_state if storage else None,
-            "operational_state": "Idle" if healthy else "Reconciling" if starting else "Faulted",
+            "operational_state": (
+                self.realtime.effective_state(storage.active_session_state) if healthy and storage and self.realtime
+                else "Idle" if healthy else "Reconciling" if starting else "Faulted"
+            ),
         }
 
     async def realtime_projection(self) -> dict[str, object] | None:

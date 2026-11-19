@@ -130,7 +130,7 @@ export function openSearchActions({
       response = { kind: "unavailable" };
     }
     if (delivery.aborted || !current(action)) return;
-    if (response.kind === "api-error") {
+    if (response.kind === "api-error" && response.error.action_id !== body.action_id) {
       action.feedback = { stage: "rejected", message: `${response.error.code} · ${response.error.message}` };
       publish();
       refresh(response.error.code);

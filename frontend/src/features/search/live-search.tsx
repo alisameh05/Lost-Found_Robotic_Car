@@ -24,8 +24,8 @@ import { duration, searchMode } from "./session-facts";
 import styles from "./session.module.css";
 
 export function LiveSearchScreen({ sessionId }: { sessionId: string }) {
-  const { recordsMode } = useRuntimeView();
-  return recordsMode ? <SearchUnavailable title="Live Search Workspace" /> : <LiveSearch sessionId={sessionId} />;
+  const { recordsMode, profile } = useRuntimeView();
+  return recordsMode && !profile ? <SearchUnavailable title="Live Search Workspace" /> : <LiveSearch sessionId={sessionId} />;
 }
 
 function LiveSearch({ sessionId }: { sessionId: string }) {
@@ -63,7 +63,7 @@ function LiveSearch({ sessionId }: { sessionId: string }) {
 
 function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snapshot }) {
   const { active_session: session, active_object: object, runtime: effective, lease, readiness } = snapshot;
-  const { workspace, profile, searchActions } = useRuntimeView();
+  const { workspace, profile, searchActions, recordsMode, emergency } = useRuntimeView();
   const connection = useRuntime()?.connection;
   const runtime = connection?.runtime;
   const router = useRouter();
@@ -164,8 +164,14 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     (lease.can_acquire || !!workspace.retryAcquisition);
   const canLeavePaused = session.state === "Paused" && state === "Paused" && !effective.persistence_pending;
   const waitingToLeave = leaving && (unresolved(pause) || canLeavePaused);
+  const saving = recordsMode
+    ? snapshot.operations.some(({ persistence }) => persistence === "Pending")
+    : effective.persistence_pending;
   const unsavedEmergency = failures.some(({ cause, failure_id }) => cause === "EmergencyStop" &&
     !session.pause_causes.some((pauseCause) => pauseCause.failure_id === failure_id));
+  const emergencySaveFailed = unsavedEmergency && (recordsMode
+    ? emergency?.kind === "result" && emergency.response.persistence === "Failed" && emergency.response.session_id === sessionId
+    : !saving);
   const requiredUnavailable = readiness.components.filter(({ component, status }) => status !== "Ready" &&
     component !== (gestures ? "Controller" : "Webcam"));
   const recoveryBlockers = [
@@ -176,8 +182,9 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     requiredUnavailable.length > 0 && `Required paths unavailable: ${requiredUnavailable.map(({ component }) => devicePaths[component].label).join(", ")}.`,
     failures.some(({ restored }) => !restored) && "Restore the failed paths.",
     failures.some(({ acknowledged }) => !acknowledged) && "Acknowledge each outstanding failure.",
-    effective.persistence_pending && "Wait for the pending save.",
-    session.state !== "Paused" && state === "Paused" && !effective.persistence_pending && "Save the pause before resuming.",
+    saving && "Wait for the pending save.",
+    session.state !== "Paused" && state === "Paused" && !saving && "Save the pause before resuming.",
+    recordsMode && "Resume and recovery actions are unavailable in this simulation.",
     candidate && "Complete the pending match review.",
     !candidate && snapshot.pending_candidate && "Wait for the current candidate review to become available.",
   ].filter((item): item is string => typeof item === "string");
@@ -190,7 +197,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   }
 
   return <div className={styles.page}>
-    <PageHeader title="Live Search Workspace" actions={<>
+    <PageHeader title="Live Search Workspace" description={recordsMode ? "Backend simulation · Disarmed" : undefined} actions={<>
       <Button onClick={() => setHelp(!help)} aria-expanded={help} aria-controls={help ? "live-control-help" : undefined}>Control Help</Button>
       {(state === "Paused" || recovery) && <Button onClick={() => setRecovery(!recovery)}
         aria-expanded={recovery} aria-controls={recovery ? "search-recovery" : undefined}>Recovery</Button>}
@@ -206,7 +213,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
         <span aria-label="Elapsed time">{duration(elapsed)}</span>
         {session.state === "Searching" || unresolved(resume)
           ? <Button disabled={blocked || unresolved(pause)} onClick={() => { void runtime?.submitSearch({ kind: "pause", sessionId }); }}>Pause</Button>
-          : <Button disabled={blocked || !ready || !readiness.can_resume || unresolved(resume)}
+          : <Button disabled={recordsMode || blocked || !ready || !readiness.can_resume || unresolved(resume)}
             onClick={() => { void runtime?.submitSearch({ kind: "resume", sessionId }); }}>Resume</Button>}
         {!candidate && <Button variant="destructive" disabled={blocked} onClick={stopSearch}>Stop Search</Button>}
       </div>
@@ -233,7 +240,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     </Panel>}
     {help && <ModelessPanel id="live-control-help" title="Control Help"><ModeInstructions mode={mode} heading="h3" /></ModelessPanel>}
     {recovery && <RecoveryPanel failures={failures} blockers={recoveryBlockers} searching={searching}
-      canAcknowledge={owner && connected && readiness.components.some(({ component, status }) => component === "Storage" && status === "Ready")}
+      canAcknowledge={!recordsMode && owner && connected && readiness.components.some(({ component, status }) => component === "Storage" && status === "Ready")}
       feedback={acknowledgment} acknowledge={(id) => { void runtime?.submitSearch({ kind: "acknowledge", sessionId, failureIds: [id] }); }}
       retry={() => { void runtime?.retrySearch("acknowledge", sessionId); }} />}
     <div role="status" className="visually-hidden">{candidate && "Potential match. Search paused for review."}</div>
@@ -252,7 +259,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
             <header><h2 id="robot-title"><Video aria-hidden="true" />Robot camera</h2>
               <StatusBadge tone={workspace?.previewLive ? "success" : "warning"}>{workspace?.previewLive ? "Live sample" : "Not live"}</StatusBadge></header>
             <div ref={robot} className={styles.surface} />
-            <p>{matching ? "AI matching active" : "AI matching suspended"} · {snapshot.pending_candidate ? "Candidate awaiting review" : "No candidate awaiting review"}</p>
+            <p>{matching ? recordsMode ? "Simulated AI matching active" : "AI matching active" : "AI matching suspended"} · {snapshot.pending_candidate ? "Candidate awaiting review" : "No candidate awaiting review"}</p>
           </Panel>
         </div>
         <Panel className={styles.input} aria-label={gestures ? "Gesture feedback" : "Controller feedback"}>
@@ -260,7 +267,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
           <div role="status">
             <p>{input}</p>
             <p>Motion permission · {permission}</p>
-            {searching && ready && permission !== "Armed" && <p>{permission === "Arming" ? "Ready for a fresh hold." : "Release to neutral before holding a direction."}</p>}
+            {!recordsMode && searching && ready && permission !== "Armed" && <p>{permission === "Arming" ? "Ready for a fresh hold." : "Release to neutral before holding a direction."}</p>}
           </div>
         </Panel>
       </div>
@@ -278,7 +285,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
           <p>Search accepted · <RecordTime value={session.started_at_ms} compact /></p>
           <p>Committed session · {session.state}</p>
           {effective.persistence_pending && <p>Session save pending</p>}
-          {unsavedEmergency && !effective.persistence_pending && <p>Emergency pause save failed. Retry Emergency Stop to save it.</p>}
+          {emergencySaveFailed && <p>Emergency pause save failed. Retry Emergency Stop to save it.</p>}
         </section>
         <section aria-label="Control ownership">
           <h2>Control ownership</h2>

@@ -1,7 +1,7 @@
 "use client";
 
 import { useCallback, type ReactNode } from "react";
-import { AppShell } from "@/components/layout/app-shell";
+import { RuntimeFrame } from "./runtime-shell";
 import { Notice } from "@/components/ui/feedback";
 import { createHttpTransport } from "@/lib/http-transport";
 import { RuntimeProvider, useRuntimeView } from "./runtime-provider";
@@ -11,11 +11,11 @@ function RecordsFrame({ children }: { children: ReactNode }) {
   const connectedLabel = profile ? "Backend simulation" : "Records connected · Search unavailable";
   const status = connected ? connectedLabel
     : health?.initialization === "Starting" || loading ? "Connecting to local records" : "Local records unavailable";
-  return <AppShell fixtureEnabled={false} modeLabel={status}>
+  return <RuntimeFrame fixtureEnabled={false} modeLabel={status}>
     {failedRead?.kind === "api-error" && failedRead.error.code === "STORAGE_UNAVAILABLE" &&
       <Notice title="Local records storage unavailable" role="alert" tone="danger">{failedRead.error.message}</Notice>}
     {children}
-  </AppShell>;
+  </RuntimeFrame>;
 }
 
 export function RecordsShell({ backendBaseUrl, children }: { backendBaseUrl: string; children: ReactNode }) {

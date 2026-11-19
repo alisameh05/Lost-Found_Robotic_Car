@@ -169,7 +169,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
     <footer className={styles.footer}>
       <div role="status" className={styles.feedback}>
         {ready ? <Notice tone="success" title="Ready to start">{recordsMode
-          ? "Required paths are ready and the displayed robot frame is confirmed. Starting a search is unavailable in this simulation."
+          ? "Required paths are ready and the displayed robot frame is confirmed. Simulated motion stays disarmed."
           : "Required paths are ready and the robot preview is live."}</Notice>
           : notice ? <Notice tone="warning" title="Start blocked">{notice}</Notice>
           : <Notice title={spectator ? "Spectator" : workspace?.controlling ? "Checking the displayed frame" : "Preview only"}>
@@ -190,9 +190,9 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
         {workspace?.retryRelease && <Button variant="secondary" onClick={() => { void runtime?.releaseWorkspace(); }}>Retry release</Button>}
         {!workspace?.controlling && !workspace?.releasing && !workspace?.retryRelease && <Button variant="primary" pending={workspace?.acquiring}
           disabledReason={acquisitionBlocked} onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
-        <Button variant="primary" pending={starting?.stage === "sending"} disabled={recordsMode || !ready || busy}
+        <Button variant="primary" pending={starting?.stage === "sending"} disabled={!ready || busy}
           onClick={() => {
-            if (recordsMode || !ready) return;
+            if (!ready) return;
             requestedStart.current = true;
             void runtime?.submitSearch({ kind: "start", object, mode });
           }}>Start Search</Button>
