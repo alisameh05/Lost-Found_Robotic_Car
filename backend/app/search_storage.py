@@ -11,6 +11,7 @@ from .registration_input import SAFE_INTEGER, canonical_json
 from .search_input import SearchRequest
 from .storage import (
     DELETING,
+    ELIGIBLE,
     GRACE,
     OBJECT_ROWS,
     Receipt,
@@ -51,10 +52,19 @@ def search_record(db: sqlite3.Connection, request: SearchRequest, now: int, days
     return cast(sqlite3.Row, row)
 
 
-def verify_transition(db: sqlite3.Connection, row: sqlite3.Row, request: SearchRequest, now: int, days: int) -> None:
+def verify_transition(
+    db: sqlite3.Connection, row: sqlite3.Row, request: SearchRequest, now: int, days: int,
+    superseded_resume: str | None,
+) -> None:
     if (row["status"] != "Lost" if request.mode else row["state"] == "Ended"):
         raise HttpError(409, "INVALID_TRANSITION", "The saved record does not allow this search action.")
-    if row["revision"] != request.revision:
+    # A safety action admitted at the visible revision may overtake its exact in-flight Resume commit.
+    resume_committed = (superseded_resume is not None and request.safety_action and row["state"] == "Searching"
+                        and row["revision"] == request.revision + 1 and db.execute("""
+                            SELECT 1 FROM action_receipts WHERE action_id = ? AND session_id = ?
+                            AND action_type = 'resume' AND result_revision = ?
+                        """, (superseded_resume, row["id"], row["revision"])).fetchone() is not None)
+    if row["revision"] != request.revision and not resume_committed:
         raise HttpError(409, "REVISION_CONFLICT", "The saved record changed. Refresh and try again.",
                         revision=row["revision"])
     if request.action == "resume":
@@ -69,13 +79,11 @@ def verify_transition(db: sqlite3.Connection, row: sqlite3.Row, request: SearchR
     if request.failure_ids:
         placeholders = ",".join("?" for _ in request.failure_ids)
         failures = db.execute(f"""
-            SELECT f.session_id, o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting
+            SELECT f.session_id
             FROM session_failures AS f JOIN sessions AS s ON s.id = f.session_id
-            JOIN objects AS o ON o.id = s.object_id WHERE f.failure_id IN ({placeholders})
-        """, request.failure_ids).fetchall()
-        if len(failures) != len(request.failure_ids) or any(
-            f["deleting"] or (not f["grace"] and f["registered_at_ms"] + retention_ms(days) <= now) for f in failures
-        ):
+            JOIN objects AS o ON o.id = s.object_id WHERE {ELIGIBLE} AND f.failure_id IN ({placeholders})
+        """, (now - retention_ms(days), *request.failure_ids)).fetchall()
+        if len(failures) != len(request.failure_ids):
             raise HttpError(404, "NOT_FOUND", "A referenced failure could not be found.")
         if any(f["session_id"] != row["id"] for f in failures):
             raise HttpError(409, "OWNERSHIP_MISMATCH", "A referenced failure belongs to a different session.")
@@ -83,6 +91,7 @@ def verify_transition(db: sqlite3.Connection, row: sqlite3.Row, request: SearchR
 
 def inspect_search(
     storage: RecordsStorage, request: SearchRequest, fingerprint: str, *, transition: bool = False,
+    superseded_resume: str | None = None,
 ) -> tuple[Receipt | None, str]:
     with storage.connect() as db, read_transaction(db):
         db.row_factory = sqlite3.Row
@@ -93,7 +102,7 @@ def inspect_search(
         if transition and prior is None:
             if request.mode and storage.active_session_state(db):
                 raise HttpError(409, "ACTIVE_SESSION_EXISTS", "A saved search is already active.")
-            verify_transition(db, row, request, now, days)
+            verify_transition(db, row, request, now, days, superseded_resume)
         return prior, row["id" if request.mode else "object_id"]
 
 
@@ -125,7 +134,7 @@ def acknowledge(db: sqlite3.Connection, row: sqlite3.Row, ids: tuple[str, ...]) 
 
 def save_search(
     storage: RecordsStorage, request: SearchRequest, fingerprint: str, session_id: str,
-    preparing: Collection[str], authorize: Callable[[bool], None],
+    preparing: Collection[str], authorize: Callable[[bool], None], superseded_resume: str | None,
 ) -> SavedSearch:
     with storage.mutation_connection() as db, write_transaction(db):
         db.row_factory = sqlite3.Row
@@ -139,7 +148,7 @@ def save_search(
                 return SavedSearch(None, owner, receipt=prior)
             if request.mode and storage.active_session_state(db):
                 raise HttpError(409, "ACTIVE_SESSION_EXISTS", "A saved search is already active.")
-            verify_transition(db, row, request, now, days)
+            verify_transition(db, row, request, now, days, superseded_resume)
             authorize(False)
             match = None
             target = None

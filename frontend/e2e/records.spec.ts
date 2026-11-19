@@ -17,12 +17,13 @@ test.use({ baseURL: frontend });
 
 async function startBackend(options: {
   initializationGate?: string; crashAfterCommit?: boolean; registrationGate?: string; clockOffset?: string;
-  cleanupFault?: string; settingsGate?: string; simulation?: boolean;
+  cleanupFault?: string; settingsGate?: string; stopGate?: string; simulation?: boolean;
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
     : options.registrationGate ? ["backend.tests.crash_registration", "journaled", options.registrationGate]
     : options.settingsGate ? ["backend.tests.crash_registration", "retention_before_commit", options.settingsGate]
+    : options.stopGate ? ["backend.tests.crash_registration", "before_stop_commit", options.stopGate]
     : options.clockOffset ? ["backend.tests.crash_registration", "clock", options.clockOffset,
       ...(options.cleanupFault ? ["deny-purge", options.cleanupFault] : [])]
     : ["backend.app"];
@@ -1112,7 +1113,8 @@ test("persists both simulated modes and recovers an interrupted search after ser
 
 test("recovers the same saved search deliberately after an emergency, reload and an event gap", async ({ page }) => {
   test.setTimeout(75_000);
-  await startBackend({ simulation: true });
+  const stopGate = join(parent, "finish-stop");
+  await startBackend({ simulation: true, stopGate });
   await observePreviewFrames(page);
   const { requests } = observe(page);
   await selectTarget(page, sourceImage(), "Recovery target");
@@ -1181,7 +1183,7 @@ test("recovers the same saved search deliberately after an emergency, reload and
   expect(count("/control-lease")).toBe(2);
   expect(count("/actions")).toBe(4);
   await button("Acquire control").click();
-  await expect(recovery.getByText("Workspace disconnected", { exact: true })).toBeVisible();
+  await expect(recovery.getByRole("strong").filter({ hasText: /^Workspace disconnected$/ })).toBeVisible();
   await expect(recovery.getByText("Restored · Awaiting acknowledgment")).toBeVisible();
   await recovery.getByRole("button", { name: "Acknowledge", exact: true }).click();
   await resumeSavedSearch();
@@ -1189,6 +1191,18 @@ test("recovers the same saved search deliberately after an emergency, reload and
   await expect(page.getByRole("region", { name: "Active search target" })).toContainText("Recovery target");
   await expect(page.getByText("PS4 DualShock 4 · Target and mode locked")).toBeVisible();
   expect(requests.filter((request) => request === "POST /api/v1/sessions")).toHaveLength(1);
+  await button("Pause").click();
+  await expect(activity).toContainText("Committed session · Paused");
+  await button("Stop Search").click();
+  try {
+    await expect(page.getByText("Save pending", { exact: true })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Control ownership" })).toContainText("This workspace holds control.");
+    await expect(resume).toBeDisabled();
+    await expect(button("Emergency Stop")).toBeEnabled();
+  } finally {
+    writeFileSync(stopGate, "");
+  }
+  await expect(page).toHaveURL(url.replace(/\/live$/, "/result"));
 });
 
 test("marks the last connected Workspace frame Not live and stops a held command", async ({ page }) => {

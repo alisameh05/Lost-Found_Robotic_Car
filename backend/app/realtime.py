@@ -294,9 +294,12 @@ class Realtime:
         self._resume_viable = True
 
     def check_resume(self, session: str, revision: int) -> None:
-        if self._resuming_session != session or not self._resume_viable:
+        if self.resume_superseded(session):
             raise HttpError(409, "INVALID_TRANSITION", "A safety stop superseded Resume.")
         self._check_resume_ready(session, revision)
+
+    def resume_superseded(self, session: str) -> bool:
+        return self._resuming_session != session or not self._resume_viable
 
     def finish_resume(self, session: str, grant: bool) -> None:
         self._resuming_session = None
@@ -436,15 +439,19 @@ class Realtime:
     def _evaluate_motion(self, now: float) -> None:
         self._expire_lease(now)
         scope = self._motion_scope()
-        if scope and self._motion:
+        if (scope or self._resume_viable) and self._motion:
             selected = self._selected_input()
             assert selected is not None
             required = ("RobotVideo", "Command", selected, "AI", "Storage")
             failed = next((PATH_FAILURES[name] for name in required if self.component_cause(name)), None)
             now = self.monotonic()
             self._expire_lease(now)
-            if scope == self._motion_scope() and (failed or (failed := self._motion.tick(scope, now, self.monotonic))):
-                self._revoke(failed)
+            authorized = (scope == self._motion_scope() if scope else self._resume_viable)
+            if authorized:
+                if failed is None and scope is not None:
+                    failed = self._motion.tick(scope, now, self.monotonic)
+                if failed:
+                    self._revoke(failed)
         self._publish_permission()
 
     def _publish_permission(self) -> None:
@@ -906,7 +913,7 @@ class Realtime:
             live["Storage"] = False
         components = [
             {"component": name, "status": "Ready" if live[name] else "Unavailable",
-             "cause_codes": [] if live[name] else ["NOT_READY"]}
+             "cause_codes": [] if live[name] else ["STORAGE_UNAVAILABLE" if name == "Storage" else "NOT_READY"]}
             if (name := str(component["component"])) in live else component
             for component in cast(list[Projection], readiness["components"])
         ]
@@ -914,14 +921,16 @@ class Realtime:
         shared = owns and all(ready for name, ready in statuses.items() if name not in ("Webcam", "Controller"))
         start = shared and projection["session_id"] is None and bool(projection["eligible_target"])
         session = projection["active_session"]
+        runtime = self._runtime(projection)
         resume = bool(shared and lease and isinstance(session, dict) and lease.session == session["id"]
-                      and session["state"] == "Paused" and statuses[self._selected_input() or "Webcam"]
-                      and not self._resuming_session and projection["pending_candidate"] is None
+                      and session["state"] == "Paused" and self._required_paths_ready(lease, session["control_mode"])
+                      and not runtime["persistence_pending"] and self._resuming_session is None
+                      and projection["pending_candidate"] is None
                       and not self.failures_for(lease.session))
         state["readiness"] = {**readiness, "components": components,
                               "can_start": {"Gestures": start and statuses["Webcam"],
                                             "Controller": start and statuses["Controller"]}, "can_resume": resume}
-        state["runtime"] = self._runtime(projection)
+        state["runtime"] = runtime
         state["failures"] = self.failures_for(cast(str | None, projection["session_id"]))
         if self._proximity:
             state["proximity"] = self._proximity.payload
@@ -1363,7 +1372,7 @@ class Realtime:
             # The deadline is anchored to acquisition, so receiving the same identity never extends it.
             if not setup_heartbeat:
                 lease.display_deadline = frame.display_deadline
-        changed = not lease.workspace or lease.displayed != (indication is not None)
+        changed = lease.setup_handoff or not lease.workspace or lease.displayed != (indication is not None)
         lease.heartbeat_seq = data["heartbeat_seq"]
         if setup_heartbeat:
             # An in-flight setup heartbeat cannot renew the newly bound session.

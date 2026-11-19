@@ -23,7 +23,7 @@ from starlette.types import ASGIApp, Message, Receive, Scope, Send
 from websockets.exceptions import ConnectionClosed, InvalidStatus
 from websockets.sync.client import ClientConnection, connect
 
-from backend.app import realtime
+from backend.app import realtime, sessions
 from backend.app import simulation as fixture
 from backend.app.config import Config
 from backend.app.control import Revocation
@@ -1261,11 +1261,16 @@ def test_recovery_reconciles_independent_occurrences_in_both_orders(tmp_path: Pa
     ("before_resume_commit", "pause"),
     ("before_resume_commit", "stop"),
     ("before_resume_commit", "storage"),
+    ("before_resume_commit", "inference"),
+    ("before_resume_commit", "historical-pause"),
+    ("after_resume_commit", "pause"),
+    ("after_resume_commit", "stop"),
     ("after_resume_commit", "camera"),
     ("after_resume_commit", "emergency"),
 ])
 def test_pending_resume_yields_to_safety(tmp_path: Path, barrier: str, interruption: str) -> None:
     entered, release = Event(), Event()
+    block_inference, release_inference = Event(), Event()
 
     def checkpoint(point):
         if point == barrier:
@@ -1274,11 +1279,22 @@ def test_pending_resume_yields_to_safety(tmp_path: Path, barrier: str, interrupt
             if interruption == "storage":
                 raise OSError("Simulated writer unavailable")
 
-    with service(tmp_path, checkpoint=checkpoint) as laf, driving_search(laf) as (headers, driver):
+    def inference(_sample: InferenceSample) -> bool:
+        if block_inference.is_set():
+            assert release_inference.wait(5)
+        return True
+
+    with service(tmp_path, checkpoint=checkpoint, inference=inference if interruption == "inference" else None) as laf, \
+            driving_search(laf) as (headers, driver):
         arm(laf, headers)
         assert search_action(laf, headers, driver, "pause", 1).status_code == 200
         wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_resume"])
         action_id = str(uuid4())
+        if interruption == "historical-pause":
+            pause_id = str(uuid4())
+            historical = search_action(laf, headers, driver, "pause", 2, action_id=pause_id)
+            for _ in range(65):
+                assert search_action(laf, headers, driver, "pause", 2).status_code == 200
         try:
             pending = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
             assert entered.is_set() and pending.status_code == 202, pending.text
@@ -1296,14 +1312,23 @@ def test_pending_resume_yields_to_safety(tmp_path: Path, barrier: str, interrupt
             elif interruption == "camera":
                 laf.observations.robot = "missing"
                 wait_for(laf.http, "/snapshot", headers, lambda s: s["lease"]["state"] == "Unowned")
+            elif interruption == "inference":
+                block_inference.set()
+                wait_for(laf.http, "/snapshot", headers, lambda s:
+                         any(failure["cause"] == "AIUnavailable" for failure in s["failures"]))
+                release_inference.set()
+                wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "AI") == "Ready")
             elif interruption == "emergency":
                 emergency = laf.http.post(API + "/emergency-stop", headers=headers, json={"request_id": str(uuid4())})
                 assert emergency.status_code == 202 and emergency.json()["permission_revoked"]
+            elif interruption == "historical-pause":
+                assert search_action(laf, headers, driver, "pause", 2, action_id=pause_id).content == historical.content
             halted = wait_for(laf.http, "/snapshot", headers)
             assert halted["runtime"]["effective_session_state"] == "Paused"
             assert halted["runtime"]["motion_permission"] == "Disarmed"
             assert laf.command.output is None
         finally:
+            release_inference.set()
             release.set()
 
         def completed(state):
@@ -1312,27 +1337,121 @@ def test_pending_resume_yields_to_safety(tmp_path: Path, barrier: str, interrupt
 
         terminal = wait_for(laf.http, "/snapshot", headers, completed)
         completion = completed(terminal)
-        if barrier == "after_resume_commit":
+        path = "/sessions/" + driver.session["id"]
+        if interruption == "historical-pause":
             assert completion["persistence"] == "Committed"
-            final = wait_for(laf.http, "/snapshot", headers, lambda s:
-                             s["active_session"]["state"] == "Paused" and s["active_session"]["revision"] >= 4)
+            searching = wait_for(laf.http, path, headers)
+            assert searching["state"] == "Searching" and searching["revision"] == 3
+        elif barrier == "after_resume_commit":
+            assert completion["persistence"] == "Committed"
+            state = "Ended" if interruption == "stop" else "Paused"
+            durable = wait_for(laf.http, path, headers, lambda s: s["state"] == state and s["revision"] >= 4)
+            if interruption in ("pause", "stop"):
+                assert durable["revision"] == 4
             retry = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
             assert retry.content == identical.content
+            final = wait_for(laf.http, "/snapshot", headers, lambda s:
+                             s["active_session"] == (None if state == "Ended" else durable))
             assert final["runtime"]["motion_permission"] == "Disarmed"
-            assert final["lease"]["state"] == "Unowned"
+            if interruption != "pause":
+                assert final["lease"]["state"] == "Unowned"
         else:
             assert completion["persistence"] == "Failed"
-            assert completion["error"]["code"] == ("STORAGE_UNAVAILABLE" if interruption == "storage" else "INVALID_TRANSITION")
-            path = "/sessions/" + driver.session["id"]
+            error = {"storage": "STORAGE_UNAVAILABLE", "inference": "LEASE_EXPIRED"}.get(interruption, "INVALID_TRANSITION")
+            assert completion["error"]["code"] == error
             if interruption == "stop":
                 wait_for(laf.http, path, headers, lambda s: s["state"] == "Ended")
+            elif interruption == "inference":
+                wait_for(laf.http, path, headers, lambda s:
+                         s["revision"] >= 3 and s["state"] == "Paused" and len(s["pause_causes"]) == 2)
             else:
                 durable = wait_for(laf.http, path, headers)
                 assert durable["state"] == "Paused" and durable["revision"] == 2
             if interruption == "pause":
+                for _ in range(65):
+                    assert search_action(laf, headers, driver, "pause", 2).status_code == 200
+                assert not completed(wait_for(laf.http, "/snapshot", headers))
                 retry = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
                 assert retry.json()["persistence"] == "Failed"
                 assert retry.json()["error"]["code"] == "INVALID_TRANSITION"
+        assert laf.command.output is None
+
+
+def test_pause_overtakes_resume_still_checking_its_receipt(tmp_path: Path, monkeypatch) -> None:
+    entered, release = Event(), Event()
+    inspect = sessions.inspect_search
+
+    def inspect_with_barrier(storage, request, fingerprint, **options):
+        if request.action == "resume" and not options.get("transition"):
+            entered.set()
+            assert release.wait(5)
+        return inspect(storage, request, fingerprint, **options)
+
+    monkeypatch.setattr(sessions, "inspect_search", inspect_with_barrier)
+    with service(tmp_path) as laf, driving_search(laf) as (headers, driver):
+        assert search_action(laf, headers, driver, "pause", 1).status_code == 200
+        ready = wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_resume"])
+        with ThreadPoolExecutor(max_workers=2) as requests:
+            resume = requests.submit(search_action, laf, headers, driver, "resume", 2)
+            try:
+                assert entered.wait(3)
+                pause = requests.submit(search_action, laf, headers, driver, "pause", 2)
+                wait_for(laf.http, "/snapshot", headers, lambda s: s["event_seq"] > ready["event_seq"])
+            finally:
+                release.set()
+            rejected = resume.result(timeout=3)
+            assert rejected.status_code == 503 and rejected.json()["code"] == "NOT_READY"
+            assert pause.result(timeout=3).status_code == 200
+        saved = wait_for(laf.http, "/sessions/" + driver.session["id"], headers)
+        assert saved["state"] == "Paused" and saved["revision"] == 2
+
+
+def test_recovered_resume_commit_waits_for_stop_admission(tmp_path: Path, monkeypatch) -> None:
+    commit, release_commit, receipt = Event(), Event(), Event()
+    stop_lookup, release_stop = Event(), Event()
+    inspect = sessions.inspect_search
+
+    def checkpoint(point):
+        if point == "after_resume_commit":
+            commit.set()
+            assert release_commit.wait(5)
+            raise OSError("Simulated error after SQLite committed")
+
+    def inspect_with_barrier(storage, request, fingerprint, **options):
+        if request.action == "stop" and not options.get("transition"):
+            stop_lookup.set()
+            assert release_stop.wait(5)
+        result = inspect(storage, request, fingerprint, **options)
+        if request.action == "resume" and commit.is_set() and result[0] is not None:
+            receipt.set()
+        return result
+
+    monkeypatch.setattr(sessions, "inspect_search", inspect_with_barrier)
+    with service(tmp_path, checkpoint=checkpoint) as laf, driving_search(laf) as (headers, driver):
+        assert search_action(laf, headers, driver, "pause", 1).status_code == 200
+        ready = wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_resume"])
+        action_id = str(uuid4())
+        with ThreadPoolExecutor(max_workers=1) as requests:
+            try:
+                assert search_action(laf, headers, driver, "resume", 2, action_id=action_id).status_code == 202
+                assert commit.is_set()
+                stop = requests.submit(search_action, laf, headers, driver, "stop", 2)
+                assert stop_lookup.wait(3)
+                release_commit.set()
+                assert receipt.wait(3)
+                sleep(0.2)
+                guarded = wait_for(laf.http, "/snapshot", headers)
+                assert guarded["active_session"]["revision"] == 2
+                assert guarded["runtime"]["motion_permission"] == "Disarmed"
+                assert guarded["lease"]["control_generation"] == ready["lease"]["control_generation"]
+            finally:
+                release_commit.set()
+                release_stop.set()
+            ended = stop.result(timeout=3)
+            assert ended.status_code == 200, ended.text
+            assert ended.json()["result"]["session"]["revision"] == 4
+        retry = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
+        assert retry.status_code == 200 and retry.json()["result"]["session"]["revision"] == 3
         assert laf.command.output is None
 
 

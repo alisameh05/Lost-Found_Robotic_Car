@@ -7,7 +7,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
-from .control import Revocation
+from .control import MAX_RUNTIME_RECEIPTS, Revocation
 from .http import HttpError
 from .operations import MAX_ORDINARY_PENDING, Operation, mutation
 from .realtime import REVOCATION_FAILURES
@@ -48,6 +48,20 @@ class SessionCoordinator:
         self._deferred_pause: str | None = None
         self._path_failures: dict[str, dict[str, object]] = {}
         self._failure_task: asyncio.Task[None] | None = None
+        self._pending_resume: SearchRequest | None = None
+        self._safety_admissions = 0
+        self._safety_admission_idle = asyncio.Event()
+        self._safety_admission_idle.set()
+        self._cancellation_scope: tuple[str | None, int | None] = (None, None)
+        self._cancelled_resumes: dict[str, Operation] = {}
+
+    def resume_cancellations(self) -> dict[str, Operation]:
+        # A no-op Pause can leave the original revision usable beyond operation-cache eviction.
+        scope = self.realtime.safety_session, self.realtime.active_revision
+        if scope != self._cancellation_scope:
+            self._cancelled_resumes.clear()
+            self._cancellation_scope = scope
+        return self._cancelled_resumes
 
     def path_failure_changed(self, failure: dict[str, object]) -> None:
         self._path_failures[str(failure["failure_id"])] = failure
@@ -94,6 +108,8 @@ class SessionCoordinator:
         runtime.check_started()
         session_id = uuid4().hex if request.mode else request.resource_id
         fingerprint = request.fingerprint()
+        superseded_resume = None
+        safety_admission = False
         if (request.safety_action and session_id == self.realtime.safety_session
                 and request.action_id not in runtime._pending and request.action_id not in runtime._terminal
                 and request.revision == self.realtime.active_revision):
@@ -103,22 +119,52 @@ class SessionCoordinator:
             except HttpError:
                 pass  # Eligible receipt recovery still precedes rejection of a stale lease.
             else:
-                self.realtime.suspend_search(session_id)
+                safety_admission = True
+                self._safety_admissions += 1
+                self._safety_admission_idle.clear()
+                resume = self._pending_resume
+                if resume and resume.resource_id == session_id and resume.revision == request.revision:
+                    superseded_resume = resume.action_id
+                else:
+                    self.realtime.suspend_search(session_id)
+        try:
+            admitted = await self.admit_action(request, session_id, fingerprint, superseded_resume)
+        finally:
+            if safety_admission:
+                self._safety_admissions -= 1
+                if not self._safety_admissions:
+                    self._safety_admission_idle.set()
+                    if self._deferred_pause is not None:
+                        self.save_deferred_pause()
+        if isinstance(admitted, Receipt):
+            return admitted
+        operation, task = admitted
+        done, _ = await asyncio.wait((task,), timeout=SAVE_WAIT)
+        return task.result() if done else operation.response
+
+    async def admit_action(
+        self, request: SearchRequest, session_id: str, fingerprint: str, superseded_resume: str | None,
+    ) -> Receipt | tuple[Operation, asyncio.Task[Receipt]]:
+        runtime = self.runtime
         async with runtime._admission:
             prior, owner = await asyncio.to_thread(inspect_search, runtime.storage, request, fingerprint)
             if prior:
                 return prior
             pending = runtime._pending.get(request.action_id)
-            previous = pending[0] if pending else runtime._terminal.get(request.action_id)
+            cancelled = self.resume_cancellations().get(request.action_id)
+            previous = pending[0] if pending else cancelled or runtime._terminal.get(request.action_id)
             if previous and previous.fingerprint != fingerprint:
                 raise HttpError(409, "ACTION_ID_CONFLICT", "This action ID already belongs to a different request.")
             if pending:
                 return pending[0].response
+            if cancelled:
+                return cancelled.response
             if request.action == "resume" and previous and 400 <= previous.response.status < 500:
                 # An identical transport retry cannot reopen a superseded Resume.
                 return previous.response
             # Validate new work against current domain facts after the pending/receipt checks.
-            prior, owner = await asyncio.to_thread(inspect_search, runtime.storage, request, fingerprint, transition=True)
+            prior, owner = await asyncio.to_thread(inspect_search, runtime.storage, request, fingerprint,
+                                                   transition=True, superseded_resume=superseded_resume)
             if prior:
                 return prior
             generation = self.realtime.authorize_search(
@@ -135,18 +181,23 @@ class SessionCoordinator:
             operation = Operation(fingerprint, mutation(request.action_id, "Pending", 202), owner,
                                   slot="safety" if request.safety_action else "ordinary")
             if request.action == "resume":
+                if runtime._pending or self._safety_admissions:
+                    raise HttpError(503, "NOT_READY", "Wait for the pending save before resuming.", True)
+                if len(self.resume_cancellations()) >= MAX_RUNTIME_RECEIPTS:
+                    raise HttpError(503, "CAPACITY_REACHED", "Resume action capacity is occupied.")
                 self.realtime.begin_resume(session_id, request.revision)
+                self._pending_resume = request
             if request.safety_action:
                 self._safety_occupied = True
-            task = asyncio.create_task(self.finish_action(request, operation, session_id, generation))
+            task = asyncio.create_task(self.finish_action(request, operation, session_id, generation, superseded_resume))
             runtime._pending[request.action_id] = (operation, task)
             runtime._terminal.pop(request.action_id, None)
             self.realtime.operation_changed(session_id, operation.payload())
-        done, _ = await asyncio.wait((task,), timeout=SAVE_WAIT)
-        return task.result() if done else operation.response
+            return operation, task
 
     async def finish_action(
         self, request: SearchRequest, operation: "Operation", session: str, generation: int,
+        superseded_resume: str | None,
     ) -> Receipt:
         runtime = self.runtime
         loop = asyncio.get_running_loop()
@@ -170,61 +221,78 @@ class SessionCoordinator:
 
         saved: SavedSearch | None = None
         uncertain = False
+        cancelled = False
         try:
             async with runtime._save:
-                saved = await asyncio.to_thread(
-                    save_search, runtime.storage, request, operation.fingerprint, session, runtime.preparing(), check,
-                )
-                assert saved.receipt is not None
-                response = saved.receipt
-        except HttpError as error:
-            response = mutation(request.action_id, "Failed", error.status, error)
-        except (OSError, sqlite3.Error):
-            try:
-                existing, owner = await asyncio.to_thread(inspect_search, runtime.storage, request, operation.fingerprint)
-            except (OSError, sqlite3.Error, HttpError):
-                # Without a readable receipt the caller must reconcile by repeating the identical request.
-                uncertain = True
-                unknown = HttpError(503, "STORAGE_UNAVAILABLE", "The search save outcome is unconfirmed.", True)
-                return Receipt(bytes(unknown.response(action_id=request.action_id).body).decode(), unknown.status, None)
-            unavailable = storage_unavailable()
-            response = existing or mutation(request.action_id, "Failed", unavailable.status, unavailable)
-            if existing:
-                recovered = json.loads(existing.body)["result"]["session"]
-                target = None
-                if request.mode:
+                try:
+                    saved = await asyncio.to_thread(
+                        save_search, runtime.storage, request, operation.fingerprint, session, runtime.preparing(), check,
+                        superseded_resume,
+                    )
+                    assert saved.receipt is not None
+                    response = saved.receipt
+                except HttpError as error:
+                    response = mutation(request.action_id, "Failed", error.status, error)
+                except (OSError, sqlite3.Error):
                     try:
-                        target = await asyncio.to_thread(runtime.storage.read_object, owner, runtime.preparing())
+                        existing, owner = await asyncio.to_thread(
+                            inspect_search, runtime.storage, request, operation.fingerprint,
+                        )
                     except (OSError, sqlite3.Error, HttpError):
-                        # A later eligible projection can still reconcile the committed receipt.
-                        pass
-                saved = SavedSearch(recovered, owner, removed=recovered is None, receipt=existing, target=target,
-                                    acknowledged=request.failure_ids)
+                        # With no readable receipt the caller can reconcile with the identical request.
+                        uncertain = True
+                        unknown = HttpError(503, "STORAGE_UNAVAILABLE", "The search save outcome is unconfirmed.", True)
+                        return Receipt(bytes(unknown.response(action_id=request.action_id).body).decode(),
+                                       unknown.status, None)
+                    unavailable = storage_unavailable()
+                    response = existing or mutation(request.action_id, "Failed", unavailable.status, unavailable)
+                    if existing:
+                        recovered = json.loads(existing.body)["result"]["session"]
+                        target = None
+                        if request.mode:
+                            try:
+                                target = await asyncio.to_thread(runtime.storage.read_object, owner, runtime.preparing())
+                            except (OSError, sqlite3.Error, HttpError):
+                                # A later eligible projection can still reconcile the committed receipt.
+                                pass
+                        saved = SavedSearch(recovered, owner, removed=recovered is None, receipt=existing, target=target,
+                                            acknowledged=request.failure_ids)
+                if request.action == "resume":
+                    # Keep the saved result disarmed while a potential safety retry proves its identity.
+                    while self._safety_admissions:
+                        await self._safety_admission_idle.wait()
         finally:
             runtime._pending.pop(request.action_id, None)
             if request.mode:
                 self.realtime.resolve_start(session, saved is not None and saved.session is not None, uncertain=uncertain)
             if request.action == "resume":
+                cancelled = self.realtime.resume_superseded(session)
                 grant = False
                 if saved and saved.session:
                     try:
                         authorize(False)
                     except HttpError:
-                        self.realtime.suspend_search(session)
-                        self._deferred_pause = session
-                        self.save_deferred_pause()
+                        pass
                     else:
                         grant = True
-                elif uncertain:
+                if not grant and (uncertain or (saved and saved.session)):
                     # A lost writer result cannot grant authority. Ensure a possibly saved Resume is paused.
                     self.realtime.suspend_search(session)
                     self._deferred_pause = session
                     self.save_deferred_pause()
+                if uncertain and self.realtime.active_revision == request.revision:
+                    stopped = HttpError(409, "INVALID_TRANSITION", "The unconfirmed Resume was stopped.")
+                    self.resume_cancellations()[request.action_id] = replace(
+                        operation, response=mutation(request.action_id, "Failed", stopped.status, stopped),
+                    )
                 self.realtime.finish_resume(session, grant)
+                self._pending_resume = None
             if request.safety_action:
                 self.safety_slot_released()
 
         complete = replace(operation, response=response)
+        if cancelled and saved is None and self.realtime.active_revision == request.revision:
+            self.resume_cancellations()[request.action_id] = complete
         if request.action == "stop" and response.status == 200:
             runtime._retention_changed.set()
         if saved and saved.removed and saved.owner:
@@ -261,7 +329,7 @@ class SessionCoordinator:
             asyncio.get_running_loop().call_soon(self.save_deferred_pause)
 
     def save_deferred_pause(self) -> None:
-        if self._safety_occupied:
+        if self._safety_occupied or self._safety_admissions:
             return
         session, self._deferred_pause = self._deferred_pause, None
         if session is not None and self.realtime.safety_session == session and not self.runtime._stopping:
