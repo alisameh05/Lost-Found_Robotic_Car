@@ -9,7 +9,9 @@ import { Notice } from "@/components/ui/feedback";
 import type { EmergencyFeedback } from "./projection";
 import { useRuntime, useRuntimeView } from "./runtime-provider";
 
-export function RuntimeFrame({ children }: { children: ReactNode }) {
+export function RuntimeFrame({ children, fixtureEnabled = true, modeLabel }: {
+  children: ReactNode; fixtureEnabled?: boolean; modeLabel?: string;
+}) {
   const runtime = useRuntime()?.connection?.runtime;
   const pathname = usePathname();
   const { snapshot, health, failedRead, emergency, connected, recovering, reconnectingSessionId, removedSessionId } = useRuntimeView();
@@ -22,11 +24,11 @@ export function RuntimeFrame({ children }: { children: ReactNode }) {
   const active = session?.state === "Searching" || session?.state === "Paused";
   const activeSearchId = recovering ? reconnectingSessionId : active && !failedRead ? session.id : undefined;
   const offerEmergency = active || !!health?.active_session_state ||
-    (!!connected && (/^\/objects\/[^/]+\/search\/?$/.test(pathname ?? "") ||
+    (!!connected && (fixtureEnabled || !!snapshot?.qualification_profile) && (/^\/objects\/[^/]+\/search\/?$/.test(pathname ?? "") ||
       /^\/sessions\/[^/]+\/live\/?$/.test(pathname ?? "")));
 
   return (
-    <AppShell fixtureEnabled activeSearch={activeSearchId && (
+    <AppShell fixtureEnabled={fixtureEnabled} modeLabel={modeLabel} activeSearch={activeSearchId && (
       <div className="active-search">
         <p>{recovering ? "Resynchronizing search" : `${snapshot?.runtime.effective_session_state ?? session?.state}${snapshot?.active_object ? ` · ${snapshot.active_object.name}` : ""}`}</p>
         <Link href={`/sessions/${encodeURIComponent(activeSearchId)}/live`}>Return to Active Search</Link>

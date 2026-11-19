@@ -1,4 +1,4 @@
-import type { BootstrapResponse, Error as ApiError, EventEnvelope, HttpResponses, MutationResponse, WorkspaceHeartbeat } from "@/generated/api-v1";
+import type { BootstrapResponse, EmergencyStopResponse, Error as ApiError, EventEnvelope, HttpResponses, MutationResponse, WorkspaceHeartbeat } from "@/generated/api-v1";
 import { protectedHeaders, type ApplicationTransport, type Endpoint, type HttpRequest, type ProtectedMedia, type ProtectedRequest, type ReadResult, type SocketObserver, type SocketOffer } from "./transport";
 import { conforms, type Definition } from "./wire-contracts";
 
@@ -17,6 +17,9 @@ const jsonWrites = {
   "POST /websocket-tickets": "TicketResponse",
   "POST /control-lease": "LeaseResponse",
   "POST /control-lease/release": "LeaseResponse",
+  "POST /sessions": "MutationResponse",
+  "POST /sessions/{id}/actions": "MutationResponse",
+  "POST /emergency-stop": "EmergencyStopResponse",
   "POST /settings/retention-preview": "RetentionPreview",
   "PUT /settings/retention": "MutationResponse",
 } as const satisfies Partial<Record<Endpoint, Definition>>;
@@ -50,6 +53,15 @@ export function createHttpTransport(base: string): ApplicationTransport {
             location === "/api/v1/objects/" + encodeURIComponent(object.id)) {
           return { kind: "ok", status: response.status, data: data as T, location };
         }
+        const session = mutation.result?.session;
+        if (path === "/sessions" && response.status === 201 && mutation.persistence === "Committed" &&
+            session && location === "/api/v1/sessions/" + encodeURIComponent(session.id)) {
+          return { kind: "ok", status: 201, data: data as T, location };
+        }
+        if (path.startsWith("/sessions/") && path.endsWith("/actions") && response.status === 200 &&
+            mutation.persistence === "Committed" && !location) {
+          return { kind: "ok", status: 200, data: data as T };
+        }
         if (path === "/settings/retention" && response.status === 200 && mutation.persistence === "Committed" &&
             mutation.result?.settings && mutation.result.deletion && !location &&
             !object && !mutation.result.session && !mutation.result.match) {
@@ -59,6 +71,11 @@ export function createHttpTransport(base: string): ApplicationTransport {
             (response.status >= 400 && mutation.persistence === "Failed")) {
           return { kind: "ok", status: response.status, data: data as T };
         }
+        return unavailable;
+      }
+      if (definition === "EmergencyStopResponse" && conforms("EmergencyStopResponse", data)) {
+        const expected = { Pending: 202, Committed: 200, Failed: 503 }[(data as EmergencyStopResponse).persistence];
+        if (response.status === expected) return { kind: "ok", status: expected, data: data as T };
         return unavailable;
       }
       if ((response.status === 200 || (definition === "Health" && response.status === 503) ||
@@ -92,7 +109,7 @@ export function createHttpTransport(base: string): ApplicationTransport {
       const headers = protectedHeaders(write, request);
       headers.set("Content-Type", "application/json");
       const [method, path] = write.split(" ", 2);
-      return readJson(path, jsonWrites[write], input.signal, {
+      return readJson(path.replace("{id}", () => encodeURIComponent(input.id ?? "")), jsonWrites[write], input.signal, {
         method, body: JSON.stringify(request.body), headers, keepalive: write === "POST /control-lease/release",
       });
     }
@@ -206,7 +223,7 @@ export function createHttpTransport(base: string): ApplicationTransport {
       }
       return unavailable;
     },
-    emergency: async () => deferred,
+    emergency: (body, input) => request("POST /emergency-stop", { ...input, body }),
     dispose: () => lifetime.abort(),
   };
 }

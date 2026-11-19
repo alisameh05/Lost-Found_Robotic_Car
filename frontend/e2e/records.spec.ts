@@ -289,7 +289,7 @@ test("acquires, demonstrates readiness, and releases control in connected Search
   await expect(page.getByText("Ready to start", { exact: true })).toHaveCount(0);
   await page.getByRole("button", { name: "Acquire control" }).click();
   await expect(page.getByText("Ready to start", { exact: true })).toBeVisible();
-  await expect(page.getByRole("button", { name: "Start Search" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Start Search" })).toBeEnabled();
   await expect(other.getByRole("button", { name: "Acquire control" })).toHaveAccessibleDescription("Another workspace holds control.");
   await expect(other.getByText("Ready to start", { exact: true })).toHaveCount(0);
 
@@ -1024,4 +1024,79 @@ test("starts a new submission from the backend clock after an expired action", a
   await expect(page.getByRole("textbox", { name: "Width · px" })).toHaveValue("30");
   await submit.click();
   await expect(page.getByRole("heading", { name: "Object Details", exact: true })).toBeVisible();
+});
+
+test("persists both simulated modes and recovers an interrupted search after service restart", async ({ page }) => {
+  test.setTimeout(75_000);
+  await startBackend({ simulation: true });
+  await selectTarget(page, sourceImage(), "Saved search target");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await expect(page.getByRole("heading", { name: "Object Details" })).toBeVisible();
+  const objectPath = new URL(page.url()).pathname;
+  const { requests } = observe(page);
+
+  async function search(mode: "Gestures" | "PS4 controller") {
+    await page.getByRole("link", { name: "Open Search Setup", exact: true }).click();
+    await page.getByRole("radio", { name: new RegExp(mode, "i") }).check();
+    await page.getByRole("button", { name: "Acquire control" }).click();
+    const start = page.getByRole("button", { name: "Start Search" });
+    await expect(start).toBeEnabled();
+    await start.click();
+    await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
+    await expect(page.getByRole("heading", { name: "Live Search Workspace" })).toBeVisible();
+    await expect(page.getByText("Backend simulation · Disarmed", { exact: true })).toBeVisible();
+    await expect(page.getByRole("link", { name: "Return to Active Search", exact: true })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeEnabled();
+    return new URL(page.url()).pathname.replace(/\/live$/, "");
+  }
+
+  // Drop the first HTTP response after the service commits. The ordered operation resolves it.
+  await page.route(`${backend}/sessions`, async (route) => {
+    const result = await route.fetch();
+    expect(result.status()).toBe(201);
+    await route.abort();
+  }, { times: 1 });
+  const first = await search("Gestures");
+  await expect(page.getByText("Gestures · Target and mode locked", { exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Dashboard", exact: true }).click();
+  const leave = page.getByRole("region", { name: "Leave search workspace" });
+  await expect(leave.getByRole("button", { name: "Stay", exact: true })).toBeFocused();
+  await leave.getByRole("button", { name: "Stay", exact: true }).click();
+  await expect(leave).toHaveCount(0);
+  await page.getByRole("link", { name: "Dashboard", exact: true }).click();
+  await leave.getByRole("button", { name: "Leave Paused", exact: true }).click();
+  await expect(page).toHaveURL(frontend + "/");
+  await page.getByRole("link", { name: "Return to Active Search", exact: true }).first().click();
+  await expect(page).toHaveURL(frontend + first + "/live");
+  await expect(page.getByRole("button", { name: "Resume", exact: true })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Stop Search", exact: true })).toBeDisabled();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  await page.getByRole("button", { name: "Stop Search", exact: true }).click();
+  await expect(page).toHaveURL(frontend + first + "/result");
+  await expect(page.getByText("Stopped by operator", { exact: true })).toBeVisible();
+  await expect(page.getByText("The object remains Lost.", { exact: true })).toBeVisible();
+
+  await page.goto(objectPath);
+  const second = await search("PS4 controller");
+  await expect(page.getByText("PS4 DualShock 4 · Target and mode locked", { exact: true })).toBeVisible();
+  await expect(page.getByRole("heading", { name: "PS4 controller input" })).toBeVisible();
+  const emergency = page.getByRole("button", { name: "Emergency Stop", exact: true });
+  await emergency.focus();
+  await page.keyboard.press("Enter");
+  await expect(page.getByText("Motion permission revoked", { exact: true })).toBeVisible();
+  await expect(page.getByText("Saved", { exact: true })).toBeVisible();
+
+  await stopBackend();
+  await startBackend({ simulation: true });
+  await page.reload();
+  await expect(page.getByText("Search has ended", { exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "View Search Result" }).click();
+  await expect(page).toHaveURL(frontend + second + "/result");
+  await expect(page.getByText("Interrupted", { exact: true })).toBeVisible();
+  await expect(page.getByText("The object remains Lost.", { exact: true })).toBeVisible();
+  await page.goto(objectPath);
+  await expect(page.locator(`a[href="${first}"]`)).toBeVisible();
+  await expect(page.locator(`a[href="${second}"]`)).toBeVisible();
+  expect(requests.filter((request) => request === "POST /api/v1/sessions")).toHaveLength(2);
 });

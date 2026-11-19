@@ -47,7 +47,7 @@ function SavedSearchResult({ sessionId }: { sessionId: string }) {
     (runtime?.serverTime() ?? Infinity) < object.expires_at_ms;
 
   return <div className={styles.page}>
-    <PageHeader title="Search Result" description="Saved outcome for this session."
+    <PageHeader title="Search Result" description={view.recordsMode && view.profile ? "Saved outcome · Backend simulation" : "Saved outcome for this session."}
       actions={ended && object && !absence && !matchAbsence && <StatusBadge>Ended</StatusBadge>} />
     {absence || matchAbsence ? <RecordAbsent status={(absence ?? matchAbsence)!} title="Session" />
       : active ? <Notice title="Search still active"><Link href={`${sessionHref(sessionId)}/live`}>Return to Active Search</Link></Notice>

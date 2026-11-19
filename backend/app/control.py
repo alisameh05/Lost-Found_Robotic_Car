@@ -81,6 +81,7 @@ class Lease:
     heartbeat_seq: int = 0
     workspace: bool = False
     displayed: bool = False
+    setup_handoff: bool = False
 
 
 @dataclass(frozen=True)
