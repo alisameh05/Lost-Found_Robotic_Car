@@ -70,7 +70,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const robot = useRef<HTMLDivElement>(null);
   const webcam = useRef<HTMLDivElement>(null);
   const [help, setHelp] = useState(false);
-  const [recovery, setRecovery] = useState(false);
+  const [recovery, setRecovery] = useState<boolean>();
   const [elapsed, setElapsed] = useState(0);
   const [destination, setDestination] = useState<string>();
   const [leaving, setLeaving] = useState(false);
@@ -91,6 +91,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const blocked = !connected || !owner || unresolved(stop);
   const candidate = connected && pendingReview(snapshot, snapshot.pending_candidate) ? snapshot.pending_candidate : null;
   const failures = snapshot.failures.filter((failure) => failure.session_id === sessionId);
+  const recoveryOpen = recovery ?? (recordsMode && failures.length > 0);
   const stopSearch = () => { void runtime?.submitSearch({ kind: "stop", sessionId }); };
 
   useEffect(() => {
@@ -156,10 +157,16 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const gestures = mode === "Gestures";
   const sample = owner && ready ? connection?.fixture?.search.readInput() : undefined;
   const permission = connected ? effective.motion_permission : "Unknown";
-  const input = gestures ? gestureFeedback(sample) : sample === "invalid" ? "Conflicting D-pad input"
+  const connectedInput = permission === "Armed" ? "Simulated direction held"
+    : permission === "Arming" ? "Neutral accepted · waiting for a fresh hold"
+    : state === "Paused" ? "Simulated movement stopped"
+    : "Waiting for neutral simulated input";
+  const input = recordsMode ? connectedInput : gestures ? gestureFeedback(sample) : sample === "invalid" ? "Conflicting D-pad input"
     : sample && sample !== "neutral" ? `Held ${sample}` : "No direction held";
   const searching = state === "Searching";
   const matching = searching && connected && readiness.components.some(({ component, status }) => component === "AI" && status === "Ready");
+  const robotLive = workspace?.previewLive && readiness.components.some(({ component, status }) =>
+    component === "RobotVideo" && status === "Ready");
   const canAcquire = connected && !!workspace?.usable && workspace.previewLive &&
     (lease.can_acquire || !!workspace.retryAcquisition);
   const canLeavePaused = session.state === "Paused" && state === "Paused" && !effective.persistence_pending;
@@ -184,7 +191,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     failures.some(({ acknowledged }) => !acknowledged) && "Acknowledge each outstanding failure.",
     saving && "Wait for the pending save.",
     session.state !== "Paused" && state === "Paused" && !saving && "Save the pause before resuming.",
-    recordsMode && "Resume and recovery actions are unavailable in this simulation.",
+    recordsMode && "Resume and acknowledgment are unavailable in this simulation.",
     candidate && "Complete the pending match review.",
     !candidate && snapshot.pending_candidate && "Wait for the current candidate review to become available.",
   ].filter((item): item is string => typeof item === "string");
@@ -197,10 +204,10 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   }
 
   return <div className={styles.page}>
-    <PageHeader title="Live Search Workspace" description={recordsMode ? "Backend simulation · Disarmed" : undefined} actions={<>
+    <PageHeader title="Live Search Workspace" description={recordsMode ? `Backend simulation · ${permission}` : undefined} actions={<>
       <Button onClick={() => setHelp(!help)} aria-expanded={help} aria-controls={help ? "live-control-help" : undefined}>Control Help</Button>
-      {(state === "Paused" || recovery) && <Button onClick={() => setRecovery(!recovery)}
-        aria-expanded={recovery} aria-controls={recovery ? "search-recovery" : undefined}>Recovery</Button>}
+      {(state === "Paused" || recoveryOpen) && <Button onClick={() => setRecovery(!recoveryOpen)}
+        aria-expanded={recoveryOpen} aria-controls={recoveryOpen ? "search-recovery" : undefined}>Recovery</Button>}
     </>} />
     <Panel className={styles.target} aria-label="Active search target">
       <div className={styles.thumbnail}><ReferenceImage object={object} thumbnail /></div>
@@ -239,7 +246,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
       </div>
     </Panel>}
     {help && <ModelessPanel id="live-control-help" title="Control Help"><ModeInstructions mode={mode} heading="h3" /></ModelessPanel>}
-    {recovery && <RecoveryPanel failures={failures} blockers={recoveryBlockers} searching={searching}
+    {recoveryOpen && <RecoveryPanel failures={failures} blockers={recoveryBlockers} searching={searching}
       canAcknowledge={!recordsMode && owner && connected && readiness.components.some(({ component, status }) => component === "Storage" && status === "Ready")}
       feedback={acknowledgment} acknowledge={(id) => { void runtime?.submitSearch({ kind: "acknowledge", sessionId, failureIds: [id] }); }}
       retry={() => { void runtime?.retrySearch("acknowledge", sessionId); }} />}
@@ -257,7 +264,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
           </Panel>
           <Panel className={styles.camera} aria-labelledby="robot-title">
             <header><h2 id="robot-title"><Video aria-hidden="true" />Robot camera</h2>
-              <StatusBadge tone={workspace?.previewLive ? "success" : "warning"}>{workspace?.previewLive ? "Live sample" : "Not live"}</StatusBadge></header>
+              <StatusBadge tone={robotLive ? "success" : "warning"}>{robotLive ? "Live sample" : "Not live"}</StatusBadge></header>
             <div ref={robot} className={styles.surface} />
             <p>{matching ? recordsMode ? "Simulated AI matching active" : "AI matching active" : "AI matching suspended"} · {snapshot.pending_candidate ? "Candidate awaiting review" : "No candidate awaiting review"}</p>
           </Panel>
@@ -275,7 +282,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
         <section aria-label="Connections">
           <h2>Connections</h2>
           <dl className={styles.connections}>
-            {(["Command", "RobotVideo", gestures ? "Webcam" : "Controller", "AI"] as const).map((key) =>
+            {(["Command", "RobotVideo", "DisplayedRobotVideo", "Workspace", gestures ? "Webcam" : "Controller", "AI", "Storage"] as const).map((key) =>
               <div key={key}><dt>{devicePaths[key].label}</dt><dd>{readiness.components.find(({ component }) => component === key)?.status ?? "Unknown"}</dd></div>)}
           </dl>
           <ProximityAdvisory proximity={snapshot.proximity} />

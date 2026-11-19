@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
+from queue import Empty, Full, Queue
 from shutil import copytree
 from threading import Event, Thread
 from time import monotonic, sleep
@@ -27,11 +28,23 @@ from backend.app import simulation as fixture
 from backend.app.config import Config
 from backend.app.control import Revocation
 from backend.app.main import create_app
+from backend.app.motion import (
+    Command,
+    Direction,
+    FixtureCommandSink,
+    InputSample,
+    InputScope,
+    controller_intent,
+    gesture_intent,
+)
 from backend.app.realtime import Channel
 from backend.app.simulation import (
     FIXTURES,
     Capture,
+    InferenceSample,
     Observation,
+    ProximitySample,
+    QualificationProfile,
     Simulation,
     contract_definitions,
     load_simulation,
@@ -103,9 +116,24 @@ class Observations:
         self.gesture_sample = True
         self.robot = "live"
         self.latest: Capture | None = None
+        self.command = True
+        self.storage = True
+        self.fingers: int | None = 0
+        self.hands = 1
+        self.certain = self.stable = True
+        self.dpad: tuple[Direction, ...] = ()
+        self.circle = False
+        self.proximity: int | None = None
+        self.protocol_fault = False
+        self.capture_barrier: Event | None = None
 
-    def observe(self, now: float) -> Observation:
-        base = self.adapter.observe(now)
+    def observe(self, now: float, scope: InputScope | None = None) -> Observation:
+        barrier = self.capture_barrier
+        if barrier is not None:
+            assert barrier.wait(5)
+        if self.protocol_fault:
+            raise ValueError("Simulated incompatible adapter")
+        base = self.adapter.observe(now, scope)
         if self.robot == "live":
             self.latest = base.robot
         robot = self.latest
@@ -115,18 +143,47 @@ class Observations:
             robot = replace(base.robot, age_ms=-1)
         elif self.robot == "invalid" and base.robot:
             robot = replace(base.robot, width=base.robot.width - 1)
+        elif self.robot == "epoch" and base.robot:
+            robot = replace(base.robot, stream_epoch="replacement")
+        gesture = gesture_intent(self.fingers, hands=self.hands, certain=self.certain, stable=self.stable)
+        controller = controller_intent(self.dpad, circle=self.circle)
         return replace(base, inference=self.inference, webcam=base.webcam if self.webcam else None, robot=robot,
+                       command=self.command,
+                       controller_input=InputSample(scope, now, controller) if scope and self.controller_sample else None,
+                       gesture_input=InputSample(scope, now, gesture) if scope and self.gesture_sample else None,
+                       proximity=ProximitySample("fixture-range", base.proximity.sequence, now, self.proximity)
+                       if base.proximity else None,
                        controller_sample_at=base.controller_sample_at if self.controller_sample else now - 1,
                        gesture_sample_at=base.gesture_sample_at if self.gesture_sample else now - 1)
 
 
-class PauseDelivery:
-    """Pause only the first connection on each selected path, at the real ASGI send boundary."""
+class CommandDevice(FixtureCommandSink):
+    def __init__(self, profile: QualificationProfile):
+        self.device_clock = Clock()
+        super().__init__(profile, self.device_clock)
+        self.acknowledgment = "valid"
 
-    def __init__(self, app: ASGIApp):
+    def renew(self, command: Command) -> Command | None:
+        accepted = super().renew(command)
+        if self.acknowledgment == "missing":
+            return None
+        if self.acknowledgment == "replayed":
+            return replace(command, challenge=replace(command.challenge, sequence=command.challenge.sequence - 1))
+        return accepted
+
+    def probe(self) -> bool:
+        return self.acknowledgment == "valid" and super().probe()
+
+
+class PauseDelivery:
+    """Pause one connection on each selected path at the real ASGI send boundary."""
+
+    def __init__(self, app: ASGIApp, connection_number: int):
         self.app = app
+        self.connection_number = connection_number
         self.initial: Counter[str] = Counter()
         self.entered = {API + path: Event() for path in ("/events", "/video/robot")}
+        self.resume_events = Event()
         self.resume_video = Event()
 
     async def __call__(self, scope: Scope, receive: Receive, send: Send) -> None:
@@ -135,14 +192,15 @@ class PauseDelivery:
             await self.app(scope, receive, send)
             return
         self.initial[path] += 1
-        if self.initial[path] != 1:
+        if self.initial[path] != self.connection_number:
             await self.app(scope, receive, send)
             return
 
         async def delay(message: Message) -> None:
             if message["type"] == "websocket.send":
                 self.entered[path].set()
-                while path == API + "/events" or not self.resume_video.is_set():
+                release = self.resume_events if path == API + "/events" else self.resume_video
+                while not release.is_set():
                     await asyncio.sleep(0.01)
             await send(message)
 
@@ -151,13 +209,15 @@ class PauseDelivery:
 
 class Loopback:
     def __init__(self, http: httpx.Client, port: int, clock: Clock, observations: Observations,
-                 invalidations: list[tuple[str, Channel]], blocked: PauseDelivery | None):
+                 invalidations: list[tuple[str, Channel]], blocked: PauseDelivery | None,
+                 command: CommandDevice | None = None):
         self.http = http
         self.ws = f"ws://127.0.0.1:{port}" + API
         self.clock = clock
         self.observations = observations
         self.invalidations = invalidations
         self.blocked = blocked
+        self.command = command
 
     def bootstrap(self) -> dict[str, str]:
         response = self.http.get(API + "/bootstrap", headers={"Origin": ORIGIN})
@@ -189,14 +249,17 @@ def wait_for(client: httpx.Client, path: str, headers: dict[str, str], check=lam
         if response.status_code == 200 and check(response.json()):
             return response.json()
         sleep(0.02)
-    raise AssertionError(f"Timed out waiting for {path}")
+    context = response.json()
+    readiness = context.get("readiness")
+    failures = [item["cause"] for item in context.get("failures", [])]
+    raise AssertionError(f"Timed out waiting for {path}. Status {response.status_code}, {readiness=}, {failures=}")
 
 
 def test_control_is_exclusive_and_historical_retries_do_not_reacquire(tmp_path: Path) -> None:
     with service(tmp_path) as laf:
         alice, bob = laf.bootstrap(), laf.bootstrap()
         alice_headers, bob_headers = auth(alice), auth(bob)
-        wait_for(laf.http, "/health", alice_headers)
+        wait_for(laf.http, "/health", alice_headers, simulation_ready)
         acquire = {"request_id": str(uuid4()), "client_id": alice["client_id"], "session_id": None, "takeover": False}
         with laf.open("/events", laf.ticket(alice_headers, "events")) as owner, \
                 laf.open("/events", laf.ticket(bob_headers, "events")) as spectator:
@@ -207,7 +270,7 @@ def test_control_is_exclusive_and_historical_retries_do_not_reacquire(tmp_path: 
             assert response.status_code == 200, response.json()
             owned = response.json()
             validate("LeaseResponse", owned)
-            owner_update, spectator_update = event(owner), event(spectator)
+            owner_update, spectator_update = (lease_event(channel, "Owned") for channel in (owner, spectator))
             assert owner_update["event_seq"] == spectator_update["event_seq"]
             assert owned["client_lease_id"] not in json.dumps([owner_update, spectator_update])
             for identity, headers in ((alice, alice_headers), (bob, bob_headers)):
@@ -221,7 +284,7 @@ def test_control_is_exclusive_and_historical_retries_do_not_reacquire(tmp_path: 
             assert result.status_code == 200
             assert result.json()["client_lease_id"] is None
             for channel in (owner, spectator):
-                assert event(channel)["payload"]["lease"]["state"] == "Unowned"
+                lease_event(channel, "Unowned")
             retry = laf.http.post(path, headers=alice_headers, json=acquire).json()
             assert retry["client_lease_id"] == owned["client_lease_id"]
             assert retry["lease"] == owned["lease"]
@@ -240,28 +303,36 @@ def test_control_is_exclusive_and_historical_retries_do_not_reacquire(tmp_path: 
 @contextmanager
 def service(root: Path, *, blocked: bool = False, event_limit: int | None = None,
             frame_limit: int | None = None, revocations: list[Revocation] | None = None,
+            inference: Callable[[InferenceSample], bool] | None = None, blocked_connection: int = 1,
             checkpoint: Callable[[str], None] | None = None, wall: Callable[[], int] | None = None) -> Iterator[Loopback]:
     clock = Clock()
-    storage = RecordsStorage(root, monotonic=clock, checkpoint=checkpoint, **({"clock": wall} if wall else {}))
     simulation = load_simulation("fixture-v1")
     assert simulation
     observations = Observations(simulation)
+
+    class ObservedStorage(RecordsStorage):
+        def safety_storage_healthy(self, preparing):
+            return observations.storage and super().safety_storage_healthy(preparing)
+
+    storage = ObservedStorage(root, monotonic=clock, checkpoint=checkpoint, **({"clock": wall} if wall else {}))
     profile = simulation.profile
-    if blocked:
+    if blocked and blocked_connection == 1:
         profile = replace(profile, values={**profile.values, "event_queue_messages": 1})
     if event_limit is not None:
         profile = replace(profile, values={**profile.values, "max_event_message_bytes": event_limit})
     if frame_limit is not None:
         profile = replace(profile, values={**profile.values, "max_frame_bytes": frame_limit})
+    command = CommandDevice(profile)
+    command.start()
     invalidations: list[tuple[str, Channel]] = []
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         app = create_app(Config(root, backend_port=port), storage=storage,
-                         simulation=Simulation(profile, observations),
+                         simulation=Simulation(profile, observations, command, inference),
                          on_channel_invalidated=lambda client, channel: invalidations.append((client, channel)),
                          **({"on_control_revoked": revocations.append} if revocations is not None else {}))
-        delayed = PauseDelivery(app) if blocked else None
+        delayed = PauseDelivery(app, blocked_connection) if blocked else None
         server = uvicorn.Server(uvicorn.Config(
             delayed or app, host="127.0.0.1", port=port, proxy_headers=False, access_log=False,
             ws="websockets", ws_max_size=app.state.socket_message_limit, ws_max_queue=1,
@@ -275,10 +346,11 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
                 sleep(0.01)
             assert server.started
             with httpx.Client(base_url=f"http://127.0.0.1:{port}", timeout=3, trust_env=False) as http:
-                yield Loopback(http, port, clock, observations, invalidations, delayed)
+                yield Loopback(http, port, clock, observations, invalidations, delayed, command)
         finally:
             server.should_exit = True
             worker.join(5)
+            command.close()
             assert not worker.is_alive()
 
 
@@ -286,6 +358,14 @@ def event(channel: ClientConnection) -> dict:
     value = json.loads(channel.recv(timeout=4))
     validate("EventEnvelope", value)
     return value
+
+
+def lease_event(channel: ClientConnection, state: str) -> dict:
+    for _ in range(12):
+        update = event(channel)
+        if update["type"] == "snapshot" and update["payload"]["lease"]["state"] == state:
+            return update
+    raise AssertionError(f"Missing {state} lease snapshot")
 
 
 def frame(channel: ClientConnection) -> tuple[dict, bytes]:
@@ -366,7 +446,7 @@ def test_atomic_snapshot_handoff_replacement_and_close_codes(tmp_path: Path) -> 
     with service(tmp_path) as app:
         first = auth(app.bootstrap())
         watcher = auth(app.bootstrap())
-        wait_for(app.http, "/health", first)
+        wait_for(app.http, "/health", first, simulation_ready)
         with app.open("/events", app.ticket(first, "events")) as initial:
             baseline = event(initial)
             assert baseline["event_seq"] == baseline["payload"]["event_seq"] == 1
@@ -375,16 +455,25 @@ def test_atomic_snapshot_handoff_replacement_and_close_codes(tmp_path: Path) -> 
                 subscription = attempts.submit(app.open, "/events", token)
                 app.observations.inference = False
                 wait_for(app.http, "/health", first, lambda health: status(health, "AI") == "Unavailable")
-                changed = event(initial)
-                assert changed["type"] == "readiness_changed" and changed["event_seq"] == 2
+                def failed_ai(channel: ClientConnection, latest: dict) -> dict:
+                    for _ in range(12):
+                        if (latest["type"] in ("snapshot", "readiness_changed")
+                                and status(latest["payload"], "AI") == "Unavailable"):
+                            return latest
+                        following = event(channel)
+                        assert following["event_seq"] == latest["event_seq"] + 1
+                        latest = following
+                    raise AssertionError("Missing AI readiness transition")
+
+                changed = failed_ai(initial, baseline)
+                assert changed["type"] == "readiness_changed"
                 with subscription.result(timeout=5) as spectator:
-                    fresh = event(spectator)
-                    if fresh["event_seq"] == 1:
-                        fresh = event(spectator)
-                        assert fresh["type"] == "readiness_changed"
-                    assert fresh["event_seq"] == 2 and status(fresh["payload"], "AI") == "Unavailable"
+                    fresh = failed_ai(spectator, event(spectator))
+                    assert fresh["event_seq"] >= changed["event_seq"]
                     with app.open("/events", app.ticket(first, "events")) as replacement:
-                        assert event(replacement)["event_seq"] == 2
+                        replaced = event(replacement)
+                        assert replaced["event_seq"] >= changed["event_seq"]
+                        assert status(replaced["payload"], "AI") == "Unavailable"
                         assert (first["X-App-Client-Id"], "events") in app.invalidations
                         closed(initial, 1008)
                         replacement.send("{")
@@ -400,6 +489,10 @@ def test_atomic_snapshot_handoff_replacement_and_close_codes(tmp_path: Path) -> 
 
 def status(payload: dict, name: str) -> str:
     return next(component["status"] for component in payload["readiness"]["components"] if component["component"] == name)
+
+
+def simulation_ready(payload: dict) -> bool:
+    return all(status(payload, name) == "Ready" for name in ("Storage", "RobotVideo", "Controller", "Command", "AI"))
 
 
 def closed(channel: ClientConnection, code: int, *, drain: bool = False) -> None:
@@ -740,7 +833,7 @@ def test_current_active_session_requires_matching_identity_and_takeover(tmp_path
             unavailable = wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "Controller") == "Unavailable")
             assert unavailable["lease"]["state"] == "Unowned"
             assert revocations[-1] == Revocation(owner["client_id"], "active", unavailable["runtime"]["control_generation"],
-                                                 "RequiredPathUnavailable", None)
+                                                 "InputUnavailable", None)
 
 
 def test_video_freshness_dimensions_and_independent_channels(tmp_path: Path) -> None:
@@ -923,7 +1016,9 @@ def test_saved_search_lifecycle_and_historical_retry(tmp_path: Path) -> None:
 
 
 @contextmanager
-def ready_search(laf: Loopback) -> Iterator[tuple[dict, dict, ClientConnection, ClientConnection]]:
+def ready_search(
+    laf: Loopback, mode: str = "Controller", acquired: dict | None = None,
+) -> Iterator[tuple[dict, dict, ClientConnection, ClientConnection]]:
     owner = laf.bootstrap()
     headers = auth(owner)
     wait_for(laf.http, "/health", headers)
@@ -932,15 +1027,264 @@ def ready_search(laf: Loopback) -> Iterator[tuple[dict, dict, ClientConnection, 
             laf.open("/video/robot", laf.ticket(headers, "robot-video")) as video:
         event(events)
         lease = acquire_control(laf, owner)
+        if acquired is not None:
+            acquired.update(lease)
         events.send(json.dumps(heartbeat(owner, lease, 1, frame(video)[0])))
-        wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_start"]["Controller"])
-        start = {"action_id": str(uuid4()), "object_id": target["id"], "control_mode": "Controller",
+        if acquired is None:
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_start"][mode])
+        start = {"action_id": str(uuid4()), "object_id": target["id"], "control_mode": mode,
                  "expected_revision": target["revision"], "client_id": owner["client_id"],
                  "client_lease_id": lease["client_lease_id"]}
         yield owner, start, events, video
 
 
-def test_emergency_revokes_while_an_ordinary_writer_is_blocked(tmp_path: Path) -> None:
+class WorkspaceDriver:
+    def __init__(self, owner: dict, lease: dict, events: ClientConnection, video: ClientConnection):
+        self.owner, self.lease, self.events, self.video = owner, lease, events, video
+        self.session: dict = {}
+        self.flags: dict[str, object] = {}
+        self.freeze = False
+        self.latest: dict | None = None
+        self.stop = Event()
+        self.messages: Queue[dict] = Queue(128)
+
+    def observe_events(self) -> None:
+        while not self.stop.is_set():
+            try:
+                message = json.loads(self.events.recv(timeout=0.1))
+            except TimeoutError:
+                continue
+            except ConnectionClosed:
+                return
+            if message["type"] == "snapshot":
+                public = message["payload"]["lease"]
+                if public["owner_client_id"] == self.owner["client_id"]:
+                    self.lease["control_generation"] = public["control_generation"]
+            try:
+                self.messages.put_nowait(message)
+            except Full:
+                try:
+                    self.messages.get_nowait()
+                except Empty:
+                    pass
+                self.messages.put_nowait(message)
+
+    def run(self) -> None:
+        seq = 2
+        while not self.stop.is_set():
+            try:
+                latest = frame(self.video)[0]
+                if not self.freeze or self.latest is None:
+                    self.latest = latest
+                self.events.send(json.dumps(heartbeat(
+                    self.owner, self.lease, seq, self.latest, session_id=self.session.get("id"), **self.flags,
+                )))
+                seq += 1
+            except (ConnectionClosed, TimeoutError):
+                return
+
+
+@contextmanager
+def driving_search(laf: Loopback, mode: str = "Controller") -> Iterator[tuple[dict, WorkspaceDriver]]:
+    laf.observations.webcam = mode == "Gestures"
+    lease: dict = {}
+    with ready_search(laf, mode, lease) as (owner, start, events, video):
+        headers = auth(owner)
+        driver = WorkspaceDriver(owner, lease, events, video)
+        worker = Thread(target=driver.run, daemon=True)
+        observer = Thread(target=driver.observe_events, daemon=True)
+        worker.start()
+        observer.start()
+        try:
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_start"][mode])
+            result = laf.http.post(API + "/sessions", headers=headers, json=start)
+            assert result.status_code == 201, result.text
+            driver.session = result.json()["result"]["session"]
+            yield headers, driver
+        finally:
+            driver.stop.set()
+            video.close()
+            worker.join(2)
+            observer.join(2)
+
+
+def wait_output(laf: Loopback, expected: Direction | None) -> None:
+    assert laf.command is not None
+    until = monotonic() + 3
+    while monotonic() < until:
+        if laf.command.output == expected:
+            return
+        sleep(0.005)
+    assert laf.command.output == expected, laf.command.journal
+
+
+def arm(laf: Loopback, headers: dict, mode: str = "Controller") -> None:
+    wait_for(laf.http, "/snapshot", headers, lambda s: s["runtime"]["motion_permission"] == "Arming")
+    if mode == "Gestures":
+        laf.observations.fingers = 1
+    else:
+        laf.observations.dpad = ("forward",)
+    wait_output(laf, "forward")
+
+
+def assert_stopped(laf: Loopback, cause: str) -> None:
+    wait_output(laf, None)
+    assert laf.command is not None
+    until = monotonic() + 1
+    while laf.command.journal[-1].event != "stop" and monotonic() < until:
+        sleep(0.005)
+    revoked, stopped = laf.command.journal[-2:]
+    assert (revoked.event, revoked.cause, stopped.event, stopped.output) == ("revoked", cause, "stop", None)
+    assert revoked.at <= stopped.at
+    assert any(entry.event == "renewed" and entry.output is not None and entry.at <= revoked.at
+               for entry in laf.command.journal[:-2])
+
+
+def test_motion_generation_requires_a_post_rotation_display(tmp_path: Path) -> None:
+    lease: dict = {}
+    with service(tmp_path) as laf, ready_search(laf, acquired=lease) as (owner, start, events, video):
+        headers = auth(owner)
+        wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_start"]["Controller"])
+        result = laf.http.post(API + "/sessions", headers=headers, json=start)
+        assert result.status_code == 201, result.text
+        session = result.json()["result"]["session"]["id"]
+        old_frame = frame(video)[0]
+        events.send(json.dumps(heartbeat(owner, lease, 2, old_frame, session_id=session)))
+        for _ in range(12):
+            update = event(events)
+            if update["type"] == "snapshot" and (
+                update["payload"]["runtime"]["control_generation"] > lease["control_generation"]
+            ):
+                break
+        generation = update["payload"]["runtime"]["control_generation"]
+        assert generation > lease["control_generation"]
+        lease["control_generation"] = generation
+        events.send(json.dumps(heartbeat(owner, lease, 3, None, session_id=session)))
+        events.send(json.dumps(heartbeat(owner, lease, 4, old_frame, session_id=session)))
+        wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "Workspace") == "Ready")
+        current = laf.http.get(API + "/snapshot", headers=headers).json()
+        assert status(current, "DisplayedRobotVideo") == "Unavailable"
+        assert current["runtime"]["motion_permission"] == "Disarmed"
+        recent = frame(video)[0]
+        while recent["capture_seq"] < old_frame["capture_seq"] + 3:
+            recent = frame(video)[0]
+        events.send(json.dumps(heartbeat(owner, lease, 5, recent, session_id=session)))
+        wait_for(laf.http, "/snapshot", headers, lambda s: s["runtime"]["motion_permission"] == "Arming")
+
+
+@pytest.mark.parametrize("mode", ["Gestures", "Controller"])
+def test_neutral_fresh_hold_and_release_drive_the_same_sink(tmp_path: Path, mode: str) -> None:
+    with service(tmp_path) as laf:
+        laf.observations.fingers = 1
+        laf.observations.dpad = ("forward",)
+        with driving_search(laf, mode) as (headers, driver):
+            lease_at_start = driver.lease["control_generation"]
+            for _ in range(3):
+                sleep(0.09)
+                assert laf.command.output is None
+            if mode == "Controller":
+                assert not laf.observations.webcam
+            for fingers, direction in enumerate(("forward", "backward", "left", "right"), start=1):
+                if mode == "Gestures":
+                    laf.observations.fingers = 0
+                else:
+                    laf.observations.dpad = ()
+                wait_for(laf.http, "/snapshot", headers, lambda s: s["runtime"]["motion_permission"] == "Arming")
+                if mode == "Gestures":
+                    laf.observations.fingers = fingers
+                else:
+                    laf.observations.dpad = (direction,)
+                wait_output(laf, direction)
+                if mode == "Gestures":
+                    laf.observations.fingers = 5
+                else:
+                    laf.observations.dpad = ("left", "right")
+                assert_stopped(laf, "InputInvalid")
+                if mode == "Gestures":
+                    laf.observations.fingers = fingers
+                else:
+                    laf.observations.dpad = (direction,)
+                sleep(0.15)
+                assert laf.command.output is None
+            laf.observations.fingers, laf.observations.dpad = 0, ()
+            arm(laf, headers, mode)
+            laf.observations.fingers, laf.observations.dpad = 0, ()
+            assert_stopped(laf, "InputReleased")
+            current = laf.http.get(API + "/snapshot", headers=headers).json()
+            assert current["active_session"] == driver.session and current["failures"] == []
+            assert current["runtime"]["control_generation"] > lease_at_start
+
+
+@pytest.mark.parametrize(("fault", "cause"), [
+    ("controller", "InputUnavailable"),
+    ("gesture", "InputUnavailable"),
+    ("robot", "RobotVideoUnavailable"),
+    ("epoch", "CameraEpochChanged"),
+    ("command", "CommandUnavailable"),
+    ("missing-ack", "CommandUnavailable"),
+    ("replayed-ack", "CommandUnavailable"),
+    ("device-expiry", "CommandExpired"),
+    ("AI", "AIUnavailable"),
+    ("storage", "StorageFault"),
+    ("protocol", "ProtocolMismatch"),
+    ("hide", "WorkspaceHidden"),
+    ("blur", "WorkspaceUnfocused"),
+    ("unusable", "WorkspaceUnusable"),
+    ("display", "DisplayStale"),
+    ("browser-loss", "WorkspaceDisconnected"),
+    ("heartbeat", "HeartbeatExpired"),
+    ("circle", "EmergencyStop"),
+])
+def test_required_path_failure_disarms_and_saves_typed_pause(tmp_path: Path, fault: str, cause: str) -> None:
+    mode = "Gestures" if fault == "gesture" else "Controller"
+    with service(tmp_path) as laf, driving_search(laf, mode) as (headers, driver):
+        arm(laf, headers, mode)
+        if fault == "controller":
+            laf.observations.controller_sample = False
+        elif fault == "gesture":
+            laf.observations.gesture_sample = False
+        elif fault in ("robot", "epoch"):
+            laf.observations.robot = "missing" if fault == "robot" else "epoch"
+        elif fault == "command":
+            laf.observations.command = False
+        elif fault in ("missing-ack", "replayed-ack"):
+            laf.command.acknowledgment = "missing" if fault == "missing-ack" else "replayed"
+        elif fault == "device-expiry":
+            laf.command.device_clock.offset += 0.3
+        elif fault == "AI":
+            laf.observations.inference = False
+        elif fault == "storage":
+            laf.observations.storage = False
+        elif fault == "protocol":
+            laf.observations.protocol_fault = True
+        elif fault in ("hide", "blur", "unusable"):
+            flag = {"hide": "visible", "blur": "focused", "unusable": "operational"}[fault]
+            driver.flags = {f"workspace_{flag}": False}
+        elif fault == "display":
+            driver.freeze = True
+        elif fault == "browser-loss":
+            driver.events.close()
+        elif fault == "heartbeat":
+            driver.stop.set()
+        else:
+            laf.observations.circle = True
+        reason = {"RobotVideoUnavailable": "RobotVideoLost", "WorkspaceDisconnected": "EventConnectionLost"}.get(cause, cause)
+        assert_stopped(laf, reason)
+        snapshot = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+        assert snapshot["runtime"]["effective_session_state"] == "Paused"
+        assert snapshot["runtime"]["motion_permission"] == "Disarmed"
+        failure = next(entry for entry in snapshot["failures"] if entry["cause"] == cause)
+        assert {"cause": "RecoveryRequired", "failure_id": failure["failure_id"]} in snapshot["active_session"]["pause_causes"]
+        assert not failure["acknowledged"]
+        if fault in ("missing-ack", "replayed-ack"):
+            assert not failure["restored"] and status(snapshot, "Command") == "Unavailable"
+        renewals = sum(entry.event == "renewed" for entry in laf.command.journal)
+        sleep(0.15)
+        assert laf.command.output is None
+        assert sum(entry.event == "renewed" for entry in laf.command.journal) == renewals
+
+
+def test_emergency_revokes_while_an_ordinary_writer_is_blocked(tmp_path: Path, monkeypatch) -> None:
     entered, unblock = Event(), Event()
     hold = False
 
@@ -949,18 +1293,24 @@ def test_emergency_revokes_while_an_ordinary_writer_is_blocked(tmp_path: Path) -
             entered.set()
             assert unblock.wait(5)
 
-    with service(tmp_path, checkpoint=checkpoint) as laf, ready_search(laf) as (owner, start, _, _):
-        headers = auth(owner)
-        active = laf.http.post(API + "/sessions", headers=headers, json=start).json()["result"]["session"]
+    with service(tmp_path, checkpoint=checkpoint) as laf, driving_search(laf) as (headers, driver):
+        from backend.app import runtime
+
+        monkeypatch.setattr(runtime, "MAX_ORDINARY_PENDING", 1)
+        active = driver.session
         wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"] == active)
+        arm(laf, headers)
         path = API + "/emergency-stop"
         unknown = laf.http.post(path, headers={**headers, "X-App-Capability": "bad"}, json={"request_id": str(uuid4())})
         assert unknown.status_code == 403
+        assert laf.command.output == "forward"
         assert laf.http.get(API + "/snapshot", headers=headers).json()["lease"]["state"] == "Owned"
         hold = True
         try:
             busy = submit(laf.http, headers, wait=False)
             assert busy.status_code == 202 and entered.is_set()
+            excess = submit(laf.http, headers, wait=False)
+            assert excess.status_code == 503 and excess.json()["code"] == "CAPACITY_REACHED"
             body_started, end_body = Event(), Event()
 
             def stalled_body() -> Iterator[bytes]:
@@ -973,6 +1323,7 @@ def test_emergency_revokes_while_an_ordinary_writer_is_blocked(tmp_path: Path) -
                                        content=stalled_body())
                 try:
                     assert body_started.wait(2)
+                    assert_stopped(laf, "EmergencyStop")
                     stopped = wait_for(laf.http, "/snapshot", headers, lambda s: s["lease"]["state"] == "Unowned")
                     assert stopped["runtime"]["effective_session_state"] == "Paused"
                     assert not rejected.done()
@@ -998,6 +1349,148 @@ def test_emergency_revokes_while_an_ordinary_writer_is_blocked(tmp_path: Path) -
         again = laf.http.post(path, headers=headers, json={"request_id": str(uuid4())})
         assert same.status_code == again.status_code == 200
         assert same.json()["failure_id"] == again.json()["failure_id"] == reply.json()["failure_id"]
+
+
+def test_inference_stall_cannot_renew_held_motion(tmp_path: Path) -> None:
+    blocked, entered, unblock = Event(), Event(), Event()
+
+    def inference(observation: InferenceSample) -> bool:
+        if blocked.is_set() and observation.scope:
+            assert observation.frame_id and observation.capture
+            entered.set()
+            assert unblock.wait(5)
+        return True
+
+    with service(tmp_path, inference=inference) as laf, driving_search(laf) as (headers, driver):
+        arm(laf, headers)
+        blocked.set()
+        try:
+            assert entered.wait(2)
+            assert_stopped(laf, "AIUnavailable")
+            assert not unblock.is_set()
+            current = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+            assert status(current, "RobotVideo") == "Ready"
+            assert status(current, "Controller") == "Ready"
+            assert current["failures"][0]["cause"] == "AIUnavailable"
+        finally:
+            unblock.set()
+
+
+def test_stopping_does_not_need_a_blocked_subscriber_or_video_consumer(tmp_path: Path) -> None:
+    with service(tmp_path, blocked=True, blocked_connection=2) as laf, driving_search(laf) as (headers, _):
+        arm(laf, headers)
+        spectator = auth(laf.bootstrap())
+        held = laf.blocked
+        assert held
+        with (laf.open("/events", laf.ticket(spectator, "events")),
+              laf.open("/video/robot", laf.ticket(spectator, "robot-video"))):
+            assert all(signal.wait(2) for signal in held.entered.values())
+            assert laf.command.output == "forward"
+            try:
+                laf.observations.command = False
+                assert_stopped(laf, "CommandUnavailable")
+                assert not held.resume_events.is_set() and not held.resume_video.is_set()
+            finally:
+                held.resume_events.set()
+                held.resume_video.set()
+
+
+def test_proximity_advisory_preserves_latch_and_has_no_motion_or_revision_effect(tmp_path: Path) -> None:
+    with service(tmp_path) as laf, driving_search(laf) as (headers, driver):
+        arm(laf, headers)
+        laf.observations.proximity = 150
+        for _ in range(30):
+            update = driver.messages.get(timeout=4)
+            if update["type"] == "proximity_warning_changed" and update["payload"]["proximity"]["state"] == "Warning":
+                break
+        warning = update["payload"]["proximity"]
+        validate("EventEnvelope", update)
+        assert warning["distance_mm"] == 150 and warning["warning_latched"]
+        assert warning["sample_seq"] and warning["source_epoch"] and warning["observed_at_ms"]
+        laf.observations.proximity = None
+        unknown = wait_for(laf.http, "/snapshot", headers, lambda s: s["proximity"]["state"] == "Unknown")
+        assert unknown["proximity"]["warning_latched"] and unknown["proximity"]["distance_mm"] is None
+        laf.observations.proximity = 229
+        retained = wait_for(laf.http, "/snapshot", headers, lambda s: s["proximity"]["distance_mm"] == 229)
+        assert retained["proximity"]["warning_latched"]
+        laf.observations.proximity = 230
+        cleared = wait_for(laf.http, "/snapshot", headers, lambda s: s["proximity"]["state"] == "Clear")
+        assert cleared["proximity"]["sample_seq"] >= retained["proximity"]["sample_seq"] + 3
+        assert not cleared["proximity"]["warning_latched"]
+        assert cleared["active_session"] == driver.session and cleared["runtime"]["motion_permission"] == "Armed"
+        assert laf.command.output == "forward"
+
+
+def test_repeated_path_observations_share_an_id_until_restoration(tmp_path: Path) -> None:
+    with service(tmp_path) as laf, driving_search(laf) as (headers, _):
+        arm(laf, headers)
+        laf.observations.inference = False
+        before = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+        first = next(failure for failure in before["failures"] if failure["cause"] == "AIUnavailable")
+        sleep(0.2)
+        assert laf.http.get(API + "/snapshot", headers=headers).json()["failures"] == [first]
+        laf.observations.inference = True
+        restored = wait_for(laf.http, "/snapshot", headers, lambda s: s["failures"][0]["restored"] and
+                            s["active_session"]["revision"] == before["active_session"]["revision"] + 1)
+        assert restored["failures"] == [{**first, "restored": True}]
+        assert laf.command.output is None
+        laf.observations.inference = False
+        recurring = wait_for(laf.http, "/snapshot", headers, lambda s: len(s["active_session"]["pause_causes"]) == 2)
+        assert [failure["restored"] for failure in recurring["failures"]] == [True, False]
+        assert len({failure["failure_id"] for failure in recurring["failures"]}) == 2
+        assert recurring["runtime"]["motion_permission"] == "Disarmed"
+
+
+def test_silent_capture_staleness_is_recorded_even_after_another_fault_pauses(tmp_path: Path) -> None:
+    release = Event()
+    with service(tmp_path) as laf, driving_search(laf) as (headers, _):
+        arm(laf, headers)
+        laf.observations.inference = False
+        paused = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+        assert paused["lease"]["state"] == "Unowned"
+        try:
+            laf.observations.capture_barrier = release
+            stale = wait_for(laf.http, "/snapshot", headers, lambda s: len(s["active_session"]["pause_causes"]) == 2)
+            assert {failure["cause"] for failure in stale["failures"]} == {"AIUnavailable", "RobotVideoUnavailable"}
+            assert status(stale, "RobotVideo") == "Unavailable"
+            assert laf.command.output is None
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize("action", ["pause", "stop"])
+def test_pause_and_stop_use_reserved_capacity_and_disarm_before_writer(tmp_path: Path, action: str, monkeypatch) -> None:
+    from backend.app import runtime
+
+    entered, release = Event(), Event()
+    blocked = False
+
+    def checkpoint(point: str) -> None:
+        if blocked and point == "before_commit":
+            entered.set()
+            assert release.wait(5)
+
+    with service(tmp_path, checkpoint=checkpoint) as laf, driving_search(laf) as (headers, driver):
+        monkeypatch.setattr(runtime, "MAX_ORDINARY_PENDING", 1)
+        arm(laf, headers)
+        blocked = True
+        session = driver.session["id"]
+        request = {"action": action, "action_id": str(uuid4()), "session_id": session,
+                   "expected_revision": driver.session["revision"], "client_id": driver.owner["client_id"],
+                   "client_lease_id": driver.lease["client_lease_id"]}
+        try:
+            assert submit(laf.http, headers, wait=False).status_code == 202 and entered.is_set()
+            path = f"{API}/sessions/{session}/actions"
+            pending = laf.http.post(path, headers=headers, json=request)
+            assert pending.status_code == 202, pending.text
+            assert_stopped(laf, "SearchSuspended")
+            current = laf.http.get(API + "/snapshot", headers=headers).json()
+            assert current["active_session"]["state"] == "Searching"
+            assert current["runtime"]["effective_session_state"] == "Paused"
+        finally:
+            release.set()
+        expected = "Paused" if action == "pause" else "Ended"
+        wait_for(laf.http, f"/sessions/{session}", headers, lambda s: s["state"] == expected)
 
 
 def test_concurrent_start_has_one_durable_winner(tmp_path: Path) -> None:

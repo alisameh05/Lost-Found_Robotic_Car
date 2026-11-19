@@ -82,6 +82,9 @@ class Lease:
     workspace: bool = False
     displayed: bool = False
     setup_handoff: bool = False
+    previous_generation: int | None = None
+    generation_started: float | None = None
+    motion_generation: bool = False
 
 
 @dataclass(frozen=True)

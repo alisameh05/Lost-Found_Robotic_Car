@@ -3,7 +3,7 @@
   "protocol_version": 1,
   "evidence_kind": "Fixture",
   "evidence_manifest_sha256": "31b6c4a0008fd267f216260efac61c1f3a5af65925662465619d94f9a7b7e4c5",
-  "device_protocol_manifest_sha256": "2ff1c0da3e1d9779372cbf69f73e5f94bd00567384f380996c0c1bc580927044",
+  "device_protocol_manifest_sha256": "14cecd071dcf05cd50a61cb3834f6fe9afaa3134526bd4ec891e4ff5d238478b",
   "max_header_bytes": 2048,
   "max_frame_bytes": 131072,
   "max_frame_width": 640,

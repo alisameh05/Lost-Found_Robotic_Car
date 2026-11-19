@@ -1045,7 +1045,7 @@ test("persists both simulated modes and recovers an interrupted search after ser
     await start.click();
     await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
     await expect(page.getByRole("heading", { name: "Live Search Workspace" })).toBeVisible();
-    await expect(page.getByText("Backend simulation · Disarmed", { exact: true })).toBeVisible();
+    await expect(page.getByText(/^Backend simulation · (Disarmed|Arming|Armed)$/)).toBeVisible();
     await expect(page.getByRole("link", { name: "Return to Active Search", exact: true })).toBeVisible();
     await expect(page.getByRole("button", { name: "Pause", exact: true })).toBeEnabled();
     return new URL(page.url()).pathname.replace(/\/live$/, "");
@@ -1059,6 +1059,12 @@ test("persists both simulated modes and recovers an interrupted search after ser
   }, { times: 1 });
   const first = await search("Gestures");
   await expect(page.getByText("Gestures · Target and mode locked", { exact: true })).toBeVisible();
+  const gestureFeedback = page.getByRole("region", { name: "Gesture feedback" });
+  await expect(gestureFeedback.getByText("Motion permission · Armed")).toBeVisible();
+  await expect(gestureFeedback.getByText("Simulated direction held")).toBeVisible();
+  await expect(page.getByRole("status", { name: "Proximity advisory" }).getByText("Obstacle warning active")).toBeVisible();
+  await expect(gestureFeedback.getByText("Motion permission · Arming")).toBeVisible();
+  await expect(page.getByText("Committed session · Searching")).toBeVisible();
   await page.getByRole("link", { name: "Dashboard", exact: true }).click();
   const leave = page.getByRole("region", { name: "Leave search workspace" });
   await expect(leave.getByRole("button", { name: "Stay", exact: true })).toBeFocused();
@@ -1081,10 +1087,13 @@ test("persists both simulated modes and recovers an interrupted search after ser
   const second = await search("PS4 controller");
   await expect(page.getByText("PS4 DualShock 4 · Target and mode locked", { exact: true })).toBeVisible();
   await expect(page.getByRole("heading", { name: "PS4 controller input" })).toBeVisible();
+  await expect(page.getByText("Gesture control inactive")).toBeVisible();
+  await expect(page.getByRole("region", { name: "Controller feedback" }).getByText("Motion permission · Armed")).toBeVisible();
   const emergency = page.getByRole("button", { name: "Emergency Stop", exact: true });
   await emergency.focus();
   await page.keyboard.press("Enter");
   await expect(page.getByText("Motion permission revoked", { exact: true })).toBeVisible();
+  await expect(page.getByText("Simulated movement stopped", { exact: true })).toBeVisible();
   await expect(page.getByText("Saved", { exact: true })).toBeVisible();
 
   await stopBackend();
@@ -1099,4 +1108,30 @@ test("persists both simulated modes and recovers an interrupted search after ser
   await expect(page.locator(`a[href="${first}"]`)).toBeVisible();
   await expect(page.locator(`a[href="${second}"]`)).toBeVisible();
   expect(requests.filter((request) => request === "POST /api/v1/sessions")).toHaveLength(2);
+});
+
+test("marks the last connected Workspace frame Not live and stops a held command", async ({ page }) => {
+  test.setTimeout(45_000);
+  await startBackend({ simulation: true });
+  await observePreviewFrames(page);
+  await selectTarget(page, sourceImage(), "Stale display target");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  await page.getByRole("button", { name: "Start Search" }).click();
+  const feedback = page.getByRole("region", { name: "Gesture feedback" });
+  await expect(feedback.getByText("Motion permission · Armed")).toBeVisible();
+  const robot = page.getByRole("region", { name: "Robot camera" });
+  const canvas = robot.locator("canvas");
+  const pixels = await canvas.evaluate((element: HTMLCanvasElement) => element.toDataURL());
+  await page.evaluate(() => { (window as unknown as PreviewWindow).previewProbe.repeatFrames = true; });
+  await expect(robot.getByText("Not live", { exact: true })).toBeVisible();
+  expect(await canvas.evaluate((element: HTMLCanvasElement) => element.toDataURL())).toBe(pixels);
+  await expect(feedback.getByText("Motion permission · Disarmed", { exact: true })).toBeVisible();
+  await expect(page.getByText("Committed session · Paused")).toBeVisible();
+  await expect(page.getByRole("strong").filter({ hasText: /^(Displayed robot video stale|Workspace unusable)$/ })).toBeVisible();
+  await page.evaluate(() => { (window as unknown as PreviewWindow).previewProbe.repeatFrames = false; });
+  await expect(robot.getByText("Live sample", { exact: true })).toBeVisible();
+  await expect(feedback.getByText("Motion permission · Disarmed", { exact: true })).toBeVisible();
 });

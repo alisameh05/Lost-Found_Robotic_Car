@@ -48,7 +48,7 @@ export function validSnapshot(state: Snapshot, boot: string) {
     state.runtime.control_generation === state.lease.control_generation &&
     (state.runtime.effective_session_state !== null) === (state.active_session !== null) &&
     (state.runtime.motion_permission === "Disarmed" || state.runtime.effective_session_state === "Searching") &&
-    state.failures.every(({ session_id }) => session_id === state.active_session?.id) &&
+    state.failures.every(({ session_id }) => session_id === (state.active_session?.id ?? null)) &&
     (state.active_object?.id ?? null) === (state.active_session?.object_id ?? null) &&
     (!state.pending_candidate || pendingReview(state));
 }
@@ -168,7 +168,7 @@ export function projectWorkspaceEvent(current: Snapshot | undefined, event: Even
           (next.pending_candidate && !sameCapture(next.pending_candidate, event.payload.match))) return;
       return { ...next, pending_candidate: event.payload.match };
     case "recovery_changed":
-      if (event.payload.failures.some((failure) => failure.session_id !== session?.id)) return;
+      if (event.payload.failures.some((failure) => failure.session_id !== (session?.id ?? null))) return;
       return { ...next, failures: event.payload.failures, runtime: event.payload.runtime,
         readiness: { ...next.readiness, can_resume: next.readiness.can_resume &&
           event.payload.failures.every(({ restored, acknowledged }) => restored && acknowledged) } };

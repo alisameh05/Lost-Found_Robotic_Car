@@ -103,9 +103,17 @@ class RecordsRuntime:
                 self.sessions.revoked(revocation)
             on_control_revoked(revocation)
 
+        def failure_changed(failure: dict[str, object]) -> None:
+            if self.sessions:
+                self.sessions.path_failure_changed(failure)
+
+        def emergency() -> None:
+            if self.sessions:
+                self.sessions.emergency_revoke()
+
         self.realtime = Realtime(simulation, unavailable_code, self.boot_id, self.storage.monotonic,
                                  self.storage.clock, self.touch_client, self.realtime_projection, invalidate,
-                                 self.expire_clients, revoked)
+                                 self.expire_clients, revoked, failure_changed, emergency)
         self.sessions = SessionCoordinator(self, self.realtime)
         return self.realtime
 
@@ -182,6 +190,16 @@ class RecordsRuntime:
         if self._startup_fault:
             return self._startup_fault
         return await asyncio.to_thread(self.storage.inspect, tuple(self._pending))
+
+    async def maintain_safety_storage(self, realtime: Realtime) -> None:
+        while not self._stopping:
+            started = realtime.monotonic()
+            if not self._starting:
+                healthy = not self._startup_fault and await asyncio.to_thread(
+                    self.storage.safety_storage_healthy, self.preparing(),
+                )
+                realtime.observe_storage(healthy, started)
+            await asyncio.sleep(0.1)
 
     def check_started(self) -> None:
         if self._starting:
@@ -486,11 +504,14 @@ class RecordsRuntime:
         self._retention_changed.set()
         async with self._admission:
             await asyncio.gather(*(task for _, task in self._pending.values()), return_exceptions=True)
+        if self.sessions:
+            await self.sessions.stop()
         if self._retention_task is not None:
             await self._retention_task
 
     def readiness(self, storage: Inspection | None) -> dict[str, object]:
-        status = "Initializing" if storage is None else "Unavailable" if storage.problem else "Ready"
+        simulation_fault = self.realtime and self.realtime.profile and self.realtime.component_cause("Storage")
+        status = "Initializing" if storage is None else "Unavailable" if storage.problem or simulation_fault else "Ready"
         cause = {"Initializing": ["INITIALIZING"], "Unavailable": ["STORAGE_UNAVAILABLE"], "Ready": []}[status]
         return {
             "components": [

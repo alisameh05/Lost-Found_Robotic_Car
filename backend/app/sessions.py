@@ -10,6 +10,7 @@ from uuid import uuid4
 from .control import Revocation
 from .http import HttpError
 from .operations import MAX_ORDINARY_PENDING, Operation, mutation
+from .realtime import REVOCATION_FAILURES
 from .registration_input import canonical_json
 from .search_input import SearchRequest
 from .search_storage import EMPTY_RESULT, SavedSearch, inspect_search, save_safety_pause, save_search
@@ -27,6 +28,7 @@ class SafetySave:
     session: str
     owner: str | None
     failure: str | None = None
+    observation: dict[str, object] | None = None
     task: asyncio.Task[Receipt] | None = None
     persistence: str = "Pending"
     error: dict[str, object] | None = None
@@ -44,6 +46,46 @@ class SessionCoordinator:
         self._safety_occupied = False
         self._emergency_occupied = False
         self._deferred_pause: str | None = None
+        self._path_failures: dict[str, dict[str, object]] = {}
+        self._failure_task: asyncio.Task[None] | None = None
+
+    def path_failure_changed(self, failure: dict[str, object]) -> None:
+        self._path_failures[str(failure["failure_id"])] = failure
+        if self._failure_task is None and not self.runtime._stopping:
+            self._failure_task = asyncio.create_task(self.save_path_failures())
+
+    async def save_path_failures(self) -> None:
+        runtime = self.runtime
+        try:
+            while self._path_failures and not runtime._stopping:
+                session = self.realtime.safety_session
+                self._path_failures = {
+                    key: value for key, value in self._path_failures.items() if value["session_id"] == session
+                }
+                if session is None or not self._path_failures:
+                    return
+                failures = tuple(self._path_failures.values())
+                try:
+                    async with runtime._save:
+                        saved = await asyncio.to_thread(save_safety_pause, runtime.storage, session, failures)
+                except (OSError, sqlite3.Error, HttpError):
+                    self.realtime.observe_storage(False, self.realtime.monotonic())
+                    await asyncio.sleep(SAVE_WAIT)
+                    continue
+                for failure in failures:
+                    key = str(failure["failure_id"])
+                    if self._path_failures.get(key) == failure:
+                        del self._path_failures[key]
+                if saved.session:
+                    self.realtime.publish_search_commit(saved.session, None, None, bool(runtime._pending))
+        finally:
+            self._failure_task = None
+
+    async def stop(self) -> None:
+        if self.emergency_fallback is not None:
+            self.emergency_fallback.cancel()
+        if self._failure_task is not None:
+            await self._failure_task
 
     async def action(self, request: SearchRequest) -> Receipt:
         runtime = self.runtime
@@ -166,7 +208,8 @@ class SessionCoordinator:
         return response
 
     def revoked(self, revocation: Revocation) -> None:
-        if revocation.session is None or revocation.reason in ("EmergencyStop", "SessionEnded"):
+        if (revocation.session is None or revocation.reason in ("EmergencyStop", "SessionEnded")
+                or revocation.reason in REVOCATION_FAILURES):
             return
         if self._safety_occupied:
             # A user action can lose its lease at the writer guard. Remember the
@@ -192,14 +235,15 @@ class SessionCoordinator:
             self.begin_pause(str(uuid4()), session, visible=False)
 
     def begin_pause(
-        self, request: str, session: str, failure: str | None = None, *, visible: bool = True,
+        self, request: str, session: str, observation: dict[str, object] | None = None, *, visible: bool = True,
     ) -> SafetySave:
         runtime = self.runtime
+        failure = str(observation["failure_id"]) if observation else None
         if self.emergency_fallback is not None and failure:
             self.emergency_fallback.cancel()
             self.emergency_fallback = None
         owner = self.realtime.active_owner
-        job = SafetySave(session, owner, failure)
+        job = SafetySave(session, owner, failure, observation)
         occupied = self._emergency_occupied if failure else self._safety_occupied
         if occupied or runtime._stopping:
             error = HttpError(503, "CAPACITY_REACHED", "Safety was applied. Pause saving capacity is occupied.", True)
@@ -228,7 +272,7 @@ class SessionCoordinator:
         try:
             async with runtime._save:
                 saved = await asyncio.to_thread(
-                    save_safety_pause, runtime.storage, job.session, self.realtime.failure if job.failure else None,
+                    save_safety_pause, runtime.storage, job.session, (job.observation,) if job.observation else (),
                 )
             receipt = Receipt(canonical_json({
                 "action_id": request, "persistence": "Committed",
@@ -271,12 +315,7 @@ class SessionCoordinator:
         session = self.realtime.emergency_revoke()
         if session is None:
             return None
-        previous = self.realtime.failure
-        if previous is None or previous["session_id"] != session:
-            self.realtime.set_failure({
-                "failure_id": uuid4().hex, "session_id": session, "cause": "EmergencyStop",
-                "observed_at_ms": self.runtime.storage.clock(), "restored": False, "acknowledged": False,
-            })
+        self.realtime.record_failure("EmergencyStop", session)
         # An authorized stalled body cannot indefinitely withhold durable emergency persistence.
         if self.emergency_fallback is None:
             self.emergency_fallback = asyncio.get_running_loop().call_later(
@@ -288,7 +327,7 @@ class SessionCoordinator:
         if session is None or self.realtime.safety_session != session:
             self.emergency_fallback = None
             return None
-        failure = self.realtime.failure
+        failure = self.realtime.failure_for(session, "EmergencyStop")
         if not failure or session != failure["session_id"]:
             return None
         previous = self.emergency_save
@@ -297,7 +336,7 @@ class SessionCoordinator:
                 self.emergency_fallback.cancel()
                 self.emergency_fallback = None
             return previous
-        self.emergency_save = self.begin_pause(request, session, str(failure["failure_id"]))
+        self.emergency_save = self.begin_pause(request, session, failure)
         return self.emergency_save
 
     async def emergency(self, request: str, client: str | None, session: str | None) -> tuple[int, dict[str, object]]:
@@ -310,7 +349,7 @@ class SessionCoordinator:
                 if self.emergency_fallback:
                     self.emergency_fallback.cancel()
                     self.emergency_fallback = None
-                failure = self.realtime.failure
+                failure = self.realtime.failure_for(session, "EmergencyStop")
                 return 503, {
                     "request_id": request, "backend_boot_id": self.runtime.boot_id, "permission_revoked": True,
                     "session_id": session,
