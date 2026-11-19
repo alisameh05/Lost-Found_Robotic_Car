@@ -125,8 +125,12 @@ class Observations:
         self.circle = False
         self.proximity: int | None = None
         self.protocol_fault = False
+        self.capture_barrier: Event | None = None
 
     def observe(self, now: float, scope: InputScope | None = None) -> Observation:
+        barrier = self.capture_barrier
+        if barrier is not None:
+            assert barrier.wait(5)
         if self.protocol_fault:
             raise ValueError("Simulated incompatible adapter")
         base = self.adapter.observe(now, scope)
@@ -255,7 +259,7 @@ def test_control_is_exclusive_and_historical_retries_do_not_reacquire(tmp_path: 
     with service(tmp_path) as laf:
         alice, bob = laf.bootstrap(), laf.bootstrap()
         alice_headers, bob_headers = auth(alice), auth(bob)
-        wait_for(laf.http, "/health", alice_headers)
+        wait_for(laf.http, "/health", alice_headers, simulation_ready)
         acquire = {"request_id": str(uuid4()), "client_id": alice["client_id"], "session_id": None, "takeover": False}
         with laf.open("/events", laf.ticket(alice_headers, "events")) as owner, \
                 laf.open("/events", laf.ticket(bob_headers, "events")) as spectator:
@@ -266,7 +270,7 @@ def test_control_is_exclusive_and_historical_retries_do_not_reacquire(tmp_path: 
             assert response.status_code == 200, response.json()
             owned = response.json()
             validate("LeaseResponse", owned)
-            owner_update, spectator_update = event(owner), event(spectator)
+            owner_update, spectator_update = (lease_event(channel, "Owned") for channel in (owner, spectator))
             assert owner_update["event_seq"] == spectator_update["event_seq"]
             assert owned["client_lease_id"] not in json.dumps([owner_update, spectator_update])
             for identity, headers in ((alice, alice_headers), (bob, bob_headers)):
@@ -280,7 +284,7 @@ def test_control_is_exclusive_and_historical_retries_do_not_reacquire(tmp_path: 
             assert result.status_code == 200
             assert result.json()["client_lease_id"] is None
             for channel in (owner, spectator):
-                assert event(channel)["payload"]["lease"]["state"] == "Unowned"
+                lease_event(channel, "Unowned")
             retry = laf.http.post(path, headers=alice_headers, json=acquire).json()
             assert retry["client_lease_id"] == owned["client_lease_id"]
             assert retry["lease"] == owned["lease"]
@@ -354,6 +358,14 @@ def event(channel: ClientConnection) -> dict:
     value = json.loads(channel.recv(timeout=4))
     validate("EventEnvelope", value)
     return value
+
+
+def lease_event(channel: ClientConnection, state: str) -> dict:
+    for _ in range(12):
+        update = event(channel)
+        if update["type"] == "snapshot" and update["payload"]["lease"]["state"] == state:
+            return update
+    raise AssertionError(f"Missing {state} lease snapshot")
 
 
 def frame(channel: ClientConnection) -> tuple[dict, bytes]:
@@ -434,7 +446,7 @@ def test_atomic_snapshot_handoff_replacement_and_close_codes(tmp_path: Path) -> 
     with service(tmp_path) as app:
         first = auth(app.bootstrap())
         watcher = auth(app.bootstrap())
-        wait_for(app.http, "/health", first)
+        wait_for(app.http, "/health", first, simulation_ready)
         with app.open("/events", app.ticket(first, "events")) as initial:
             baseline = event(initial)
             assert baseline["event_seq"] == baseline["payload"]["event_seq"] == 1
@@ -443,16 +455,25 @@ def test_atomic_snapshot_handoff_replacement_and_close_codes(tmp_path: Path) -> 
                 subscription = attempts.submit(app.open, "/events", token)
                 app.observations.inference = False
                 wait_for(app.http, "/health", first, lambda health: status(health, "AI") == "Unavailable")
-                changed = event(initial)
-                assert changed["type"] == "readiness_changed" and changed["event_seq"] == 2
+                def failed_ai(channel: ClientConnection, latest: dict) -> dict:
+                    for _ in range(12):
+                        if (latest["type"] in ("snapshot", "readiness_changed")
+                                and status(latest["payload"], "AI") == "Unavailable"):
+                            return latest
+                        following = event(channel)
+                        assert following["event_seq"] == latest["event_seq"] + 1
+                        latest = following
+                    raise AssertionError("Missing AI readiness transition")
+
+                changed = failed_ai(initial, baseline)
+                assert changed["type"] == "readiness_changed"
                 with subscription.result(timeout=5) as spectator:
-                    fresh = event(spectator)
-                    if fresh["event_seq"] == 1:
-                        fresh = event(spectator)
-                        assert fresh["type"] == "readiness_changed"
-                    assert fresh["event_seq"] == 2 and status(fresh["payload"], "AI") == "Unavailable"
+                    fresh = failed_ai(spectator, event(spectator))
+                    assert fresh["event_seq"] >= changed["event_seq"]
                     with app.open("/events", app.ticket(first, "events")) as replacement:
-                        assert event(replacement)["event_seq"] == 2
+                        replaced = event(replacement)
+                        assert replaced["event_seq"] >= changed["event_seq"]
+                        assert status(replaced["payload"], "AI") == "Unavailable"
                         assert (first["X-App-Client-Id"], "events") in app.invalidations
                         closed(initial, 1008)
                         replacement.send("{")
@@ -468,6 +489,10 @@ def test_atomic_snapshot_handoff_replacement_and_close_codes(tmp_path: Path) -> 
 
 def status(payload: dict, name: str) -> str:
     return next(component["status"] for component in payload["readiness"]["components"] if component["component"] == name)
+
+
+def simulation_ready(payload: dict) -> bool:
+    return all(status(payload, name) == "Ready" for name in ("Storage", "RobotVideo", "Controller", "Command", "AI"))
 
 
 def closed(channel: ClientConnection, code: int, *, drain: bool = False) -> None:
@@ -1115,6 +1140,38 @@ def assert_stopped(laf: Loopback, cause: str) -> None:
                for entry in laf.command.journal[:-2])
 
 
+def test_motion_generation_requires_a_post_rotation_display(tmp_path: Path) -> None:
+    lease: dict = {}
+    with service(tmp_path) as laf, ready_search(laf, acquired=lease) as (owner, start, events, video):
+        headers = auth(owner)
+        wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_start"]["Controller"])
+        result = laf.http.post(API + "/sessions", headers=headers, json=start)
+        assert result.status_code == 201, result.text
+        session = result.json()["result"]["session"]["id"]
+        old_frame = frame(video)[0]
+        events.send(json.dumps(heartbeat(owner, lease, 2, old_frame, session_id=session)))
+        for _ in range(12):
+            update = event(events)
+            if update["type"] == "snapshot" and (
+                update["payload"]["runtime"]["control_generation"] > lease["control_generation"]
+            ):
+                break
+        generation = update["payload"]["runtime"]["control_generation"]
+        assert generation > lease["control_generation"]
+        lease["control_generation"] = generation
+        events.send(json.dumps(heartbeat(owner, lease, 3, None, session_id=session)))
+        events.send(json.dumps(heartbeat(owner, lease, 4, old_frame, session_id=session)))
+        wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "Workspace") == "Ready")
+        current = laf.http.get(API + "/snapshot", headers=headers).json()
+        assert status(current, "DisplayedRobotVideo") == "Unavailable"
+        assert current["runtime"]["motion_permission"] == "Disarmed"
+        recent = frame(video)[0]
+        while recent["capture_seq"] < old_frame["capture_seq"] + 3:
+            recent = frame(video)[0]
+        events.send(json.dumps(heartbeat(owner, lease, 5, recent, session_id=session)))
+        wait_for(laf.http, "/snapshot", headers, lambda s: s["runtime"]["motion_permission"] == "Arming")
+
+
 @pytest.mark.parametrize("mode", ["Gestures", "Controller"])
 def test_neutral_fresh_hold_and_release_drive_the_same_sink(tmp_path: Path, mode: str) -> None:
     with service(tmp_path) as laf:
@@ -1382,6 +1439,23 @@ def test_repeated_path_observations_share_an_id_until_restoration(tmp_path: Path
         assert [failure["restored"] for failure in recurring["failures"]] == [True, False]
         assert len({failure["failure_id"] for failure in recurring["failures"]}) == 2
         assert recurring["runtime"]["motion_permission"] == "Disarmed"
+
+
+def test_silent_capture_staleness_is_recorded_even_after_another_fault_pauses(tmp_path: Path) -> None:
+    release = Event()
+    with service(tmp_path) as laf, driving_search(laf) as (headers, _):
+        arm(laf, headers)
+        laf.observations.inference = False
+        paused = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+        assert paused["lease"]["state"] == "Unowned"
+        try:
+            laf.observations.capture_barrier = release
+            stale = wait_for(laf.http, "/snapshot", headers, lambda s: len(s["active_session"]["pause_causes"]) == 2)
+            assert {failure["cause"] for failure in stale["failures"]} == {"AIUnavailable", "RobotVideoUnavailable"}
+            assert status(stale, "RobotVideo") == "Unavailable"
+            assert laf.command.output is None
+        finally:
+            release.set()
 
 
 @pytest.mark.parametrize("action", ["pause", "stop"])

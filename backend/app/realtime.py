@@ -355,6 +355,9 @@ class Realtime:
         while not self._closed:
             now = self.monotonic()
             self._evaluate_motion(now)
+            robot = self._frames.get("robot")
+            if robot and "robot" in self._live_sources and robot.age(now) >= profile.bound("capture_age_limit_ms"):
+                self._observe_source("robot", None, None, now, profile)
             if self._proximity:
                 before = self._proximity.payload
                 self._proximity.expire(now)
@@ -1291,7 +1294,6 @@ class Realtime:
             return True
         lease.setup_handoff = False
         lease.previous_generation = None
-        lease.generation_started = None
         lease.heartbeat_deadline = now + profile.bound("heartbeat_deadline_ms") / 1000
         lease.workspace = True
         lease.displayed = indication is not None
