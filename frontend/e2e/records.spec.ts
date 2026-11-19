@@ -211,7 +211,7 @@ test("watches a protected simulated preview from a saved Lost target across tabs
   await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
   await expect(preview.getByText("Backend simulation · Disarmed")).toBeVisible();
   await expect(preview.locator("canvas")).toHaveAttribute("width", "480");
-  await expect(page.getByRole("button", { name: "Acquire control" })).toBeDisabled();
+  await expect(page.getByRole("button", { name: "Acquire control" })).toBeEnabled();
   await expect(page.getByRole("button", { name: "Start Search" })).toBeDisabled();
   await page.getByRole("radio", { name: "PS4 controller" }).check();
   await expect(page.getByRole("listitem").filter({ hasText: "Laptop webcam" }).getByText("Inactive")).toBeVisible();
@@ -253,7 +253,7 @@ test("watches a protected simulated preview from a saved Lost target across tabs
   await expect(spectator.getByText("Live preview", { exact: true })).toBeVisible();
   await spectator.reload();
   await expect(spectator.getByText("Live preview", { exact: true })).toBeVisible();
-  await expect(spectator.getByRole("button", { name: "Acquire control" })).toBeDisabled();
+  await expect(spectator.getByRole("button", { name: "Acquire control" })).toBeEnabled();
   await spectator.close();
   await page.bringToFront();
 
@@ -268,6 +268,65 @@ test("watches a protected simulated preview from a saved Lost target across tabs
       (request) => request === "POST /api/v1/websocket-tickets",
     )).toBe(true);
   }
+});
+
+test("acquires, demonstrates readiness, and releases control in connected Search Setup", async ({ page, context }) => {
+  test.setTimeout(60_000);
+  await startBackend({ simulation: true });
+  await observePreviewFrames(page);
+  await selectTarget(page, sourceImage(), "Workspace control");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await expect(page.getByRole("heading", { name: "Object Details" })).toBeVisible();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  const preview = page.getByRole("region", { name: "Simulated robot preview" });
+  await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
+  const other = await context.newPage();
+  await other.goto(page.url());
+  await expect(other.getByText("Live preview", { exact: true })).toBeVisible();
+  const { requests } = observe(page);
+  await page.bringToFront();
+  await expect(page.getByText("Ready to start", { exact: true })).toHaveCount(0);
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  await expect(page.getByText("Ready to start", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Search" })).toBeDisabled();
+  await expect(other.getByRole("button", { name: "Acquire control" })).toHaveAccessibleDescription("Another workspace holds control.");
+  await expect(other.getByText("Ready to start", { exact: true })).toHaveCount(0);
+
+  const pixels = await preview.locator("canvas").evaluate((element: HTMLCanvasElement) => element.toDataURL());
+  await page.evaluate(() => { (window as unknown as PreviewWindow).previewProbe.repeatFrames = true; });
+  await expect(preview.getByText("Not live", { exact: true })).toBeVisible();
+  await expect(page.getByText("Ready to start", { exact: true })).toHaveCount(0);
+  expect(await preview.locator("canvas").evaluate((element: HTMLCanvasElement) => element.toDataURL())).toBe(pixels);
+  await page.evaluate(() => { (window as unknown as PreviewWindow).previewProbe.repeatFrames = false; });
+  await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
+  await expect(page.getByText("Ready to start", { exact: true })).toHaveCount(0);
+
+  await other.bringToFront();
+  await expect(other.getByText("Selecting Acquire control consents to taking over available control.")).toBeVisible();
+  await other.getByRole("button", { name: "Acquire control" }).click();
+  await expect(other.getByText("Ready to start", { exact: true })).toBeVisible();
+  await other.evaluate(() => dispatchEvent(new Event("blur")));
+  await expect(other.getByText("Ready to start", { exact: true })).toHaveCount(0);
+  await expect(other.getByRole("button", { name: "Release control" })).toHaveCount(0);
+
+  await page.bringToFront();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  await expect(page.getByText("Ready to start", { exact: true })).toBeVisible();
+  const released = page.waitForResponse((response) =>
+    response.request().method() === "POST" && response.url().endsWith("/api/v1/control-lease/release"), { timeout: 5_000 });
+  await page.getByRole("button", { name: "Release control" }).click();
+  expect((await released).status()).toBe(200);
+  await expect(page.getByText("Ready to start", { exact: true })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Acquire control" })).toBeEnabled();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  await expect(page.getByText("Ready to start", { exact: true })).toBeVisible();
+  const left = page.waitForResponse((response) =>
+    response.request().method() === "POST" && response.url().endsWith("/api/v1/control-lease/release"), { timeout: 5_000 });
+  await page.getByRole("link", { name: "Back to Object Details" }).click();
+  expect((await left).status()).toBe(200);
+  await expect(page.getByRole("heading", { name: "Object Details" })).toBeVisible();
+  expect(requests).not.toContain("POST /api/v1/sessions");
 });
 
 test("keeps Start, Resume and acquisition unavailable on direct routes", async ({ page }) => {

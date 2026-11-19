@@ -380,7 +380,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       const reusable = sessionId && workspace?.canHandOff(sessionId) ? workspace : undefined;
       if (!reusable) workspace?.dispose();
       const active = reusable ?? openWorkspace({
-        transport, context, profile: view.profile, serverTime, readOnly: recordsMode,
+        transport, context, profile: view.profile, serverTime, connectedBackend: recordsMode,
         update: (observation) => update({ workspace: observation }),
         snapshot: (next, removedOwner) => {
           if (removedOwner) removeRecords([removedOwner]);
@@ -422,6 +422,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     acquireWorkspace: () => workspace?.acquire(),
     releaseWorkspace: () => workspace?.release(),
     submitSearch(intent: SearchIntent) {
+      if (recordsMode) return;
       const state = view.snapshot;
       if (!context || !workspace || !state || !view.workspace?.eventsLive) return;
       const active = state.active_session;

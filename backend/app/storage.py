@@ -691,6 +691,26 @@ class RecordsStorage:
             items = [self.object_payload(row, days, now) for row in rows[:limit]]
         return items, (rows[limit - 1]["registered_at_ms"], rows[limit - 1]["id"]) if len(rows) > limit else None
 
+    def search_setup(self) -> tuple[dict[str, object] | None, dict[str, object] | None, bool]:
+        with self.connect() as db, read_transaction(db):
+            db.row_factory = sqlite3.Row
+            now, _ = self.now()
+            days = self.settings(db)["retention_days"]
+            active = db.execute("SELECT * FROM sessions WHERE state IN ('Searching', 'Paused')").fetchone()
+            cutoff = now - retention_ms(days)
+            if active is not None:
+                row = db.execute(OBJECT_ROWS + f" WHERE o.id = ? AND {ELIGIBLE}",
+                                 (active["object_id"], cutoff)).fetchone()
+                return self.session_payload(active), self.object_payload(row, days, now) if row else None, False
+            for path, length, checksum in db.execute(f"""
+                SELECT m.relative_path, m.byte_length, m.checksum
+                FROM objects AS o JOIN media AS m ON m.id = o.reference_media_id
+                WHERE {ELIGIBLE} AND o.status = 'Lost' AND m.lifecycle = 'Ready'
+            """, (cutoff,)):
+                if self.files.read(path, length, checksum, metadata_only=True)[0] == "Available":
+                    return None, None, True
+            return None, None, False
+
     @staticmethod
     def session_payload(row: sqlite3.Row) -> dict[str, object]:
         return {**{field: row[field] for field in SESSION_FIELDS}, "pause_causes": json.loads(row["pause_causes"])}

@@ -58,6 +58,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   const showPreview = !recordsMode || (object.status === "Lost" && !object.retention_grace && referenceDisplayed === true);
   const canvas = useRef<HTMLDivElement>(null);
   const requestedStart = useRef(false);
+  const releaseForNavigation = recordsMode ? () => { void runtime?.releaseWorkspace(); } : undefined;
   useEffect(() => {
     if (canvas.current && profile && showPreview) return runtime?.mountWorkspace(canvas.current);
   }, [runtime, profile, showPreview]);
@@ -84,7 +85,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   const required = describeDeviceReadiness(readiness, mode);
   const blockedPaths = [...required.shared, ...(required.selected ? [required.selected] : [])]
     .filter(({ component, status }) => status !== "Ready" && component !== "Workspace" && component !== "DisplayedRobotVideo");
-  const ready = !recordsMode && eligible && !!workspace?.eventsLive && workspace.usable && workspace.controlling && workspace.previewLive &&
+  const ready = eligible && !!workspace?.eventsLive && workspace.usable && workspace.controlling && workspace.previewLive &&
     snapshot?.readiness.can_start[mode] === true;
   const spectator = snapshot?.lease.state === "Owned" && !workspace?.controlling && !workspace?.acquiring && !workspace?.retryAcquisition;
   const acquisitionBlocked = recordBlock ?? (referenceDisplayed === false ? "The reference image is unavailable."
@@ -133,12 +134,12 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
         </fieldset>
         <Panel className={`${styles.card} ${styles.instructions}`}>
           <ModeInstructions mode={mode} title={mode === "Gestures" ? "Gesture instructions" : "PS4 instructions"} />
-          <Link href={supportHref("/control-guide", context)}>Open Control Guide</Link>
+          <Link href={supportHref("/control-guide", context)} onNavigate={releaseForNavigation}>Open Control Guide</Link>
         </Panel>
         <section aria-labelledby="setup-readiness-title" className={styles.column}>
           <div className={styles.row}>
             <h2 id="setup-readiness-title">Connection readiness</h2>
-            <Link className="button button--secondary" href={supportHref("/devices", context)}>View Devices</Link>
+            <Link className="button button--secondary" href={supportHref("/devices", context)} onNavigate={releaseForNavigation}>View Devices</Link>
           </div>
           {health?.initialization === "Starting" && <Notice title="Initializing services" tone="warning">Checking the backend and managed storage.</Notice>}
           {health?.initialization === "Failed" && <Notice title="Backend diagnostics" tone="danger">Managed storage or startup checks failed.</Notice>}
@@ -167,26 +168,31 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
     </div>
     <footer className={styles.footer}>
       <div role="status" className={styles.feedback}>
-        {recordsMode ? <Notice title="Read-only setup">Control and Start Search are unavailable in this preview.</Notice>
-          : ready ? <Notice tone="success" title="Ready to start">Required paths are ready and the robot preview is live.</Notice>
+        {ready ? <Notice tone="success" title="Ready to start">{recordsMode
+          ? "Required paths are ready and the displayed robot frame is confirmed. Starting a search is unavailable in this simulation."
+          : "Required paths are ready and the robot preview is live."}</Notice>
           : notice ? <Notice tone="warning" title="Start blocked">{notice}</Notice>
           : <Notice title={spectator ? "Spectator" : workspace?.controlling ? "Checking the displayed frame" : "Preview only"}>
             {spectator ? "Another workspace holds control." : workspace?.controlling
-              ? "Waiting for the fixture to acknowledge the displayed robot frame." : "Acquire control to finish checking readiness."}
+              ? "Waiting for the displayed robot frame to be acknowledged." : "Acquire control to finish checking readiness."}
           </Notice>}
         {workspace?.message && <p role="status">{workspace.message}</p>}
+        {workspace?.releasing && <p role="status">Releasing control…</p>}
+        {workspace?.releaseNotice && <p role="status">{workspace.releaseNotice}</p>}
         <ActionFeedback label="Starting search" feedback={starting?.stage === "committed" && !active ? undefined : starting} retry={workspace?.eventsLive ? () => {
           requestedStart.current = true;
           void runtime?.retrySearch("start", object.id);
         } : undefined} />
       </div>
       <div className={styles.actions}>
-        <Link className="button button--secondary" href={objectHref(object.id)}>Back to Object Details</Link>
-        {!workspace?.controlling && <Button variant="primary" pending={workspace?.acquiring}
-          disabledReason={recordsMode ? "Control is unavailable in this preview." : acquisitionBlocked} onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
-        <Button variant="primary" pending={starting?.stage === "sending"} disabled={!ready || busy}
+        <Link className="button button--secondary" href={objectHref(object.id)} onNavigate={releaseForNavigation}>Back to Object Details</Link>
+        {recordsMode && workspace?.controlling && <Button variant="secondary" onClick={() => { void runtime?.releaseWorkspace(); }}>Release control</Button>}
+        {workspace?.retryRelease && <Button variant="secondary" onClick={() => { void runtime?.releaseWorkspace(); }}>Retry release</Button>}
+        {!workspace?.controlling && !workspace?.releasing && !workspace?.retryRelease && <Button variant="primary" pending={workspace?.acquiring}
+          disabledReason={acquisitionBlocked} onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
+        <Button variant="primary" pending={starting?.stage === "sending"} disabled={recordsMode || !ready || busy}
           onClick={() => {
-            if (!ready) return;
+            if (recordsMode || !ready) return;
             requestedStart.current = true;
             void runtime?.submitSearch({ kind: "start", object, mode });
           }}>Start Search</Button>

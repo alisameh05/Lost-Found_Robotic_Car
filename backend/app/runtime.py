@@ -9,6 +9,7 @@ from secrets import token_urlsafe
 from time import monotonic
 from typing import Literal
 
+from .control import Revocation
 from .http import HttpError
 from .realtime import Channel, Realtime
 from .reference_image import Reference, prepare_reference
@@ -114,10 +115,11 @@ class RecordsRuntime:
     realtime: Realtime | None = field(default=None, init=False, repr=False)
 
     def enable_realtime(self, simulation: Simulation | None, unavailable_code: str,
-                        invalidate: Callable[[str, Channel], None]) -> Realtime:
+                        invalidate: Callable[[str, Channel], None],
+                        on_control_revoked: Callable[[Revocation], None]) -> Realtime:
         self.realtime = Realtime(simulation, unavailable_code, self.boot_id, self.storage.monotonic,
                                  self.storage.clock, self.touch_client, self.realtime_projection, invalidate,
-                                 self.expire_clients)
+                                 self.expire_clients, on_control_revoked)
         return self.realtime
 
     def frontend_profile(self) -> dict[str, int | str] | None:
@@ -130,8 +132,8 @@ class RecordsRuntime:
     def expire_clients(self) -> None:
         now = self.client_time()
         for client, touched in list(self._clients.items()):
-            connected = self.realtime and self.realtime.client_has_events(client)
-            if now - touched >= CLIENT_IDLE_SECONDS and not connected:
+            protected = self.realtime and self.realtime.client_is_live(client)
+            if now - touched >= CLIENT_IDLE_SECONDS and not protected:
                 del self._clients[client]
                 if self.realtime:
                     self.realtime.expire_client(client)
@@ -530,7 +532,26 @@ class RecordsRuntime:
         storage = await self.inspect()
         if storage is None:
             return None
-        return {**await self.snapshot(storage), "storage_problem": bool(storage.problem)}
+        session, target, available = (None, None, False)
+        if storage.settings is not None and (not storage.problem or storage.active_session_state is not None):
+            try:
+                session, target, available = await asyncio.to_thread(self.storage.search_setup)
+            except (OSError, sqlite3.Error):
+                storage = replace(storage, problem="Search setup storage is unavailable.")
+        state = await self.snapshot(storage)
+        if session and target:
+            state["active_session"] = session
+            state["active_object"] = target
+            runtime = state["runtime"]
+            assert isinstance(runtime, dict)
+            runtime["effective_session_state"] = session["state"]
+            retention = state["retention"]
+            assert isinstance(retention, dict)
+            retention["active_object_expires_at_ms"] = target["expires_at_ms"]
+            retention["active_object_grace"] = target["retention_grace"]
+        return {**state, "storage_problem": bool(storage.problem),
+                "eligible_target": available and not storage.problem,
+                "session_id": session["id"] if session else None}
 
     async def snapshot(self, storage: Inspection) -> dict[str, object]:
         profile = self.frontend_profile()
