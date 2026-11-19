@@ -131,6 +131,7 @@ class Connection:
     ready: asyncio.Event = field(default_factory=asyncio.Event)
     events: deque[bytes] = field(default_factory=deque)
     event_bytes: int = 0
+    sending_event: bytes | None = None
     waiting: Frame | None = None
     issued: dict[str, IssuedFrame] = field(default_factory=dict)
     video_generation: int = 0
@@ -208,7 +209,9 @@ class Realtime:
         self._storage_ready = False
         self._storage_until = 0.0
         self._inference_until = 0.0
+        # Supersession invalidates commit authority while the worker still owns the slot.
         self._candidate_work: str | None = None
+        self._candidate_valid = False
         self.on_candidate: Callable[[CandidateCapture], None] | None = None
         self._motion = None
         self._proximity = None
@@ -333,7 +336,7 @@ class Realtime:
 
     def suspend_search(self, session: str, *, invalidate_candidate: bool = True) -> None:
         if invalidate_candidate:
-            self._candidate_work = None
+            self._candidate_valid = False
         if self._resuming_session == session:
             self._resume_viable = False
         had_permission = self._motion and self._motion.permission != "Disarmed"
@@ -368,7 +371,7 @@ class Realtime:
 
     def search_ended(self, session: str) -> None:
         if self._active_session == session:
-            self._candidate_work = None
+            self._candidate_valid = False
             self._active_session = self._active_owner = None
             self._active_mode = self._active_state = None
             self.active_revision = None
@@ -380,7 +383,7 @@ class Realtime:
             self._revoke("SessionEnded")
 
     def _revoke(self, reason: str, request_id: str | None = None) -> None:
-        self._candidate_work = None
+        self._candidate_valid = False
         self._resume_viable = False
         if self._motion:
             self._motion.stop(reason)
@@ -1151,17 +1154,20 @@ class Realtime:
         work = CandidateCapture(uuid4().hex, scope.session, owner, revision, self._generation, frame.id,
                                 max(frame.captured_at_ms, session["started_at_ms"]), frame.capture, box)
         self._candidate_work = work.id
+        self._candidate_valid = True
         publish(work)
 
     def candidate_current(self, work: CandidateCapture) -> bool:
         self._expire_lease(self.monotonic())
-        return (not self._closed and work.id == self._candidate_work and work.generation == self._generation
+        return (not self._closed and self._candidate_valid and work.id == self._candidate_work
+                and work.generation == self._generation
                 and work.session == self._active_session and work.revision == self.active_revision
                 and self._active_state == "Searching")
 
     def candidate_finished(self, work: CandidateCapture) -> None:
         if self._candidate_work == work.id:
             self._candidate_work = None
+            self._candidate_valid = False
 
     def observe_storage(self, available: bool, started: float) -> None:
         if not self.profile:
@@ -1267,9 +1273,11 @@ class Realtime:
         # A queued snapshot may still contain eligible-when-projected record data.
         marker = canonical_json(owner).encode("utf-8")
         for connection in tuple(self._connections.values()):
-            if any(marker in message for message in connection.events):
+            if marker in (connection.sending_event or b"") or any(marker in message for message in connection.events):
                 self.remove(connection, 1008)
         self._publish("object_removed", {"object_id": owner, "reason": "Expired"})
+        # Failed and Pending operations carry no owner in their wire payload.
+        self._publish_snapshot()
 
     def stop(self, code: int = 1000) -> None:
         self._closed = True
@@ -1365,7 +1373,11 @@ class Realtime:
                 if connection.events:
                     data = connection.events.popleft()
                     connection.event_bytes -= len(data)
-                    await socket.send_text(data.decode("utf-8"))
+                    connection.sending_event = data
+                    try:
+                        await socket.send_text(data.decode("utf-8"))
+                    finally:
+                        connection.sending_event = None
                     continue
             elif connection.waiting is not None:
                 frame, connection.waiting = connection.waiting, None

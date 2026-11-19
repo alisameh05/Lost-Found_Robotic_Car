@@ -304,7 +304,8 @@ class SessionCoordinator:
                     while self._safety_admissions:
                         await self._safety_admission_idle.wait()
         finally:
-            runtime._pending.pop(request.action_id, None)
+            pending = runtime._pending.pop(request.action_id, None)
+            eligible = pending is None or pending[0].visible
             if request.mode:
                 self.realtime.resolve_start(session, saved is not None and saved.session is not None, uncertain=uncertain)
             if request.action == "resume":
@@ -342,6 +343,9 @@ class SessionCoordinator:
         if saved and saved.removed and saved.owner:
             self.realtime.search_ended(session)
             runtime.hide_removed_owner(saved.owner, request.action_id)
+        elif not eligible:
+            expired = HttpError(410, "EXPIRED", "The retention period for this record has ended.")
+            return mutation(request.action_id, "Failed", expired.status, expired)
         elif owner_unavailable and operation.owner:
             runtime.hide_removed_owner(operation.owner, request.action_id)
         else:
@@ -429,7 +433,8 @@ class SessionCoordinator:
             error = storage_unavailable()
             receipt = mutation(request, "Failed", error.status, error)
         finally:
-            runtime._pending.pop(key, None)
+            pending = runtime._pending.pop(key, None)
+            visible = operation.visible and (pending is None or pending[0].visible)
             if job.failure:
                 self._emergency_occupied = False
             else:
@@ -441,14 +446,14 @@ class SessionCoordinator:
         complete = replace(operation, response=receipt)
         if saved and saved.owner and saved.session:
             job.owner = saved.owner
-            if operation.visible:
+            if visible:
                 runtime.publish_terminal(key, complete)
             recovery_changed = self.realtime.reconcile_failures((), saved.restored)
             self.realtime.publish_search_commit(
-                saved.session, complete.payload() if operation.visible else None, None, bool(runtime._pending),
+                saved.session, complete.payload() if visible else None, None, bool(runtime._pending),
                 recovery_changed=recovery_changed,
             )
-        elif operation.visible:
+        elif visible:
             # If Stop won, acknowledge the request without publishing an owner payload.
             if job.terminal_won:
                 complete = replace(complete, owner=None)

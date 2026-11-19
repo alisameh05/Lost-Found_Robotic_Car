@@ -487,11 +487,11 @@ class RecordsRuntime:
         hidden = set()
         for key, (operation, task) in tuple(self._pending.items()):
             if operation.owner == owner:
-                hidden.add(key)
+                hidden.add(operation.request_id or key)
                 self._pending[key] = (replace(operation, visible=False), task)
         for key, operation in tuple(self._terminal.items()):
             if operation.owner == owner:
-                hidden.add(key)
+                hidden.add(operation.request_id or key)
                 del self._terminal[key]
         if action_id:
             hidden.add(action_id)

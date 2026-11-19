@@ -4,6 +4,7 @@ import { existsSync, linkSync, mkdtempSync, readFileSync, unlinkSync, writeFileS
 import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
+import type { SessionAction } from "../src/generated/api-v1";
 
 const frontend = "http://127.0.0.1:3103";
 const backend = "http://127.0.0.1:8110/api/v1";
@@ -1245,12 +1246,55 @@ async function startReviewSearch(page: Page, mode: "Gestures" | "PS4 controller"
   return new URL(page.url()).pathname.replace(/\/live$/, "");
 }
 
+async function replayReviewAction(page: Page, action: SessionAction) {
+  return page.evaluate(async ({ backend, action }) => {
+    const bootstrap = await fetch(`${backend}/bootstrap`).then((response) => response.json());
+    const client_id = bootstrap.client_id;
+    const post = (path: string, body: object) => fetch(backend + path, {
+      method: "POST",
+      headers: {
+        "Content-Type": "application/json",
+        "X-App-Client-Id": client_id,
+        "X-App-Capability": bootstrap.capability,
+      },
+      body: JSON.stringify(body),
+    });
+    const { ticket } = await post("/websocket-tickets", { client_id, channel: "events" }).then((response) => response.json());
+    const events = new URL(`${backend}/events`);
+    events.protocol = "ws:";
+    const socket = new WebSocket(events, ["laf.v1", `laf.ticket.${ticket}`]);
+    try {
+      await new Promise<void>((resolve, reject) => {
+        const timer = setTimeout(() => reject(new Error("The replacement event connection timed out")), 5_000);
+        socket.onmessage = () => { clearTimeout(timer); resolve(); };
+        socket.onclose = () => { clearTimeout(timer); reject(new Error("The replacement event connection closed")); };
+      });
+      const lease = await post("/control-lease", {
+        request_id: crypto.randomUUID(), client_id, session_id: null, takeover: false,
+      });
+      if (!lease.ok) throw new Error("The replacement client could not acquire control");
+      const { client_lease_id } = await lease.json();
+      const same = await post(`/sessions/${action.session_id}/actions`, { ...action, client_id, client_lease_id });
+      return {
+        status: same.status,
+        receipt: await same.text(),
+        replacedClient: client_id !== action.client_id,
+        replacedLease: client_lease_id !== action.client_lease_id,
+      };
+    } finally {
+      socket.close();
+    }
+  }, { backend, action });
+}
+
 for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const) {
   test(`saved candidate review recovers ${outcome} through a backend restart`, async ({ page }) => {
     test.setTimeout(60_000);
     await startBackend({ reviewSimulation: true, crashCandidate: outcome === "uncommitted" });
     const session = await startReviewSearch(page, outcome === "confirm" ? "Gestures" : "PS4 controller");
     const panel = page.getByRole("region", { name: "Review potential match" });
+    let confirm: SessionAction | undefined;
+    let receipt: string | undefined;
     if (outcome === "uncommitted") {
       await expect.poll(() => backendProcess?.exitCode).toBe(84);
       await expect(panel).toHaveCount(0);
@@ -1264,17 +1308,25 @@ for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const
       const overlay = await image.locator("+ span").evaluate((box) => ({
         left: box.style.left, top: box.style.top, width: box.style.width, height: box.style.height,
       }));
-      expect(overlay.left).toBe("25%");
-      expect(overlay.width).toBe("50%");
-      expect(parseFloat(overlay.top)).toBeCloseTo(100 * 65 / 262, 4);
-      expect(parseFloat(overlay.height)).toBeCloseTo(100 * 132 / 262, 4);
+      expect(parseFloat(overlay.left)).toBeCloseTo(100 * 303 / 480, 4);
+      expect(parseFloat(overlay.width)).toBeCloseTo(100 * 83 / 480, 4);
+      expect(parseFloat(overlay.top)).toBeCloseTo(100 * 203 / 262, 4);
+      expect(parseFloat(overlay.height)).toBeCloseTo(100 * 41 / 262, 4);
       await expect(panel.getByRole("button", { name: "Reject Match" })).toHaveCount(0);
       await expect(page.getByRole("button", { name: "Resume", exact: true })).toBeDisabled();
       await expect(page.getByRole("button", { name: "Emergency Stop", exact: true })).toBeEnabled();
       if (outcome === "confirm") {
         await page.route(`${backend}${session}/actions`, async (route) => {
-          const response = await route.fetch();
-          expect([200, 202]).toContain(response.status());
+          confirm = route.request().postDataJSON();
+          let response = await route.fetch();
+          if (response.status() === 202) {
+            await expect.poll(async () => {
+              response = await route.fetch();
+              return response.status();
+            }).toBe(200);
+          }
+          expect(response.ok()).toBe(true);
+          receipt = await response.text();
           await route.abort("connectionreset");
         }, { times: 1 });
         await panel.getByRole("button", { name: "Confirm Match" }).click();
@@ -1287,6 +1339,7 @@ for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const
           ? "Match confirmed and saved" : "Search ended without confirmation" })).toBeVisible();
       }
     }
+    if (outcome === "confirm") await expect.poll(() => receipt).toBeDefined();
 
     await stopBackend();
     await startBackend({ reviewSimulation: true });
@@ -1296,6 +1349,9 @@ for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const
       outcome === "stop" ? "Stopped by operator" : "Interrupted");
     if (outcome === "confirm") {
       await expect(page.getByText("Found", { exact: true })).toBeVisible();
+      expect(await replayReviewAction(page, confirm!)).toEqual({
+        status: 200, receipt, replacedClient: true, replacedLease: true,
+      });
     } else {
       await expect(page.getByText("The object remains Lost.", { exact: true })).toBeVisible();
     }

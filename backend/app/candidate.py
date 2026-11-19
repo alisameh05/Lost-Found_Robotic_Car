@@ -31,17 +31,21 @@ class CandidateCapture:
 
 
 def evidence_box(raw: tuple[float, float, float, float], width: int, height: int) -> Box | None:
-    if (not isinstance(raw, tuple) or len(raw) != 4
-            or not all(type(value) in (int, float) and 0 <= value <= max(width, height) for value in raw)):
+    if not isinstance(raw, tuple) or len(raw) != 4 or not all(type(value) in (int, float) for value in raw):
         return None
-    x, y, w, h = raw
-    if not (0 <= x < x + w <= width and 0 <= y < y + h <= height):
+    try:
+        x, y, w, h = (float(value) for value in raw)
+    except OverflowError:
         return None
-    left, top = math.floor(x), math.floor(y)
-    right, bottom = min(width, math.ceil(x + w)), min(height, math.ceil(y + h))
+    right, bottom = x + w, y + h
+    if not all(map(math.isfinite, (x, y, w, h, right, bottom))) or w <= 0 or h <= 0:
+        return None
+    left, top = max(0.0, x), max(0.0, y)
+    right, bottom = min(width, right), min(height, bottom)
     if left >= right or top >= bottom:
         return None
-    return left, top, right - left, bottom - top
+    px, py = math.floor(left), math.floor(top)
+    return px, py, math.ceil(right) - px, math.ceil(bottom) - py
 
 
 def encode_evidence(capture: Capture) -> bytes:

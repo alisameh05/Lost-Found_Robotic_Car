@@ -6,6 +6,7 @@ from uuid import uuid4
 
 import pytest
 
+from backend.app import sessions
 from backend.app.simulation import CandidateObservation, InferenceSample
 from backend.app.storage import DAY_MS, utc_ms
 from backend.tests.test_realtime import (
@@ -55,14 +56,15 @@ def test_invalid_and_superseded_observations_do_not_pause_or_save(tmp_path: Path
         if not isinstance(result, CandidateObservation):
             return result
         if valid.is_set():
-            return result
+            assert sample.capture
+            return replace(result, box=(sample.capture.width - 1.5, -0.5, 2.0, 4.0))
         first = first or result
         replacements = [
             {"frame_id": "wrong"}, {"stream_epoch": "wrong"}, {"clock_epoch": "wrong"},
             {"capture_sequence": result.capture_sequence + 1}, {"scope": replace(result.scope, session="wrong")},
             {"scope": replace(result.scope, generation=result.scope.generation - 1)},
             {"box": (2.0, 3.0, 0.0, 4.0)}, {"box": (float("nan"), 3.0, 2.0, 3.0)},
-            {"box": (0, 0, 10000, 10000)},
+            {"box": (10000, 0, 2, 3)},
         ]
         index = len(rejected)
         rejected.append(result.frame_id)
@@ -76,6 +78,7 @@ def test_invalid_and_superseded_observations_do_not_pause_or_save(tmp_path: Path
         valid.set()
         match, session = review(laf, headers)
         assert match["frame_id"] not in rejected and session["revision"] == 2
+        assert match["box"] == {"x": match["evidence_media"]["width"] - 2, "y": 0, "width": 2, "height": 4}
         history = laf.http.get(f"{API}/sessions/{session['id']}/matches", headers=headers).json()
         assert history["items"] == [match]
 
@@ -218,6 +221,44 @@ def test_failed_candidate_preparation_saves_fault_and_cleans_up(tmp_path: Path) 
         assert laf.http.get(f"{API}/sessions/{driver.session['id']}/matches", headers=headers).json()["items"] == []
         assert len(list((tmp_path / "media").iterdir())) == 1
         assert not list((tmp_path / "staging").iterdir())
+
+
+def test_superseded_encoder_does_not_suspend_a_new_search(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> None:
+    entered, release, observe = Event(), Event(), Event()
+    sampled_sessions: set[str] = set()
+    encode = sessions.encode_evidence
+
+    def gated_encode(capture):
+        if not entered.is_set():
+            entered.set()
+            assert release.wait(8)
+        return encode(capture)
+
+    def infer(sample: InferenceSample) -> bool | CandidateObservation:
+        if observe.is_set() and sample.scope:
+            sampled_sessions.add(sample.scope.session)
+            return candidate(sample)
+        return True
+
+    monkeypatch.setattr(sessions, "encode_evidence", gated_encode)
+    with service(tmp_path, inference=infer) as laf:
+        try:
+            with driving_search(laf) as (headers, driver):
+                observe.set()
+                assert entered.wait(2)
+                first = driver.session["id"]
+                stopped = search_action(laf, headers, driver, "stop", 1)
+                assert stopped.status_code == 200 and stopped.json()["result"]["match"] is None
+            with driving_search(laf, takeover=True) as (headers, driver):
+                current = wait_for(laf.http, "/snapshot", headers, lambda _: driver.session["id"] in sampled_sessions)
+                assert current["runtime"]["effective_session_state"] == "Searching" and current["pending_candidate"] is None
+                assert not release.is_set()
+                release.set()
+                match, _ = review(laf, headers)
+                assert match["session_id"] == driver.session["id"] != first
+                assert laf.http.get(f"{API}/sessions/{first}/matches", headers=headers).json()["items"] == []
+        finally:
+            release.set()
 
 
 @pytest.mark.parametrize("action", ["confirm", "stop"])

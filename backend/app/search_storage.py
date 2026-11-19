@@ -194,10 +194,11 @@ def save_search(
             authorize(False)
             match = None
             target = None
-            if request.mode:
+            if request.mode or request.action == "confirm":
                 inspection = storage._inspect(db, now, preparing)
                 if inspection.problem:
                     raise storage_unavailable(inspection.problem)
+            if request.mode:
                 if not clock_valid:
                     raise HttpError(503, "NOT_READY", "The local clock is unavailable.", True)
                 target = storage.object_payload(row, days, now)
@@ -237,20 +238,20 @@ def save_search(
             session = storage.session_payload(saved)
             if request.action != "confirm":
                 storage.checkpoint(f"before_{request.action}_commit")
+            found = None
+            if request.action == "confirm":
+                object_row = db.execute(OBJECT_ROWS + " WHERE o.id = ?", (owner,)).fetchone()
+                found = storage.object_payload(object_row, days, now)
+            authorize(True)
             now, _ = storage.now()
             expired = row["registered_at_ms"] + retention_ms(days) <= now
             if request.mode and expired:
                 raise HttpError(410, "EXPIRED", "The retention period for this record has ended.")
             removed = request.action in ("confirm", "stop") and expired
-            found = None
-            if request.action == "confirm" and not removed:
-                object_row = db.execute(OBJECT_ROWS + " WHERE o.id = ?", (owner,)).fetchone()
-                found = storage.object_payload(object_row, days, now)
             result = EMPTY_RESULT if removed else {**EMPTY_RESULT, "object": found, "session": session, "match": match}
             receipt = Receipt(canonical_json({
                 "action_id": request.action_id, "persistence": "Committed", "result": result, "error": None,
             }), 201 if request.mode else 200, f"/api/v1/sessions/{session_id}" if request.mode else None)
-            authorize(True)
             db.execute("""
                 INSERT INTO action_receipts VALUES (?, 'Object', ?, NULL, ?, ?, ?, ?, ?, ?, ?, ?, NULL)
             """, (request.action_id, owner, session_id, request.action, fingerprint, saved["revision"],

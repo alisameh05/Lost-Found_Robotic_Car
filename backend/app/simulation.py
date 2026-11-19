@@ -261,6 +261,8 @@ Inference = Callable[[InferenceSample], bool | CandidateObservation]
 
 
 class FixtureInference:
+    """Report the wallet region in the verified robot fixture after a short search."""
+
     def __init__(self) -> None:
         self.session: str | None = None
         self.started = 0.0
@@ -275,7 +277,7 @@ class FixtureInference:
             return True
         return CandidateObservation(
             scope, sample.frame_id, capture.stream_epoch, capture.clock_epoch, capture.sequence,
-            (capture.width * 0.25, capture.height * 0.25, capture.width * 0.5, capture.height * 0.5),
+            (303.5, 203.5, 82.0, 40.0),
         )
 
 
