@@ -84,7 +84,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   const required = describeDeviceReadiness(readiness, mode);
   const blockedPaths = [...required.shared, ...(required.selected ? [required.selected] : [])]
     .filter(({ component, status }) => status !== "Ready" && component !== "Workspace" && component !== "DisplayedRobotVideo");
-  const ready = !recordsMode && eligible && !!workspace?.eventsLive && workspace.usable && workspace.controlling && workspace.previewLive &&
+  const ready = eligible && !!workspace?.eventsLive && workspace.usable && workspace.controlling && workspace.previewLive &&
     snapshot?.readiness.can_start[mode] === true;
   const spectator = snapshot?.lease.state === "Owned" && !workspace?.controlling && !workspace?.acquiring && !workspace?.retryAcquisition;
   const acquisitionBlocked = recordBlock ?? (referenceDisplayed === false ? "The reference image is unavailable."
@@ -167,12 +167,13 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
     </div>
     <footer className={styles.footer}>
       <div role="status" className={styles.feedback}>
-        {recordsMode ? <Notice title="Read-only setup">Control and Start Search are unavailable in this preview.</Notice>
-          : ready ? <Notice tone="success" title="Ready to start">Required paths are ready and the robot preview is live.</Notice>
+        {ready ? <Notice tone="success" title="Ready to start">{recordsMode
+          ? "Required paths are ready and the displayed robot frame is confirmed. Starting a search is unavailable in this simulation."
+          : "Required paths are ready and the robot preview is live."}</Notice>
           : notice ? <Notice tone="warning" title="Start blocked">{notice}</Notice>
           : <Notice title={spectator ? "Spectator" : workspace?.controlling ? "Checking the displayed frame" : "Preview only"}>
             {spectator ? "Another workspace holds control." : workspace?.controlling
-              ? "Waiting for the fixture to acknowledge the displayed robot frame." : "Acquire control to finish checking readiness."}
+              ? "Waiting for the displayed robot frame to be acknowledged." : "Acquire control to finish checking readiness."}
           </Notice>}
         {workspace?.message && <p role="status">{workspace.message}</p>}
         <ActionFeedback label="Starting search" feedback={starting?.stage === "committed" && !active ? undefined : starting} retry={workspace?.eventsLive ? () => {
@@ -182,11 +183,12 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
       </div>
       <div className={styles.actions}>
         <Link className="button button--secondary" href={objectHref(object.id)}>Back to Object Details</Link>
+        {recordsMode && workspace?.controlling && <Button variant="secondary" onClick={() => { void runtime?.releaseWorkspace(); }}>Release control</Button>}
         {!workspace?.controlling && <Button variant="primary" pending={workspace?.acquiring}
-          disabledReason={recordsMode ? "Control is unavailable in this preview." : acquisitionBlocked} onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
-        <Button variant="primary" pending={starting?.stage === "sending"} disabled={!ready || busy}
+          disabledReason={acquisitionBlocked} onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
+        <Button variant="primary" pending={starting?.stage === "sending"} disabled={recordsMode || !ready || busy}
           onClick={() => {
-            if (!ready) return;
+            if (recordsMode || !ready) return;
             requestedStart.current = true;
             void runtime?.submitSearch({ kind: "start", object, mode });
           }}>Start Search</Button>

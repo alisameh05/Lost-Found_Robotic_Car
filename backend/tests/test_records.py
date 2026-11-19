@@ -100,13 +100,19 @@ def test_address_capability_client_and_preflight(tmp_path: Path) -> None:
         assert result.headers["cache-control"] == "no-store"
         assert "access-control-allow-credentials" not in result.headers
         assert browser.options("/api/v1/control-lease", headers=preflight).status_code == 404
+        for route in ("/control-lease", "/control-lease/release"):
+            result = browser.options("/api/v1" + route, headers={
+                **preflight, "Access-Control-Request-Method": "POST",
+                "Access-Control-Request-Headers": "Content-Type, X-App-Capability",
+            })
+            assert result.status_code == 204 and result.headers["access-control-allow-methods"] == "POST"
         register = browser.options("/api/v1/objects", headers={**preflight, "Access-Control-Request-Method": "POST"})
         assert register.status_code == 204 and register.headers["access-control-allow-methods"] == "POST"
         assert browser.options("/api/v1/snapshot", headers={
             **preflight, "Access-Control-Request-Headers": "X-Unknown",
         }).status_code == 422
         assert browser.post("/api/v1/objects", headers=ORIGIN, data={"name": "test"}).status_code == 403
-        assert browser.post("/api/v1/control-lease", headers=headers).json()["code"] == "NOT_FOUND"
+        assert browser.post("/api/v1/control-lease", headers=headers, json={}).json()["code"] == "VALIDATION_FAILED"
 
 
 @pytest.mark.parametrize(("query", "expected"), [

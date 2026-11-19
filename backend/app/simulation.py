@@ -102,6 +102,8 @@ class Observation:
     command: bool
     controller: bool
     inference: bool
+    controller_sample_at: float | None = None
+    gesture_sample_at: float | None = None
 
 
 class PreviewAdapter(Protocol):
@@ -146,7 +148,8 @@ class StaticScene:
                     sample.jpeg)
             for epoch, sample in zip(self._epochs, self._samples, strict=True)
         )
-        return Observation(robot, webcam, command=True, controller=True, inference=True)
+        return Observation(robot, webcam, command=True, controller=True, inference=True,
+                           controller_sample_at=now, gesture_sample_at=now)
 
 
 @dataclass(frozen=True)
@@ -183,6 +186,7 @@ def load_simulation(selection: str | None) -> Simulation | None:
 def capture_identity_valid(capture: Capture) -> bool:
     return (
         ID.fullmatch(capture.stream_epoch) is not None and ID.fullmatch(capture.clock_epoch) is not None
-        and 1 <= capture.sequence <= SAFE_INTEGER and 0 <= capture.source_us <= SAFE_INTEGER
-        and 0 <= capture.age_ms <= SAFE_INTEGER
+        and type(capture.sequence) is int and 1 <= capture.sequence <= SAFE_INTEGER
+        and type(capture.source_us) is int and 0 <= capture.source_us <= SAFE_INTEGER
+        and type(capture.age_ms) is int and 0 <= capture.age_ms <= SAFE_INTEGER
     )

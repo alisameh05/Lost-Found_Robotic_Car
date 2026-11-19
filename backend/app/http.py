@@ -24,6 +24,7 @@ QUERY_LIMIT = 8_192
 APP_HEADERS = ("content-type", "x-app-capability", "x-app-client-id", "x-action-created-at-ms")
 RECORDS_ROUTES = {
     "/websocket-tickets": ("POST",),
+    "/control-lease": ("POST",), "/control-lease/release": ("POST",),
     "/bootstrap": ("GET",), "/health": ("GET",), "/snapshot": ("GET",),
     "/objects": ("GET", "POST"), "/objects/{id}": ("GET",),
     "/objects/{id}/sessions": ("GET",), "/sessions/{id}": ("GET",), "/sessions/{id}/matches": ("GET",),
@@ -38,6 +39,7 @@ LIST_QUERIES = {
 }
 RETENTION_ROUTES = frozenset({"/settings/retention-preview", "/settings/retention"})
 CLIENT_ROUTES = frozenset(LIST_QUERIES) | {"/snapshot"} | RETENTION_ROUTES
+LEASE_ROUTES = frozenset({"/control-lease", "/control-lease/release"})
 DOMAIN_ID = r"[A-Za-z0-9_-]{1,128}"
 REQUEST_ID = r"[0-9a-f]{8}-[0-9a-f]{4}-4[0-9a-f]{3}-[89ab][0-9a-f]{3}-[0-9a-f]{12}"
 

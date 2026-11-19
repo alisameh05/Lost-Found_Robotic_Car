@@ -8,7 +8,7 @@ import { RuntimeProvider, useRuntimeView } from "./runtime-provider";
 
 function RecordsFrame({ children }: { children: ReactNode }) {
   const { connected, loading, health, failedRead, profile } = useRuntimeView();
-  const connectedLabel = profile ? "Backend simulation · Read-only" : "Records connected · Search unavailable";
+  const connectedLabel = profile ? "Backend simulation" : "Records connected · Search unavailable";
   const status = connected ? connectedLabel
     : health?.initialization === "Starting" || loading ? "Connecting to local records" : "Local records unavailable";
   return <AppShell fixtureEnabled={false} modeLabel={status}>

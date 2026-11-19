@@ -1,4 +1,4 @@
-import type { BootstrapResponse, Error as ApiError, EventEnvelope, HttpResponses, MutationResponse } from "@/generated/api-v1";
+import type { BootstrapResponse, Error as ApiError, EventEnvelope, HttpResponses, MutationResponse, WorkspaceHeartbeat } from "@/generated/api-v1";
 import { protectedHeaders, type ApplicationTransport, type Endpoint, type HttpRequest, type ProtectedMedia, type ProtectedRequest, type ReadResult, type SocketObserver, type SocketOffer } from "./transport";
 import { conforms, type Definition } from "./wire-contracts";
 
@@ -11,6 +11,14 @@ const responses = {
   "GET /sessions/{id}/matches": "MatchPage",
   "GET /settings": "Settings",
   "GET /snapshot": "Snapshot",
+} as const satisfies Partial<Record<Endpoint, Definition>>;
+
+const jsonWrites = {
+  "POST /websocket-tickets": "TicketResponse",
+  "POST /control-lease": "LeaseResponse",
+  "POST /control-lease/release": "LeaseResponse",
+  "POST /settings/retention-preview": "RetentionPreview",
+  "PUT /settings/retention": "MutationResponse",
 } as const satisfies Partial<Record<Endpoint, Definition>>;
 
 const unavailable = { kind: "unavailable" } as const;
@@ -53,7 +61,8 @@ export function createHttpTransport(base: string): ApplicationTransport {
         }
         return unavailable;
       }
-      if ((response.status === 200 || (definition === "Health" && response.status === 503)) && conforms(definition, data)) {
+      if ((response.status === 200 || (definition === "Health" && response.status === 503) ||
+          (path === "/control-lease/release" && response.status === 202)) && conforms(definition, data)) {
         return { kind: "ok", status: response.status, data: data as T };
       }
       if (!response.ok && conforms("Error", data)) {
@@ -77,14 +86,15 @@ export function createHttpTransport(base: string): ApplicationTransport {
         method: "POST", headers: protectedHeaders("POST /objects", registration), body: form,
       });
     }
-    if (route === "POST /websocket-tickets" || route === "POST /settings/retention-preview" || route === "PUT /settings/retention") {
-      const request = input as HttpRequest<typeof route>;
-      const headers = protectedHeaders(route, request);
+    if (Object.hasOwn(jsonWrites, route)) {
+      const write = route as keyof typeof jsonWrites;
+      const request = input as HttpRequest<typeof write>;
+      const headers = protectedHeaders(write, request);
       headers.set("Content-Type", "application/json");
-      return readJson(route.slice(route.indexOf(" ") + 1),
-        route === "PUT /settings/retention" ? "MutationResponse" : route === "POST /websocket-tickets" ? "TicketResponse" : "RetentionPreview", input.signal, {
-          method: route === "PUT /settings/retention" ? "PUT" : "POST", body: JSON.stringify(request.body), headers,
-        });
+      const [method, path] = write.split(" ", 2);
+      return readJson(path, jsonWrites[write], input.signal, {
+        method, body: JSON.stringify(request.body), headers, keepalive: write === "POST /control-lease/release",
+      });
     }
     if (!Object.hasOwn(responses, route)) return deferred;
     const definition = responses[route as keyof typeof responses];
@@ -137,7 +147,15 @@ export function createHttpTransport(base: string): ApplicationTransport {
     return { kind: "ok", status: 200, data: {
       protocol: "laf.v1",
       close,
-      heartbeat: () => false,
+      heartbeat(body: WorkspaceHeartbeat) {
+        const limit = input.context.qualification_profile?.max_client_message_bytes;
+        if (disposed || offer.path !== "/events" || socket.readyState !== WebSocket.OPEN ||
+            socket.protocol !== "laf.v1" || !limit || !conforms("WorkspaceHeartbeat", body)) return false;
+        const message = JSON.stringify(body);
+        if (new TextEncoder().encode(message).length + socket.bufferedAmount > limit) return false;
+        socket.send(message);
+        return true;
+      },
     } } as const;
   }
 

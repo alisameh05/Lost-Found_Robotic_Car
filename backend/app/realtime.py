@@ -1,4 +1,4 @@
-"""Boot-scoped observational transport. All authority changes run on the service event loop."""
+"""Boot-scoped realtime transport and workspace authority on the service event loop."""
 
 import asyncio
 import json
@@ -8,7 +8,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable
 from dataclasses import dataclass, field
 from hashlib import sha256
-from secrets import token_urlsafe
+from secrets import compare_digest, token_urlsafe
 from typing import Literal, cast
 
 from fastapi import Request, WebSocket
@@ -16,6 +16,22 @@ from PIL import Image
 from starlette.websockets import WebSocketDisconnect
 
 from .config import Config
+from .control import (
+    HEARTBEAT_FIELDS,
+    MAX_ISSUED_FRAMES,
+    MAX_RUNTIME_RECEIPTS,
+    TOKEN,
+    WORKSPACE_FLAGS,
+    Lease,
+    LeaseReceipt,
+    LeaseRequest,
+    ReleaseCapacityReached,
+    Revocation,
+    counter,
+    domain_id,
+    public_lease,
+    token,
+)
 from .http import DOMAIN_ID, HEADER_LIMIT, HttpError, authorize_address, header, json_fields, read_json
 from .registration_input import SAFE_INTEGER, canonical_json
 from .simulation import (
@@ -33,7 +49,6 @@ Channel = Literal["events", "robot-video", "webcam-video"]
 CHANNELS: dict[str, Channel] = {"/events": "events", "/video/robot": "robot-video", "/video/webcam": "webcam-video"}
 PROTOCOL = "laf.v1"
 TICKET_PREFIX = "laf.ticket."
-TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 TICKET_SECONDS = 10
 MAX_OUTSTANDING = 32
 # Keep recent consumed entries distinguishable from unknown tickets without an unbounded replay cache.
@@ -78,6 +93,12 @@ class Frame:
         return metadata
 
 
+@dataclass(frozen=True)
+class IssuedFrame:
+    stream_epoch: str
+    display_deadline: float
+
+
 @dataclass
 class Connection:
     client: str
@@ -87,6 +108,8 @@ class Connection:
     events: deque[bytes] = field(default_factory=deque)
     event_bytes: int = 0
     waiting: Frame | None = None
+    issued: dict[str, IssuedFrame] = field(default_factory=dict)
+    video_generation: int = 0
 
     def end(self, code: int) -> None:
         if not self.close.done():
@@ -94,6 +117,7 @@ class Connection:
         self.events.clear()
         self.event_bytes = 0
         self.waiting = None
+        self.issued.clear()
 
     def queue(self, message: bytes, profile: QualificationProfile) -> int | None:
         size = len(message)
@@ -114,6 +138,7 @@ class Realtime:
         monotonic: Callable[[], float], utc: Callable[[], int], touch_client: Callable[[str], bool],
         project: Callable[[], Awaitable[Projection | None]],
         invalidate: Callable[[str, Channel], None], expire_clients: Callable[[], None],
+        on_control_revoked: Callable[[Revocation], None],
     ):
         self.simulation = simulation
         self.unavailable_code = unavailable_code
@@ -124,12 +149,17 @@ class Realtime:
         self.project = project
         self.invalidate = invalidate
         self.expire_clients = expire_clients
+        self.on_control_revoked = on_control_revoked
         self.sequence = 1
         self._tickets: dict[bytes, Ticket] = {}
         self._connections: dict[tuple[str, Channel], Connection] = {}
         self._frames: dict[Source, Frame] = {}
         self._live_sources: set[Source] = set()
         self._readiness: dict[str, bool] = {}
+        self._input_deadlines: dict[str, float] = {}
+        self._generation = 1
+        self._lease: Lease | None = None
+        self._receipts: dict[str, LeaseReceipt] = {}
         self._projection: Projection | None = None
         self._projection_lock = asyncio.Lock()
         self._removal_revision = 0
@@ -145,8 +175,105 @@ class Realtime:
             raise HttpError(503, code, "A compatible backend simulation profile is unavailable.")
         return self.profile
 
-    def client_has_events(self, client: str) -> bool:
-        return (client, "events") in self._connections
+    def client_is_live(self, client: str) -> bool:
+        return (client, "events") in self._connections or bool(self._lease and self._lease.client == client)
+
+    def _advance_generation(self) -> None:
+        if self._generation < SAFE_INTEGER:
+            self._generation += 1
+
+    def _revoke(self, reason: str, request_id: str | None = None) -> None:
+        lease, self._lease = self._lease, None
+        if lease is None:
+            return
+        self._advance_generation()
+        self.on_control_revoked(Revocation(lease.client, lease.session, self._generation, reason, request_id))
+        self._publish_snapshot()
+
+    def _expire_lease(self, now: float) -> None:
+        lease = self._lease
+        if lease is not None:
+            if now >= lease.heartbeat_deadline:
+                self._revoke("HeartbeatExpired")
+            elif now >= lease.display_deadline:
+                self._revoke("DisplayStale")
+
+    async def maintain_control(self) -> None:
+        profile = self.requires_profile()
+        interval = min(50, profile.bound("heartbeat_deadline_ms"), profile.bound("display_deadline_ms")) / 2000
+        while not self._closed:
+            self._expire_lease(self.monotonic())
+            await asyncio.sleep(interval)
+
+    def _can_acquire(self, client: str | None) -> bool:
+        return bool(client and self.profile and not self._closed and self._generation < SAFE_INTEGER - 1
+                    and (client, "events") in self._connections)
+
+    async def change_lease(self, request: LeaseRequest) -> Projection:
+        if not self.touch_client(request.client):
+            raise HttpError(403, "CLIENT_INVALID", "Reconnect to obtain a current page identity.")
+        profile = self.requires_profile()
+        fingerprint = request.fingerprint()
+        # Release revokes before waiting for storage. Acquire refreshes current session/record facts first.
+        if request.secret is None and request.request_id not in self._receipts:
+            if await self.snapshot(request.client) is None:
+                raise HttpError(503, "NOT_READY", "The current snapshot is unavailable. Retry shortly.", True)
+            if not self.touch_client(request.client):
+                raise HttpError(403, "CLIENT_INVALID", "Reconnect to obtain a current page identity.")
+        self._expire_lease(self.monotonic())
+        receipt = self._receipts.get(request.request_id)
+        if receipt is not None:
+            if receipt.fingerprint != fingerprint:
+                raise HttpError(409, "REQUEST_ID_CONFLICT", "This runtime request ID was already used.")
+        else:
+            receipt = self._change_lease(request, fingerprint, profile)
+            self._receipts[request.request_id] = receipt
+        snapshot = await self.snapshot(request.client)
+        if snapshot is None:
+            raise HttpError(503, "NOT_READY", "The current snapshot is unavailable. Retry shortly.", True)
+        return receipt.outcome(request.request_id, snapshot)
+
+    def _change_lease(self, request: LeaseRequest, fingerprint: bytes,
+                      profile: QualificationProfile) -> LeaseReceipt:
+        lease = self._lease
+        full = len(self._receipts) >= MAX_RUNTIME_RECEIPTS
+        current_session = self._projection.get("session_id") if self._projection else None
+        capacity = "Control request capacity reached. Restart the disarmed service before acquiring again."
+        if request.secret is not None:
+            if lease is None or request.generation != self._generation:
+                raise HttpError(403, "LEASE_EXPIRED", "The control lease is no longer current.")
+            if lease.client != request.client or not compare_digest(lease.secret, request.secret):
+                raise HttpError(403, "LEASE_REQUIRED", "Release requires the current private control lease.")
+            if request.session != current_session or request.session != lease.session:
+                raise HttpError(409, "OWNERSHIP_MISMATCH", "The active search changed.")
+            self._revoke("Released", request.request_id)
+            if full:
+                raise ReleaseCapacityReached(503, "CAPACITY_REACHED", capacity)
+            return LeaseReceipt(fingerprint, self._generation, None, None,
+                                self._can_acquire(request.client) and len(self._receipts) + 1 < MAX_RUNTIME_RECEIPTS)
+
+        if lease is not None:
+            raise HttpError(403, "LEASE_OWNED", "Control is already held.")
+        # Leave a generation available to invalidate the authorization on revocation.
+        if self._generation >= SAFE_INTEGER - 1:
+            raise HttpError(503, "COUNTER_EXHAUSTED", "Restart the disarmed service before acquiring again.")
+        if not self._projection or not self._can_acquire(request.client):
+            raise HttpError(503, "NOT_READY", "Open a current event connection before acquiring control.", True)
+        if request.session != current_session:
+            raise HttpError(409, "OWNERSHIP_MISMATCH", "The active search changed.")
+        if not request.takeover and (self._generation > 1 or current_session is not None):
+            raise HttpError(409, "INVALID_TRANSITION", "Confirm takeover to acquire available control.")
+        if full:
+            raise HttpError(503, "CAPACITY_REACHED", capacity)
+        now = self.monotonic()
+        secret = token_urlsafe(32)
+        self._advance_generation()
+        self._lease = Lease(request.client, request.session, secret,
+                            now + profile.bound("heartbeat_deadline_ms") / 1000,
+                            now + profile.bound("display_deadline_ms") / 1000)
+        receipt = LeaseReceipt(fingerprint, self._generation, request.client, secret)
+        self._publish_snapshot()
+        return receipt
 
     def expire_client(self, client: str) -> None:
         for channel in CHANNELS.values():
@@ -207,21 +334,30 @@ class Realtime:
             return self.unavailable_code if name == "QualificationProfile" else "NOT_READY"
         if name == "QualificationProfile":
             return None
+        if name in ("Webcam", "Controller") and self.monotonic() >= self._input_deadlines.get(name, 0):
+            return "NOT_READY"
         return None if self._readiness.get(name, False) else "NOT_READY"
 
     def remove(self, connection: Connection, code: int) -> None:
         key = (connection.client, connection.channel)
+        connection.end(code)
         if self._connections.get(key) is connection:
-            self.invalidate(*key)
             if connection.channel == "events":
                 self.touch_client(connection.client)
             del self._connections[key]
-        connection.end(code)
+            self._invalidate_channel(*key)
+
+    def _invalidate_channel(self, client: str, channel: Channel) -> None:
+        if self._lease and self._lease.client == client and channel in ("events", "robot-video"):
+            self._revoke("EventConnectionLost" if channel == "events" else "RobotVideoLost")
+        self.invalidate(client, channel)
 
     def _envelope(self, kind: EventKind, payload: object) -> bytes:
+        session = self._projection.get("active_session") if self._projection and kind == "snapshot" else None
         return canonical_json({
             "protocol_version": 1, "backend_boot_id": self.boot, "event_seq": self.sequence,
-            "session_id": None, "session_revision": None, "type": kind,
+            "session_id": session["id"] if isinstance(session, dict) else None,
+            "session_revision": session["revision"] if isinstance(session, dict) else None, "type": kind,
             "occurred_at_ms": self.utc(), "payload": payload,
         }).encode("utf-8")
 
@@ -237,12 +373,27 @@ class Realtime:
             self.sequence += 1
         if self._projection is not None:
             self._projection["event_seq"] = self.sequence
-        message = self._envelope(kind, payload)
+        message = self._envelope(kind, payload) if kind not in ("snapshot", "readiness_changed") else None
+        closing = []
         for connection in tuple(self._connections.values()):
             if connection.channel == "events":
-                code = connection.queue(message, profile)
+                data = message or self._client_message(kind, connection.client)
+                code = connection.queue(data, profile)
                 if code is not None:
-                    self.remove(connection, code)
+                    closing.append((connection, code))
+        # Queue the current sequence everywhere before a slow owner is revoked and publishes the next one.
+        for connection, code in closing:
+            self.remove(connection, code)
+
+    def _client_message(self, kind: EventKind, client: str) -> bytes:
+        assert self._projection is not None
+        state = self._public_snapshot(self._projection, client)
+        payload = {key: state[key] for key in ("readiness", "runtime")} if kind == "readiness_changed" else state
+        return self._envelope(kind, payload)
+
+    def _publish_snapshot(self) -> None:
+        if self._projection is not None:
+            self._publish("snapshot", None)
 
     async def _refresh_projection(self) -> Projection | None:
         # The caller holds _projection_lock for the read, commit and initial subscription.
@@ -265,29 +416,62 @@ class Realtime:
         self._projection = next_state
         if before is None:
             return next_state
-        if before["readiness"] != next_state["readiness"] or before["runtime"] != next_state["runtime"]:
-            self._publish("readiness_changed", {key: next_state[key] for key in ("readiness", "runtime")})
+        invalid = ("ActiveSessionChanged" if self._lease and self._lease.session != next_state["session_id"] else
+                   "StorageUnavailable" if next_state["storage_problem"] and not before["storage_problem"] else None)
+        if self._lease and invalid:
+            self._revoke(invalid)
+        elif before["active_session"] != next_state["active_session"] or before["active_object"] != next_state["active_object"]:
+            self._publish_snapshot()
+        elif any(before[key] != next_state[key] for key in ("readiness", "runtime", "eligible_target")):
+            self._publish("readiness_changed", None)
         if before["retention"] != next_state["retention"]:
             self._publish("retention_changed", {"retention": next_state["retention"], "operation": None})
         if next_state["storage_problem"] and next_state["storage_problem"] != before["storage_problem"]:
             self._publish("storage_fault", {
                 "code": "STORAGE_UNAVAILABLE", "message": "Managed storage is unavailable.", "operation": None,
                 "blocked_capabilities": ["Register", "Start", "Resume", "Review", "RetentionChange"],
-                "deletion": retention["deletion"], "runtime": next_state["runtime"],
+                "deletion": retention["deletion"], "runtime": self._runtime(next_state),
             })
         if before["operations"] != next_state["operations"]:
             if not self._closed:
-                self._publish("snapshot", self._public_snapshot(next_state), ordered=False)
+                self._publish("snapshot", None, ordered=False)
         return next_state
 
-    @staticmethod
-    def _public_snapshot(projection: Projection) -> Projection:
-        return {key: value for key, value in projection.items() if key != "storage_problem"}
+    def _runtime(self, state: Projection) -> Projection:
+        return {**cast(Projection, state["runtime"]), "control_generation": self._generation}
 
-    async def snapshot(self) -> Projection | None:
+    def _public_snapshot(self, projection: Projection, client: str | None) -> Projection:
+        state = {key: value for key, value in projection.items()
+                 if key not in ("storage_problem", "eligible_target", "session_id")}
+        lease = self._lease
+        owns = lease is not None and lease.client == client
+        readiness = cast(Projection, state["readiness"])
+        live = {"Workspace": bool(owns and lease and lease.workspace),
+                "DisplayedRobotVideo": bool(owns and lease and lease.displayed),
+                **{name: self.component_cause(name) is None for name in ("Webcam", "Controller")}}
+        components = [
+            {"component": name, "status": "Ready" if live[name] else "Unavailable",
+             "cause_codes": [] if live[name] else ["NOT_READY"]}
+            if (name := str(component["component"])) in live else component
+            for component in cast(list[Projection], readiness["components"])
+        ]
+        statuses = {component["component"]: component["status"] == "Ready" for component in components}
+        shared = (owns and projection["session_id"] is None and bool(projection["eligible_target"])
+                  and all(ready for name, ready in statuses.items() if name not in ("Webcam", "Controller")))
+        state["readiness"] = {**readiness, "components": components,
+                              "can_start": {"Gestures": shared and statuses["Webcam"],
+                                            "Controller": shared and statuses["Controller"]}}
+        state["runtime"] = self._runtime(state)
+        state["lease"] = public_lease(lease.client if lease else None, self._generation,
+                                      self._can_acquire(client) and len(self._receipts) < MAX_RUNTIME_RECEIPTS)
+        return state
+
+    async def snapshot(self, client: str | None = None) -> Projection | None:
         async with self._projection_lock:
+            self._expire_lease(self.monotonic())
             state = await self._refresh_projection()
-            return self._public_snapshot(state) if state is not None else None
+            self._expire_lease(self.monotonic())
+            return self._public_snapshot(state, client) if state is not None else None
 
     async def maintain_projection(self) -> None:
         while not self._closed:
@@ -331,15 +515,23 @@ class Realtime:
             observation = simulation.adapter.observe(now)
             for source, capture in zip(SOURCES, (observation.robot, observation.webcam), strict=True):
                 self._observe_source(source, capture, now, simulation.profile)
+            deadline = simulation.profile.bound("input_sample_deadline_ms") / 1000
+            controller_time, gesture_time = observation.controller_sample_at, observation.gesture_sample_at
+            self._input_deadlines = {name: at + deadline for name, at in
+                                     (("Controller", controller_time), ("Webcam", gesture_time))
+                                     if at is not None and at <= now}
             self._set_readiness({
-                "Command": observation.command, "Controller": observation.controller, "AI": observation.inference,
-                "RobotVideo": "robot" in self._live_sources, "Webcam": "webcam" in self._live_sources,
+                "Command": observation.command, "AI": observation.inference,
+                "Controller": observation.controller and now < self._input_deadlines.get("Controller", now),
+                "RobotVideo": "robot" in self._live_sources,
+                "Webcam": "webcam" in self._live_sources and now < self._input_deadlines.get("Webcam", now),
             })
             await asyncio.sleep(CAPTURE_INTERVAL)
 
     def _set_readiness(self, observations: dict[str, bool]) -> None:
         if observations == self._readiness:
             return
+        shared_loss = any(self._readiness.get(name) and not observations[name] for name in ("Command", "AI"))
         self._readiness = observations
         if self._projection is not None:
             current = cast(Projection, self._projection["readiness"])
@@ -352,7 +544,10 @@ class Realtime:
             ]}
             if updated != current:
                 self._projection["readiness"] = updated
-                self._publish("readiness_changed", {"readiness": updated, "runtime": self._projection["runtime"]})
+                if shared_loss and self._lease:
+                    self._revoke("RequiredPathUnavailable")
+                else:
+                    self._publish("readiness_changed", None)
 
     def _observe_source(self, source: Source, capture: Capture | None, now: float,
                         profile: QualificationProfile) -> None:
@@ -370,14 +565,17 @@ class Realtime:
                 else:
                     connection.waiting = frame
                     connection.ready.set()
-        elif capture is None or old is None or now < old.capture.observed_at or old.age(now) >= profile.bound("capture_age_limit_ms"):
+        elif (old is None or capture != old.capture or now < old.capture.observed_at
+              or old.age(now) >= profile.bound("capture_age_limit_ms")):
             was_live = source in self._live_sources
             self._live_sources.discard(source)
             for connection in tuple(self._connections.values()):
                 if connection.channel == channel:
                     connection.waiting = None
+                    connection.issued.clear()
                     if was_live:
-                        self.invalidate(connection.client, channel)
+                        connection.video_generation += 1
+                        self._invalidate_channel(connection.client, channel)
 
     def object_removed(self, owner: str) -> None:
         if self._closed or not self.profile:
@@ -397,6 +595,7 @@ class Realtime:
 
     def stop(self, code: int = 1000) -> None:
         self._closed = True
+        self._revoke("ServiceStopped")
         for connection in tuple(self._connections.values()):
             self.remove(connection, code)
         self._tickets.clear()
@@ -420,18 +619,25 @@ class Realtime:
                         response.headers["Cache-Control"] = "no-store"
                         await socket.send_denial_response(response)
                         return
+                    await socket.accept(subprotocol=PROTOCOL)
+                    if self._closed or not self.touch_client(client):
+                        await socket.close(code=1008)
+                        return
                     # Snapshot serialization and registration have no scheduling point between them.
                     self._replace(connection)
-                    code = connection.queue(self._envelope("snapshot", self._public_snapshot(state)), profile)
+                    code = connection.queue(self._client_message("snapshot", client), profile)
                     if code is not None:
                         self.remove(connection, code)
             else:
+                await socket.accept(subprotocol=PROTOCOL)
+                if self._closed or not self.touch_client(client):
+                    await socket.close(code=1008)
+                    return
                 self._replace(connection)
                 source: Source = "robot" if channel == "robot-video" else "webcam"
                 if source in self._live_sources:
                     connection.waiting = self._frames[source]
                     connection.ready.set()
-            await socket.accept(subprotocol=PROTOCOL)
             await self._deliver(socket, connection, profile)
         except (WebSocketDisconnect, OSError):
             pass
@@ -447,7 +653,7 @@ class Realtime:
 
     async def _deliver(self, socket: WebSocket, connection: Connection, profile: QualificationProfile) -> None:
         sender = asyncio.create_task(self._send(socket, connection, profile))
-        receiver = asyncio.create_task(self._receive(socket, connection.channel, profile))
+        receiver = asyncio.create_task(self._receive(socket, connection, profile))
         code: int | None = 1011
         try:
             done, _ = await asyncio.wait((sender, receiver, connection.close), return_when=asyncio.FIRST_COMPLETED)
@@ -486,30 +692,89 @@ class Realtime:
                 source: Source = "robot" if connection.channel == "robot-video" else "webcam"
                 metadata = frame.header(source, self.monotonic(), self.utc(), profile)
                 if metadata is not None:
+                    generation = connection.video_generation
                     await socket.send_bytes(len(metadata).to_bytes(4, "big") + metadata + frame.capture.jpeg)
+                    if source == "robot" and not connection.close.done() and generation == connection.video_generation:
+                        self._track_frame(connection, frame, profile)
                 continue
             connection.ready.clear()
 
-    @staticmethod
-    async def _receive(socket: WebSocket, channel: Channel, profile: QualificationProfile) -> int | None:
-        message = await socket.receive()
-        if message["type"] == "websocket.disconnect":
-            return None
-        value = message.get("text") if channel == "events" else message.get("bytes")
-        if value is None:
-            return 1003
-        size = len(value.encode("utf-8")) if isinstance(value, str) else len(value)
-        if size > profile.bound("max_client_message_bytes"):
-            return 1009
-        if isinstance(value, str):
+    def _track_frame(self, connection: Connection, frame: Frame, profile: QualificationProfile) -> None:
+        now = self.monotonic()
+        limit = min(profile.bound("capture_age_limit_ms"), profile.bound("display_deadline_ms"))
+        for ident, old in tuple(connection.issued.items()):
+            if now >= old.display_deadline:
+                del connection.issued[ident]
+        if frame.age(now) < limit and "robot" in self._live_sources:
+            if len(connection.issued) >= MAX_ISSUED_FRAMES:
+                del connection.issued[next(iter(connection.issued))]
+            capture = frame.capture
+            deadline = capture.observed_at + (limit - capture.age_ms) / 1000
+            connection.issued[frame.id] = IssuedFrame(capture.stream_epoch, deadline)
+
+    def _heartbeat(self, connection: Connection, data: object, profile: QualificationProfile) -> bool:
+        now = self.monotonic()
+        self._expire_lease(now)
+        lease = self._lease
+        if not lease or (self._connections.get((connection.client, "events")) is not connection
+                         or connection.client != lease.client):
+            return False
+        if (not isinstance(data, dict) or data.keys() != HEARTBEAT_FIELDS
+                or data["type"] != "workspace_heartbeat" or type(data["protocol_version"]) is not int
+                or data["protocol_version"] != 1 or data["backend_boot_id"] != self.boot
+                or data["client_id"] != lease.client or not token(data["client_lease_id"])
+                or not compare_digest(data["client_lease_id"], lease.secret) or data["session_id"] != lease.session
+                or not counter(data["control_generation"]) or data["control_generation"] != self._generation
+                or not counter(data["heartbeat_seq"])
+                or (data["heartbeat_seq"] <= lease.heartbeat_seq if lease.heartbeat_seq else data["heartbeat_seq"] != 1)
+                or any(type(data[flag]) is not bool for flag in WORKSPACE_FLAGS)):
+            return False
+        indication = data["displayed_robot_frame"]
+        if indication is not None:
+            video = self._connections.get((connection.client, "robot-video"))
+            if (not isinstance(indication, dict) or indication.keys() != {"frame_id", "stream_epoch"}
+                    or not all(domain_id(value) for value in indication.values()) or video is None
+                    or "robot" not in self._live_sources):
+                return False
+            frame = video.issued.get(indication["frame_id"])
+            if frame is None or indication["stream_epoch"] != frame.stream_epoch or now >= frame.display_deadline:
+                return False
+            # The deadline is anchored to acquisition, so receiving the same identity never extends it.
+            lease.display_deadline = frame.display_deadline
+        if not all(data[flag] for flag in WORKSPACE_FLAGS):
+            self._revoke("WorkspaceUnavailable")
+            return True
+        changed = not lease.workspace or lease.displayed != (indication is not None)
+        lease.heartbeat_seq = data["heartbeat_seq"]
+        lease.heartbeat_deadline = now + profile.bound("heartbeat_deadline_ms") / 1000
+        lease.workspace = True
+        lease.displayed = indication is not None
+        if changed and self._projection is not None:
+            self._publish("readiness_changed", None)
+        return True
+
+    async def _receive(self, socket: WebSocket, connection: Connection, profile: QualificationProfile) -> int | None:
+        while not connection.close.done():
+            message = await socket.receive()
+            if message["type"] == "websocket.disconnect":
+                return None
+            value = message.get("text") if connection.channel == "events" else message.get("bytes")
+            if value is None:
+                return 1003
+            size = len(value.encode("utf-8")) if isinstance(value, str) else len(value)
+            if size > profile.bound("max_client_message_bytes"):
+                return 1009
+            if not isinstance(value, str):
+                return 1008
             try:
-                json.loads(value, object_pairs_hook=json_fields, parse_constant=_reject_json_constant)
+                data = json.loads(value, object_pairs_hook=json_fields, parse_constant=_reject_json_constant)
             except (ValueError, RecursionError):
                 return 1007
             except HttpError:
                 return 1008
-        # There is no lease in the preview slice. Even a valid heartbeat is unauthorized.
-        return 1008
+            if not self._heartbeat(connection, data, profile):
+                return 1008
+        return None
 
 
 def _operation_owner(operation: Projection) -> object:

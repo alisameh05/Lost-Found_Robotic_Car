@@ -8,10 +8,12 @@ from fastapi.responses import JSONResponse, Response
 from PIL import Image
 
 from .config import Config
+from .control import ReleaseCapacityReached, Revocation, parse_lease
 from .http import (
     API_PREFIX,
     CLIENT_ROUTES,
     HEADER_LIMIT,
+    LEASE_ROUTES,
     LIST_QUERIES,
     RECORDS_ROUTES,
     RETENTION_ROUTES,
@@ -63,13 +65,18 @@ def validate_page_limit(query: dict[str, str]) -> None:
 
 
 def _ignore_invalidation(_: str, __: Channel) -> None:
-    # The preview has no owner. Subsequent authority gates can attach at this boundary.
+    pass
+
+
+def _ignore_revocation(_: Revocation) -> None:
+    # This slice has no session writer. The lifecycle coordinator receives the stopped generation here.
     pass
 
 
 def create_app(
     config: Config, *, held_owner: bool = False, storage: RecordsStorage | None = None,
     simulation: Simulation | None = None, on_channel_invalidated: Callable[[str, Channel], None] = _ignore_invalidation,
+    on_control_revoked: Callable[[Revocation], None] = _ignore_revocation,
 ) -> FastAPI:
     unavailable_code = "NOT_READY"
     if simulation is None:
@@ -87,10 +94,11 @@ def create_app(
         with owner:
             runtime = RecordsRuntime(storage or RecordsStorage(config.data_root))
             app.state.runtime = runtime
-            realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated)
+            realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked)
             startup = asyncio.create_task(runtime.initialize())
             tasks = (
                 asyncio.create_task(realtime.capture()), asyncio.create_task(realtime.maintain_projection()),
+                asyncio.create_task(realtime.maintain_control()),
             ) if simulation else ()
             try:
                 yield
@@ -139,11 +147,11 @@ def create_app(
                         raise HttpError(403, "CLIENT_INVALID", "Provide a page identity for the retention request.")
                 elif registering:
                     header(request, "x-app-client-id", 403, "CLIENT_INVALID")
-                elif path != "/bootstrap":
+                elif path != "/bootstrap" and path not in LEASE_ROUTES:
                     authorize_client(request, runtime, required=path in CLIENT_ROUTES)
                 allowed = LIST_QUERIES.get(path, ()) if not registering else ()
                 query = parse_query(request.scope["query_string"], allowed)
-                if not registering and path not in RETENTION_ROUTES and path != "/websocket-tickets":
+                if not registering and path not in RETENTION_ROUTES | LEASE_ROUTES | {"/websocket-tickets"}:
                     await require_empty_body(request)
                 if path == "/objects" and not registering:
                     validate_objects_query(query)
@@ -182,6 +190,17 @@ def create_app(
         runtime: RecordsRuntime = request.app.state.runtime
         assert runtime.realtime is not None
         return JSONResponse(await ticket_request(request, runtime.realtime))
+
+    @app.post(API_PREFIX + "/control-lease")
+    @app.post(API_PREFIX + "/control-lease/release")
+    async def control_lease(request: Request) -> JSONResponse:
+        runtime: RecordsRuntime = request.app.state.runtime
+        assert runtime.realtime is not None
+        parsed = await parse_lease(request, release=route_path(request) == "/control-lease/release")
+        try:
+            return JSONResponse(await runtime.realtime.change_lease(parsed))
+        except ReleaseCapacityReached as error:
+            return error.response(permission_revoked=True)
 
     @app.websocket(API_PREFIX + "/events")
     @app.websocket(API_PREFIX + "/video/robot")
@@ -255,7 +274,7 @@ def create_app(
         if request.scope["path"] == API_PREFIX + "/settings":
             return JSONResponse(storage.settings)
         if runtime.realtime and runtime.realtime.profile:
-            snapshot = await runtime.realtime.snapshot()
+            snapshot = await runtime.realtime.snapshot(request.headers["x-app-client-id"])
             if snapshot is None:
                 return HttpError(503, "NOT_READY", "The current snapshot is unavailable. Retry shortly.", True).response()
             return JSONResponse(snapshot)
