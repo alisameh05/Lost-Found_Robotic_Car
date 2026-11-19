@@ -5,7 +5,7 @@ import json
 import math
 import re
 from collections import deque
-from collections.abc import Awaitable, Callable
+from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from hashlib import sha256
 from secrets import compare_digest, token_urlsafe
@@ -16,6 +16,7 @@ from fastapi import Request, WebSocket
 from PIL import Image
 from starlette.websockets import WebSocketDisconnect
 
+from .candidate import CandidateCapture, evidence_box
 from .config import Config
 from .control import (
     HEARTBEAT_FIELDS,
@@ -38,6 +39,7 @@ from .motion import FixtureCommandSink, InputScope, Motion
 from .registration_input import SAFE_INTEGER, canonical_json
 from .simulation import (
     SOURCES,
+    CandidateObservation,
     Capture,
     InferenceSample,
     ProximityAdvisory,
@@ -60,7 +62,7 @@ MAX_KNOWN_TICKETS = 256
 CAPTURE_INTERVAL = 0.1
 PROJECTION_INTERVAL = 0.25
 Projection = dict[str, object]
-EventKind = Literal["snapshot", "session_changed", "recovery_changed", "readiness_changed",
+EventKind = Literal["snapshot", "session_changed", "candidate_pending", "recovery_changed", "readiness_changed",
                     "retention_changed", "storage_fault", "object_removed", "proximity_warning_changed"]
 PATH_FAILURES = {
     "Command": "CommandUnavailable", "AI": "AIUnavailable", "RobotVideo": "RobotVideoUnavailable",
@@ -90,6 +92,7 @@ class Ticket:
 class Frame:
     id: str
     capture: Capture
+    captured_at_ms: int
 
     def age(self, now: float) -> int:
         return self.capture.age_ms + math.ceil((now - self.capture.observed_at) * 1000)
@@ -192,6 +195,7 @@ class Realtime:
         self._active_owner: str | None = None
         self._active_mode: str | None = None
         self._active_state: str | None = None
+        self._active_since = 0.0
         self.active_revision: int | None = None
         self.emergency_requests: set[str] = set()
         self._failures: dict[str, Projection] = {}
@@ -204,6 +208,8 @@ class Realtime:
         self._storage_ready = False
         self._storage_until = 0.0
         self._inference_until = 0.0
+        self._candidate_work: str | None = None
+        self.on_candidate: Callable[[CandidateCapture], None] | None = None
         self._motion = None
         self._proximity = None
         self._fixture_sink = None
@@ -325,7 +331,9 @@ class Realtime:
         if not committed and not uncertain and self._pause_required_for == session:
             self._pause_required_for = None
 
-    def suspend_search(self, session: str) -> None:
+    def suspend_search(self, session: str, *, invalidate_candidate: bool = True) -> None:
+        if invalidate_candidate:
+            self._candidate_work = None
         if self._resuming_session == session:
             self._resume_viable = False
         had_permission = self._motion and self._motion.permission != "Disarmed"
@@ -348,6 +356,8 @@ class Realtime:
 
     def search_committed(self, session: Projection) -> None:
         if session["state"] != "Ended":
+            if self._active_session != session["id"]:
+                self._active_since = self.monotonic()
             self._active_session = str(session["id"])
             self._active_owner = str(session["object_id"])
             self._active_mode = str(session["control_mode"])
@@ -358,6 +368,7 @@ class Realtime:
 
     def search_ended(self, session: str) -> None:
         if self._active_session == session:
+            self._candidate_work = None
             self._active_session = self._active_owner = None
             self._active_mode = self._active_state = None
             self.active_revision = None
@@ -369,6 +380,7 @@ class Realtime:
             self._revoke("SessionEnded")
 
     def _revoke(self, reason: str, request_id: str | None = None) -> None:
+        self._candidate_work = None
         self._resume_viable = False
         if self._motion:
             self._motion.stop(reason)
@@ -638,7 +650,8 @@ class Realtime:
 
     def _envelope(self, kind: EventKind, payload: object) -> bytes:
         session = (payload.get("session") if kind == "session_changed" and isinstance(payload, dict)
-                   else self._projection.get("active_session") if self._projection and kind in ("snapshot", "recovery_changed") else None)
+                   else self._projection.get("active_session")
+                   if self._projection and kind in ("snapshot", "candidate_pending", "recovery_changed") else None)
         return canonical_json({
             "protocol_version": 1, "backend_boot_id": self.boot, "event_seq": self.sequence,
             "session_id": session["id"] if isinstance(session, dict) else None,
@@ -725,7 +738,7 @@ class Realtime:
                    "StorageUnavailable" if next_state["storage_problem"] and not before["storage_problem"] else None)
         if self._lease and invalid:
             self._revoke(invalid)
-        elif before["active_session"] != next_state["active_session"] or before["active_object"] != next_state["active_object"]:
+        elif any(before[key] != next_state[key] for key in ("active_session", "active_object", "pending_candidate")):
             self._publish_snapshot()
         elif any(before[key] != next_state[key] for key in ("readiness", "runtime", "eligible_target")):
             self._publish("readiness_changed", None)
@@ -859,7 +872,7 @@ class Realtime:
 
     def publish_search_commit(
         self, session: Projection, operation: Projection | None, target: Projection | None, pending: bool,
-        *, recovery_changed: bool = False,
+        *, recovery_changed: bool = False, candidate: Projection | None = None,
     ) -> None:
         self.search_committed(session)
         state = self._projection
@@ -876,6 +889,10 @@ class Realtime:
         state.update(active_session=None if ended else session, active_object=None if ended else target,
                      session_id=None if ended else session["id"],
                      failures=self.failures_for(None if ended else str(session["id"])))
+        if ended:
+            state["pending_candidate"] = None
+        elif candidate is not None:
+            state["pending_candidate"] = candidate
         runtime = cast(Projection, state["runtime"])
         runtime.update(effective_session_state=None if ended else session["state"], persistence_pending=pending)
         retention = cast(Projection, state["retention"])
@@ -886,6 +903,8 @@ class Realtime:
         # The full projection introduces a new owner or lease generation before the typed completion.
         self._publish_snapshot()
         self._publish("session_changed", {"session": session, "operation": operation, "runtime": self._runtime(state)})
+        if candidate is not None:
+            self._publish("candidate_pending", {"match": candidate, "control_generation": self._generation})
         if recovery_changed:
             self._publish_failures()
         if session["state"] == "Paused":
@@ -959,8 +978,10 @@ class Realtime:
                 or len(capture.jpeg) + 4 >= profile.bound("max_frame_bytes")
                 or capture.age_ms + (now - capture.observed_at) * 1000 >= profile.bound("capture_age_limit_ms")):
             return None
-        frame = Frame(token_urlsafe(18), capture)
-        if frame.header(source, now, self.utc(), profile) is None:
+        utc = self.utc()
+        age = capture.age_ms + math.ceil((now - capture.observed_at) * 1000)
+        frame = Frame(token_urlsafe(18), capture, max(0, utc - age))
+        if frame.header(source, now, utc, profile) is None:
             return None
         if previous:
             old = previous.capture
@@ -1095,9 +1116,52 @@ class Realtime:
                     available = await asyncio.to_thread(simulation.inference, sample)
                 except (OSError, ValueError):
                     available = False
-                if scope == self._motion_scope() and started + limit > self.monotonic():
+                now = self.monotonic()
+                if scope == self._motion_scope() and started + limit > now:
                     self._inference_until = started + limit if available else 0
+                    if scope and isinstance(available, CandidateObservation):
+                        self._accept_candidate(scope, frame, available, now)
             await asyncio.sleep(CAPTURE_INTERVAL)
+
+    def _accept_candidate(self, scope: InputScope, frame: Frame, result: CandidateObservation, now: float) -> None:
+        profile, latest = self.profile, self._frames.get("robot")
+        revision, owner = self.active_revision, self._active_owner
+        publish = self.on_candidate
+        self._expire_lease(now)
+        lease = self._lease
+        if (not profile or not latest or not publish or not lease or not owner or revision is None
+                or scope != self._motion_scope() or not self._active_mode
+                or not self._required_paths_ready(lease, self._active_mode) or self._candidate_work is not None
+                or (result.scope, result.frame_id, result.stream_epoch, result.clock_epoch, result.capture_sequence)
+                != (scope, frame.id, frame.capture.stream_epoch, frame.capture.clock_epoch, frame.capture.sequence)
+                or latest.capture.stream_epoch != frame.capture.stream_epoch
+                or latest.capture.clock_epoch != frame.capture.clock_epoch
+                or frame.age(now) >= profile.bound("capture_age_limit_ms")):
+            return
+        session = self._projection["active_session"] if self._projection else None
+        acquired = frame.capture.observed_at - frame.capture.age_ms / 1000
+        if not isinstance(session, dict) or acquired < max(self._active_since, lease.generation_started or 0.0):
+            return
+        box = evidence_box(result.box, frame.capture.width, frame.capture.height)
+        if box is None:
+            return
+        self.suspend_search(scope.session)
+        if self._lease is not lease:
+            return
+        work = CandidateCapture(uuid4().hex, scope.session, owner, revision, self._generation, frame.id,
+                                max(frame.captured_at_ms, session["started_at_ms"]), frame.capture, box)
+        self._candidate_work = work.id
+        publish(work)
+
+    def candidate_current(self, work: CandidateCapture) -> bool:
+        self._expire_lease(self.monotonic())
+        return (not self._closed and work.id == self._candidate_work and work.generation == self._generation
+                and work.session == self._active_session and work.revision == self.active_revision
+                and self._active_state == "Searching")
+
+    def candidate_finished(self, work: CandidateCapture) -> None:
+        if self._candidate_work == work.id:
+            self._candidate_work = None
 
     def observe_storage(self, available: bool, started: float) -> None:
         if not self.profile:
@@ -1177,7 +1241,7 @@ class Realtime:
                         connection.video_generation += 1
                         self._invalidate_channel(connection.client, channel)
 
-    def object_removed(self, owner: str) -> None:
+    def object_removed(self, owner: str, hidden_actions: Collection[str] = ()) -> None:
         if self._closed or not self.profile:
             return
         self._projection_revision += 1
@@ -1185,7 +1249,8 @@ class Realtime:
             if self._projection["session_id"] is not None and (
                 isinstance(active := self._projection["active_session"], dict) and active["object_id"] == owner
             ):
-                self._projection.update(active_object=None, active_session=None, session_id=None, failures=[])
+                self._projection.update(active_object=None, active_session=None, session_id=None, failures=[],
+                                        pending_candidate=None)
                 runtime = cast(Projection, self._projection["runtime"])
                 runtime["effective_session_state"] = None
                 retention = cast(Projection, self._projection["retention"])
@@ -1193,7 +1258,12 @@ class Realtime:
             operations = cast(list[Projection], self._projection["operations"])
             self._projection["operations"] = [
                 operation for operation in operations if _operation_owner(operation) != owner
+                and operation["action_id"] not in hidden_actions and operation["request_id"] not in hidden_actions
             ]
+            cast(Projection, self._projection["runtime"])["persistence_pending"] = any(
+                operation["persistence"] == "Pending"
+                for operation in cast(list[Projection], self._projection["operations"])
+            )
         # A queued snapshot may still contain eligible-when-projected record data.
         marker = canonical_json(owner).encode("utf-8")
         for connection in tuple(self._connections.values()):
@@ -1427,8 +1497,12 @@ class Realtime:
 
 def _operation_owner(operation: Projection) -> object:
     result = operation.get("result")
-    obj = result.get("object") if isinstance(result, dict) else None
-    return obj.get("id") if isinstance(obj, dict) else None
+    if isinstance(result, dict):
+        if isinstance(obj := result.get("object"), dict):
+            return obj.get("id")
+        if isinstance(session := result.get("session"), dict):
+            return session.get("object_id")
+    return None
 
 
 def _reject_json_constant(_: str) -> None:

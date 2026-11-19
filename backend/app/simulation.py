@@ -21,6 +21,7 @@ from .registration_input import SAFE_INTEGER
 
 FIXTURES = Path(__file__).with_name("preview_fixture")
 PROFILE_NAME = "fixture-v1"
+REVIEW_PROFILE_NAME = "fixture-review-v1"
 PROFILE_FIELDS = Path(__file__).resolve().parents[1] / "contracts" / "v1" / "schemas.json"
 Source = Literal["robot", "webcam"]
 SOURCES: tuple[Source, ...] = ("robot", "webcam")
@@ -247,17 +248,49 @@ class InferenceSample:
 
 
 @dataclass(frozen=True)
+class CandidateObservation:
+    scope: InputScope
+    frame_id: str
+    stream_epoch: str
+    clock_epoch: str
+    capture_sequence: int
+    box: tuple[float, float, float, float]
+
+
+Inference = Callable[[InferenceSample], bool | CandidateObservation]
+
+
+class FixtureInference:
+    def __init__(self) -> None:
+        self.session: str | None = None
+        self.started = 0.0
+
+    def __call__(self, sample: InferenceSample) -> bool | CandidateObservation:
+        scope, capture = sample.scope, sample.capture
+        if scope is None or capture is None or sample.frame_id is None:
+            return True
+        if scope.session != self.session:
+            self.session, self.started = scope.session, capture.observed_at
+        if capture.observed_at - self.started < 2.0:
+            return True
+        return CandidateObservation(
+            scope, sample.frame_id, capture.stream_epoch, capture.clock_epoch, capture.sequence,
+            (capture.width * 0.25, capture.height * 0.25, capture.width * 0.5, capture.height * 0.5),
+        )
+
+
+@dataclass(frozen=True)
 class Simulation:
     profile: QualificationProfile
     adapter: PreviewAdapter
     command_sink: CommandSink | None = None
-    inference: Callable[[InferenceSample], bool] | None = None
+    inference: Inference | None = None
 
 
 def load_simulation(selection: str | None) -> Simulation | None:
     if selection is None:
         return None
-    if selection != PROFILE_NAME:
+    if selection not in (PROFILE_NAME, REVIEW_PROFILE_NAME):
         raise IncompatibleProfile("The simulation profile is incompatible.")
     manifests = tuple((FIXTURES / name).read_text(encoding="utf-8").encode("utf-8") for name in ("evidence.json", "interfaces.json"))
     evidence, interfaces = manifests
@@ -276,7 +309,8 @@ def load_simulation(selection: str | None) -> Simulation | None:
         if hashes[source] != sha256(jpeg).hexdigest():
             raise ValueError("The sample does not match the fixture evidence.")
         samples.append(read_sample(jpeg, profile))
-    return Simulation(profile, StaticScene(*samples))
+    return Simulation(profile, StaticScene(*samples),
+                      inference=FixtureInference() if selection == REVIEW_PROFILE_NAME else None)
 
 
 def capture_identity_valid(capture: Capture) -> bool:

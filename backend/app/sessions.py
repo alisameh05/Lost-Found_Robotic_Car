@@ -7,6 +7,7 @@ from dataclasses import dataclass, replace
 from typing import TYPE_CHECKING
 from uuid import uuid4
 
+from .candidate import CandidateCapture, encode_evidence, save_candidate
 from .control import MAX_RUNTIME_RECEIPTS, Revocation
 from .http import HttpError
 from .operations import MAX_ORDINARY_PENDING, Operation, mutation
@@ -49,6 +50,9 @@ class SessionCoordinator:
         self._path_failures: dict[str, dict[str, object]] = {}
         self._failure_task: asyncio.Task[None] | None = None
         self._pending_resume: SearchRequest | None = None
+        self._pending_stop: str | None = None
+        self._candidate_task: asyncio.Task[None] | None = None
+        self.preparing_candidate: str | None = None
         self._safety_admissions = 0
         self._safety_admission_idle = asyncio.Event()
         self._safety_admission_idle.set()
@@ -102,6 +106,38 @@ class SessionCoordinator:
             self.emergency_fallback.cancel()
         if self._failure_task is not None:
             await self._failure_task
+        if self._candidate_task is not None:
+            await self._candidate_task
+
+    def admit_candidate(self, work: CandidateCapture) -> None:
+        assert self._candidate_task is None
+        self.preparing_candidate = work.id
+        self._candidate_task = asyncio.create_task(self.prepare_candidate(work))
+
+    async def prepare_candidate(self, work: CandidateCapture) -> None:
+        runtime, realtime = self.runtime, self.realtime
+        loop = asyncio.get_running_loop()
+
+        async def authorized() -> bool:
+            return not runtime._stopping and realtime.candidate_current(work)
+
+        def current() -> bool:
+            return asyncio.run_coroutine_threadsafe(authorized(), loop).result()
+
+        try:
+            data = await asyncio.to_thread(encode_evidence, work.capture)
+            async with runtime._save:
+                saved = await asyncio.to_thread(save_candidate, runtime.storage, work, data, current)
+                if saved and saved.session:
+                    realtime.publish_search_commit(saved.session, None, None, bool(runtime._pending), candidate=saved.match)
+        except (OSError, ValueError, sqlite3.Error, HttpError):
+            if await authorized():
+                realtime.observe_storage(False, realtime.monotonic())
+                realtime.record_failure("StorageFault", work.session)
+        finally:
+            realtime.candidate_finished(work)
+            self.preparing_candidate = None
+            self._candidate_task = None
 
     async def action(self, request: SearchRequest) -> Receipt:
         runtime = self.runtime
@@ -126,7 +162,7 @@ class SessionCoordinator:
                 if resume and resume.resource_id == session_id and resume.revision == request.revision:
                     superseded_resume = resume.action_id
                 else:
-                    self.realtime.suspend_search(session_id)
+                    self.realtime.suspend_search(session_id, invalidate_candidate=False)
         try:
             admitted = await self.admit_action(request, session_id, fingerprint, superseded_resume)
         finally:
@@ -189,6 +225,8 @@ class SessionCoordinator:
                 self._pending_resume = request
             if request.safety_action:
                 self._safety_occupied = True
+            if request.action == "stop":
+                self._pending_stop = session_id
             task = asyncio.create_task(self.finish_action(request, operation, session_id, generation, superseded_resume))
             runtime._pending[request.action_id] = (operation, task)
             runtime._terminal.pop(request.action_id, None)
@@ -203,6 +241,8 @@ class SessionCoordinator:
         loop = asyncio.get_running_loop()
 
         def authorize(final: bool) -> None:
+            if request.action == "confirm" and self._pending_stop == session:
+                raise HttpError(409, "INVALID_TRANSITION", "Stop superseded the match confirmation.")
             current = self.realtime.authorize_search(
                 request.client, request.secret, None if request.mode else session, request.mode,
             )
@@ -222,6 +262,7 @@ class SessionCoordinator:
         saved: SavedSearch | None = None
         uncertain = False
         cancelled = False
+        owner_unavailable = False
         try:
             async with runtime._save:
                 try:
@@ -232,6 +273,7 @@ class SessionCoordinator:
                     assert saved.receipt is not None
                     response = saved.receipt
                 except HttpError as error:
+                    owner_unavailable = error.code in ("EXPIRED", "NOT_FOUND")
                     response = mutation(request.action_id, "Failed", error.status, error)
                 except (OSError, sqlite3.Error):
                     try:
@@ -289,15 +331,19 @@ class SessionCoordinator:
                 self._pending_resume = None
             if request.safety_action:
                 self.safety_slot_released()
+            if request.action == "stop":
+                self._pending_stop = None
 
         complete = replace(operation, response=response)
         if cancelled and saved is None and self.realtime.active_revision == request.revision:
             self.resume_cancellations()[request.action_id] = complete
-        if request.action == "stop" and response.status == 200:
+        if request.action in ("confirm", "stop") and response.status == 200:
             runtime._retention_changed.set()
         if saved and saved.removed and saved.owner:
             self.realtime.search_ended(session)
-            self.realtime.object_removed(saved.owner)
+            runtime.hide_removed_owner(saved.owner, request.action_id)
+        elif owner_unavailable and operation.owner:
+            runtime.hide_removed_owner(operation.owner, request.action_id)
         else:
             runtime.publish_terminal(request.action_id, complete)
             if saved and saved.session:
