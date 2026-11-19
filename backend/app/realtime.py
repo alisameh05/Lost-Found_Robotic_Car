@@ -116,6 +116,8 @@ class Frame:
 class IssuedFrame:
     stream_epoch: str
     display_deadline: float
+    captured_at: float
+    retire_at: float
 
 
 @dataclass
@@ -204,6 +206,7 @@ class Realtime:
         self._proximity = None
         self._fixture_sink = None
         self._published_permission = "Disarmed"
+        self._circle_held = False
         if simulation:
             self._proximity = ProximityAdvisory(simulation.profile)
             if simulation.command_sink is None:
@@ -280,9 +283,12 @@ class Realtime:
             self._pause_required_for = None
 
     def suspend_search(self, session: str) -> None:
+        had_permission = self._motion and self._motion.permission != "Disarmed"
         if self._motion:
             self._motion.stop("SearchSuspended")
         self._pause_required_for = session
+        if had_permission:
+            self._rotate_motion_generation()
         if self._projection is not None:
             self._publish("readiness_changed", None)
 
@@ -356,17 +362,29 @@ class Realtime:
             await asyncio.sleep(interval)
 
     def _input_scope(self) -> InputScope | None:
-        lease = self._lease
-        if lease and lease.session and lease.session == self._active_session:
-            return InputScope(self.boot, lease.session, self._generation)
-        return None
+        return InputScope(self.boot, self._active_session, self._generation) if self._active_session else None
 
     def _motion_scope(self) -> InputScope | None:
         lease = self._lease
-        if (lease and lease.workspace and lease.displayed and not lease.setup_handoff
+        if (lease and lease.session == self._active_session and lease.workspace and lease.displayed and not lease.setup_handoff
                 and self._active_state == "Searching" and self._pause_required_for != self._active_session):
             return self._input_scope()
         return None
+
+    def _rotate_motion_generation(self) -> None:
+        lease = self._lease
+        if lease is None or self._motion is None:
+            return
+        if self._generation >= SAFE_INTEGER - 1:
+            self._revoke("ProtocolMismatch")
+            return
+        self._motion.stop("GenerationChanged")
+        lease.previous_generation = self._generation
+        self._advance_generation()
+        lease.generation_started = self.monotonic()
+        lease.motion_generation = True
+        lease.workspace = lease.displayed = False
+        self._publish_snapshot()
 
     def _evaluate_motion(self, now: float) -> None:
         self._expire_lease(now)
@@ -376,7 +394,9 @@ class Realtime:
             assert selected is not None
             required = ("RobotVideo", "Command", selected, "AI", "Storage")
             failed = next((PATH_FAILURES[name] for name in required if self.component_cause(name)), None)
-            if failed or (failed := self._motion.tick(scope, now, self.monotonic)):
+            now = self.monotonic()
+            self._expire_lease(now)
+            if scope == self._motion_scope() and (failed or (failed := self._motion.tick(scope, now, self.monotonic))):
                 self._revoke(failed)
         self._publish_permission()
 
@@ -526,8 +546,12 @@ class Realtime:
             return None if self._storage_ready and now < self._storage_until else "STORAGE_UNAVAILABLE"
         if name == "RobotVideo":
             frame = self._frames.get("robot")
-            if "robot" not in self._live_sources or frame is None or frame.age(now) >= self.profile.bound("capture_age_limit_ms"):
-                return "NOT_READY"
+            live = "robot" in self._live_sources and frame and frame.age(now) < self.profile.bound("capture_age_limit_ms")
+            return None if live else "NOT_READY"
+        if (name == "Command" and self._motion and
+                (self.failure_for(self.safety_session, "CommandUnavailable") or
+                 self.failure_for(self.safety_session, "CommandExpired")) and not self._motion.command_ready()):
+            return "NOT_READY"
         if name == "AI" and self.simulation and self.simulation.inference and now >= self._inference_until:
             return "NOT_READY"
         if name in ("Webcam", "Controller") and now >= self._input_deadlines.get(name, 0):
@@ -674,6 +698,8 @@ class Realtime:
         return self._failures.get(identity) if identity else None
 
     def record_failure(self, cause: str, session: str | None, *, publish: bool = True) -> Projection:
+        if session is not None and session == self.safety_session:
+            self._pause_required_for = session
         if previous := self.failure_for(session, cause):
             return previous
         identity = uuid4().hex
@@ -870,6 +896,7 @@ class Realtime:
             return
         profile = simulation.profile
         deadline = profile.bound("input_sample_deadline_ms") / 1000
+        decoding: dict[Source, asyncio.Task[None]] = {}
         try:
             while not self._closed:
                 sampled_at, scope = self.monotonic(), self._input_scope()
@@ -883,7 +910,13 @@ class Realtime:
                 now = self.monotonic()
                 self._expire_lease(now)
                 for source, capture in zip(SOURCES, (observation.robot, observation.webcam), strict=True):
-                    self._observe_source(source, capture, now, profile)
+                    pending = decoding.get(source)
+                    if capture is None:
+                        if pending:
+                            pending.cancel()
+                        self._observe_source(source, None, None, now, profile)
+                    elif pending is None or pending.done():
+                        decoding[source] = asyncio.create_task(self._decode_source(source, capture, profile))
                 for name, reported_at, sample in (
                     ("Controller", observation.controller_sample_at, observation.controller_input),
                     ("Webcam", observation.gesture_sample_at, observation.gesture_input),
@@ -913,15 +946,26 @@ class Realtime:
                     selected = self._selected_input()
                     sample = observation.gesture_input if selected == "Webcam" else observation.controller_input
                     # Circle is routed through the same latch even after a manual Pause.
-                    if (selected == "Controller" and sample and sample.scope == scope and sample.intent == "emergency"
-                            and 0 <= now - sample.at < deadline):
-                        self.on_simulated_emergency()
+                    circle = bool(selected == "Controller" and sample and sample.scope == scope
+                                  and sample.intent == "emergency" and 0 <= now - sample.at < deadline)
+                    if circle:
+                        if not self._circle_held:
+                            self.on_simulated_emergency()
                     elif scope == self._motion_scope():
                         if lost := motion.loss(now):
                             self._revoke(lost)
                         else:
+                            prior = motion.permission
                             motion.accept(scope, sample, now)
-                self._evaluate_motion(now)
+                            lease = self._lease
+                            assert lease is not None
+                            if ((prior == "Armed" and motion.permission != "Armed") or
+                                    (motion.permission == "Arming" and not lease.motion_generation)):
+                                self._rotate_motion_generation()
+                    self._circle_held = circle
+                elif scope is None:
+                    self._circle_held = False
+                self._evaluate_motion(self.monotonic())
                 self._restore_failures()
                 if self._proximity:
                     before = self._proximity.payload
@@ -931,6 +975,23 @@ class Realtime:
         finally:
             if self._motion:
                 self._motion.stop("AdapterStopped")
+            for pending in decoding.values():
+                pending.cancel()
+            await asyncio.gather(*decoding.values(), return_exceptions=True)
+
+    async def _decode_source(self, source: Source, capture: Capture, profile: QualificationProfile) -> None:
+        frame = await asyncio.to_thread(
+            self._check_capture, source, capture, self._frames.get(source), self.monotonic(), profile,
+        )
+        now = self.monotonic()
+        if frame is not None and frame.age(now) >= profile.bound("capture_age_limit_ms"):
+            frame = None
+        self._observe_source(source, capture, frame, now, profile)
+        self._set_readiness({
+            **self._readiness,
+            "RobotVideo": "robot" in self._live_sources,
+            "Webcam": "webcam" in self._live_sources and now < self._input_deadlines.get("Webcam", now),
+        })
 
     async def maintain_inference(self) -> None:
         simulation = self.simulation
@@ -993,21 +1054,23 @@ class Realtime:
                 self._projection["readiness"] = updated
                 self._publish("readiness_changed", None)
 
-    def _observe_source(self, source: Source, capture: Capture | None, now: float,
+    def _observe_source(self, source: Source, capture: Capture | None, frame: Frame | None, now: float,
                         profile: QualificationProfile) -> None:
         old = self._frames.get(source)
-        frame = self._check_capture(source, capture, old, now, profile) if capture is not None else None
         channel: Channel = "robot-video" if source == "robot" else "webcam-video"
         if frame:
             self._frames[source] = frame
             self._live_sources.add(source)
             epoch_changed = bool(old and old.capture.stream_epoch != frame.capture.stream_epoch)
+            if epoch_changed and source == "robot":
+                if self._lease:
+                    self._revoke("CameraEpochChanged")
+                elif self.safety_session is not None:
+                    self.record_failure("CameraEpochChanged", self.safety_session)
             for connection in tuple(self._connections.values()):
                 if connection.channel != channel:
                     continue
                 if epoch_changed:
-                    if source == "robot" and self._lease and self._lease.client == connection.client:
-                        self._revoke("CameraEpochChanged")
                     self.remove(connection, 1008)
                 else:
                     connection.waiting = frame
@@ -1016,6 +1079,8 @@ class Realtime:
               or old.age(now) >= profile.bound("capture_age_limit_ms")):
             was_live = source in self._live_sources
             self._live_sources.discard(source)
+            if was_live and source == "robot" and self._lease is None:
+                self._path_lost("RobotVideo")
             for connection in tuple(self._connections.values()):
                 if connection.channel == channel:
                     connection.waiting = None
@@ -1160,14 +1225,15 @@ class Realtime:
         now = self.monotonic()
         limit = min(profile.bound("capture_age_limit_ms"), profile.bound("display_deadline_ms"))
         for ident, old in tuple(connection.issued.items()):
-            if now >= old.display_deadline:
+            if now >= old.retire_at:
                 del connection.issued[ident]
         if frame.age(now) < limit and "robot" in self._live_sources:
             if len(connection.issued) >= MAX_ISSUED_FRAMES:
                 del connection.issued[next(iter(connection.issued))]
             capture = frame.capture
             deadline = capture.observed_at + (limit - capture.age_ms) / 1000
-            connection.issued[frame.id] = IssuedFrame(capture.stream_epoch, deadline)
+            retired = capture.observed_at + (profile.bound("capture_age_limit_ms") - capture.age_ms) / 1000
+            connection.issued[frame.id] = IssuedFrame(capture.stream_epoch, deadline, capture.observed_at, retired)
 
     def _heartbeat(self, connection: Connection, data: object, profile: QualificationProfile) -> bool:
         now = self.monotonic()
@@ -1183,11 +1249,14 @@ class Realtime:
                 or not compare_digest(data["client_lease_id"], lease.secret)
                 or (data["session_id"] != lease.session and not
                     (data["session_id"] is None and lease.setup_handoff))
-                or not counter(data["control_generation"]) or data["control_generation"] != self._generation
+                or not counter(data["control_generation"])
                 or not counter(data["heartbeat_seq"])
                 or (data["heartbeat_seq"] <= lease.heartbeat_seq if lease.heartbeat_seq else data["heartbeat_seq"] != 1)
                 or any(type(data[flag]) is not bool for flag in WORKSPACE_FLAGS)):
             return False
+        if data["control_generation"] != self._generation:
+            # Old in-flight heartbeats cannot refresh either deadline during an owner handoff.
+            return bool(data["control_generation"] == lease.previous_generation)
         indication = data["displayed_robot_frame"]
         setup_heartbeat = lease.setup_handoff and data["session_id"] is None
         for flag, reason in (("workspace_visible", "WorkspaceHidden"), ("workspace_focused", "WorkspaceUnfocused"),
@@ -1205,8 +1274,13 @@ class Realtime:
                     or "robot" not in self._live_sources):
                 return False
             frame = video.issued.get(indication["frame_id"])
-            if frame is None or indication["stream_epoch"] != frame.stream_epoch or now >= frame.display_deadline:
+            if frame is None or indication["stream_epoch"] != frame.stream_epoch:
                 return False
+            if now >= frame.display_deadline:
+                self._revoke("DisplayStale")
+                return True
+            if lease.generation_started is not None and frame.captured_at < lease.generation_started:
+                return True
             # The deadline is anchored to acquisition, so receiving the same identity never extends it.
             if not setup_heartbeat:
                 lease.display_deadline = frame.display_deadline
@@ -1216,6 +1290,8 @@ class Realtime:
             # An in-flight setup heartbeat cannot renew the newly bound session.
             return True
         lease.setup_handoff = False
+        lease.previous_generation = None
+        lease.generation_started = None
         lease.heartbeat_deadline = now + profile.bound("heartbeat_deadline_ms") / 1000
         lease.workspace = True
         lease.displayed = indication is not None

@@ -1130,7 +1130,7 @@ test("marks the last connected Workspace frame Not live and stops a held command
   expect(await canvas.evaluate((element: HTMLCanvasElement) => element.toDataURL())).toBe(pixels);
   await expect(feedback.getByText("Motion permission · Disarmed", { exact: true })).toBeVisible();
   await expect(page.getByText("Committed session · Paused")).toBeVisible();
-  await expect(page.getByText(/^(Displayed robot video stale|Workspace unusable)$/)).toBeVisible();
+  await expect(page.getByRole("strong").filter({ hasText: /^(Displayed robot video stale|Workspace unusable)$/ })).toBeVisible();
   await page.evaluate(() => { (window as unknown as PreviewWindow).previewProbe.repeatFrames = false; });
   await expect(robot.getByText("Live sample", { exact: true })).toBeVisible();
   await expect(feedback.getByText("Motion permission · Disarmed", { exact: true })).toBeVisible();

@@ -8,6 +8,7 @@ from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
 from dataclasses import replace
 from pathlib import Path
+from queue import Empty, Full, Queue
 from shutil import copytree
 from threading import Event, Thread
 from time import monotonic, sleep
@@ -166,12 +167,16 @@ class CommandDevice(FixtureCommandSink):
             return replace(command, challenge=replace(command.challenge, sequence=command.challenge.sequence - 1))
         return accepted
 
+    def probe(self) -> bool:
+        return self.acknowledgment == "valid" and super().probe()
+
 
 class PauseDelivery:
-    """Pause only the first connection on each selected path, at the real ASGI send boundary."""
+    """Pause one connection on each selected path at the real ASGI send boundary."""
 
-    def __init__(self, app: ASGIApp):
+    def __init__(self, app: ASGIApp, connection_number: int):
         self.app = app
+        self.connection_number = connection_number
         self.initial: Counter[str] = Counter()
         self.entered = {API + path: Event() for path in ("/events", "/video/robot")}
         self.resume_events = Event()
@@ -183,7 +188,7 @@ class PauseDelivery:
             await self.app(scope, receive, send)
             return
         self.initial[path] += 1
-        if self.initial[path] != 1:
+        if self.initial[path] != self.connection_number:
             await self.app(scope, receive, send)
             return
 
@@ -294,7 +299,7 @@ def test_control_is_exclusive_and_historical_retries_do_not_reacquire(tmp_path: 
 @contextmanager
 def service(root: Path, *, blocked: bool = False, event_limit: int | None = None,
             frame_limit: int | None = None, revocations: list[Revocation] | None = None,
-            inference: Callable[[InferenceSample], bool] | None = None, moving: bool = False,
+            inference: Callable[[InferenceSample], bool] | None = None, blocked_connection: int = 1,
             checkpoint: Callable[[str], None] | None = None, wall: Callable[[], int] | None = None) -> Iterator[Loopback]:
     clock = Clock()
     simulation = load_simulation("fixture-v1")
@@ -307,7 +312,7 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
 
     storage = ObservedStorage(root, monotonic=clock, checkpoint=checkpoint, **({"clock": wall} if wall else {}))
     profile = simulation.profile
-    if blocked and not moving:
+    if blocked and blocked_connection == 1:
         profile = replace(profile, values={**profile.values, "event_queue_messages": 1})
     if event_limit is not None:
         profile = replace(profile, values={**profile.values, "max_event_message_bytes": event_limit})
@@ -323,7 +328,7 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
                          simulation=Simulation(profile, observations, command, inference),
                          on_channel_invalidated=lambda client, channel: invalidations.append((client, channel)),
                          **({"on_control_revoked": revocations.append} if revocations is not None else {}))
-        delayed = PauseDelivery(app) if blocked else None
+        delayed = PauseDelivery(app, blocked_connection) if blocked else None
         server = uvicorn.Server(uvicorn.Config(
             delayed or app, host="127.0.0.1", port=port, proxy_headers=False, access_log=False,
             ws="websockets", ws_max_size=app.state.socket_message_limit, ws_max_queue=1,
@@ -986,8 +991,9 @@ def test_saved_search_lifecycle_and_historical_retry(tmp_path: Path) -> None:
 
 
 @contextmanager
-def ready_search(laf: Loopback, mode: str = "Controller", acquired: dict | None = None,
-                 ) -> Iterator[tuple[dict, dict, ClientConnection, ClientConnection]]:
+def ready_search(
+    laf: Loopback, mode: str = "Controller", acquired: dict | None = None,
+) -> Iterator[tuple[dict, dict, ClientConnection, ClientConnection]]:
     owner = laf.bootstrap()
     headers = auth(owner)
     wait_for(laf.http, "/health", headers)
@@ -1015,6 +1021,28 @@ class WorkspaceDriver:
         self.freeze = False
         self.latest: dict | None = None
         self.stop = Event()
+        self.messages: Queue[dict] = Queue(128)
+
+    def observe_events(self) -> None:
+        while not self.stop.is_set():
+            try:
+                message = json.loads(self.events.recv(timeout=0.1))
+            except TimeoutError:
+                continue
+            except ConnectionClosed:
+                return
+            if message["type"] == "snapshot":
+                public = message["payload"]["lease"]
+                if public["owner_client_id"] == self.owner["client_id"]:
+                    self.lease["control_generation"] = public["control_generation"]
+            try:
+                self.messages.put_nowait(message)
+            except Full:
+                try:
+                    self.messages.get_nowait()
+                except Empty:
+                    pass
+                self.messages.put_nowait(message)
 
     def run(self) -> None:
         seq = 2
@@ -1039,7 +1067,9 @@ def driving_search(laf: Loopback, mode: str = "Controller") -> Iterator[tuple[di
         headers = auth(owner)
         driver = WorkspaceDriver(owner, lease, events, video)
         worker = Thread(target=driver.run, daemon=True)
+        observer = Thread(target=driver.observe_events, daemon=True)
         worker.start()
+        observer.start()
         try:
             wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_start"][mode])
             result = laf.http.post(API + "/sessions", headers=headers, json=start)
@@ -1050,6 +1080,7 @@ def driving_search(laf: Loopback, mode: str = "Controller") -> Iterator[tuple[di
             driver.stop.set()
             video.close()
             worker.join(2)
+            observer.join(2)
 
 
 def wait_output(laf: Loopback, expected: Direction | None) -> None:
@@ -1090,6 +1121,7 @@ def test_neutral_fresh_hold_and_release_drive_the_same_sink(tmp_path: Path, mode
         laf.observations.fingers = 1
         laf.observations.dpad = ("forward",)
         with driving_search(laf, mode) as (headers, driver):
+            lease_at_start = driver.lease["control_generation"]
             for _ in range(3):
                 sleep(0.09)
                 assert laf.command.output is None
@@ -1123,6 +1155,7 @@ def test_neutral_fresh_hold_and_release_drive_the_same_sink(tmp_path: Path, mode
             assert_stopped(laf, "InputReleased")
             current = laf.http.get(API + "/snapshot", headers=headers).json()
             assert current["active_session"] == driver.session and current["failures"] == []
+            assert current["runtime"]["control_generation"] > lease_at_start
 
 
 @pytest.mark.parametrize(("fault", "cause"), [
@@ -1186,6 +1219,8 @@ def test_required_path_failure_disarms_and_saves_typed_pause(tmp_path: Path, fau
         failure = next(entry for entry in snapshot["failures"] if entry["cause"] == cause)
         assert {"cause": "RecoveryRequired", "failure_id": failure["failure_id"]} in snapshot["active_session"]["pause_causes"]
         assert not failure["acknowledged"]
+        if fault in ("missing-ack", "replayed-ack"):
+            assert not failure["restored"] and status(snapshot, "Command") == "Unavailable"
         renewals = sum(entry.event == "renewed" for entry in laf.command.journal)
         sleep(0.15)
         assert laf.command.output is None
@@ -1285,16 +1320,15 @@ def test_inference_stall_cannot_renew_held_motion(tmp_path: Path) -> None:
 
 
 def test_stopping_does_not_need_a_blocked_subscriber_or_video_consumer(tmp_path: Path) -> None:
-    with service(tmp_path, blocked=True, moving=True) as laf:
+    with service(tmp_path, blocked=True, blocked_connection=2) as laf, driving_search(laf) as (headers, _):
+        arm(laf, headers)
         spectator = auth(laf.bootstrap())
         held = laf.blocked
         assert held
-        wait_for(laf.http, "/health", spectator)
         with (laf.open("/events", laf.ticket(spectator, "events")),
-              laf.open("/video/robot", laf.ticket(spectator, "robot-video")),
-              driving_search(laf) as (headers, _)):
+              laf.open("/video/robot", laf.ticket(spectator, "robot-video"))):
             assert all(signal.wait(2) for signal in held.entered.values())
-            arm(laf, headers)
+            assert laf.command.output == "forward"
             try:
                 laf.observations.command = False
                 assert_stopped(laf, "CommandUnavailable")
@@ -1309,10 +1343,11 @@ def test_proximity_advisory_preserves_latch_and_has_no_motion_or_revision_effect
         arm(laf, headers)
         laf.observations.proximity = 150
         for _ in range(30):
-            update = event(driver.events)
+            update = driver.messages.get(timeout=4)
             if update["type"] == "proximity_warning_changed" and update["payload"]["proximity"]["state"] == "Warning":
                 break
         warning = update["payload"]["proximity"]
+        validate("EventEnvelope", update)
         assert warning["distance_mm"] == 150 and warning["warning_latched"]
         assert warning["sample_seq"] and warning["source_epoch"] and warning["observed_at_ms"]
         laf.observations.proximity = None

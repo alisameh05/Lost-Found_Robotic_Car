@@ -33,11 +33,16 @@ class ConnectedFixtureSink:
 
     def call(self, method: str, *args):
         self.pipe.send((method, args))
+        if not self.pipe.poll(0.05):
+            raise OSError("The external command fixture did not reply.")
         return self.pipe.recv()
 
     @property
     def output(self) -> Direction | None:
         return self.call("output")
+
+    def probe(self) -> bool:
+        return self.call("probe")
 
     def challenge(self, scope: InputScope, generation: int) -> Challenge:
         return self.call("challenge", scope, generation)

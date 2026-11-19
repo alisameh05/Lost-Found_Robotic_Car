@@ -74,6 +74,7 @@ class CommandSink(Protocol):
 
     @property
     def output(self) -> Direction | None: ...
+    def probe(self) -> bool: ...
     def challenge(self, scope: InputScope, generation: int) -> Challenge: ...
     def renew(self, command: Command) -> Command | None: ...
     def revoke(self, generation: int, cause: str) -> None: ...
@@ -128,6 +129,9 @@ class FixtureCommandSink:
         with self._lock:
             self._expire(self._clock())
             return self._output
+
+    def probe(self) -> bool:
+        return not self._closed.is_set()
 
     def _expire(self, now: float) -> None:
         if self._deadline is not None and now >= self._deadline:
@@ -199,6 +203,12 @@ class Motion:
         if self._direction is not None and self._logical_output() == self._direction:
             return "Armed"
         return "Arming" if self._direction is None and self._neutral else "Disarmed"
+
+    def command_ready(self) -> bool:
+        try:
+            return self.sink.probe()
+        except OSError:
+            return False
 
     def stop(self, cause: str) -> None:
         was_held = self._direction is not None

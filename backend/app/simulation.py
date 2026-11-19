@@ -154,7 +154,7 @@ class ProximityAdvisory:
             self.clear_count = 0
         self.latest = sample
         distance = sample.distance_mm
-        state = self.payload["state"]
+        state = "Unknown" if previous and sample.source_epoch != previous.source_epoch else self.payload["state"]
         latched = self.payload["warning_latched"]
         if type(distance) is not int or not 0 <= distance <= self.profile.bound("proximity_max_distance_mm"):
             self.unknown()
@@ -216,7 +216,7 @@ class StaticScene:
         self._samples = (robot, webcam)
         self._epochs = (token_urlsafe(18), token_urlsafe(18))
         self._sequence = 0
-        self._scope: InputScope | None = None
+        self._session: str | None = None
         self._scope_started = 0.0
 
     def observe(self, now: float, scope: InputScope | None = None) -> Observation:
@@ -226,8 +226,8 @@ class StaticScene:
                     sample.jpeg)
             for epoch, sample in zip(self._epochs, self._samples, strict=True)
         )
-        if scope != self._scope:
-            self._scope, self._scope_started = scope, now
+        if scope and scope.session != self._session:
+            self._session, self._scope_started = scope.session, now
         elapsed = now - self._scope_started
         held = 1.2 <= elapsed < 4.2
         return Observation(
