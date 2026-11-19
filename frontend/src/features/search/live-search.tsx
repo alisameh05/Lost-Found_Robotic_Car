@@ -191,7 +191,6 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     failures.some(({ acknowledged }) => !acknowledged) && "Acknowledge each outstanding failure.",
     saving && "Wait for the pending save.",
     session.state !== "Paused" && state === "Paused" && !saving && "Save the pause before resuming.",
-    recordsMode && "Resume and acknowledgment are unavailable in this simulation.",
     candidate && "Complete the pending match review.",
     !candidate && snapshot.pending_candidate && "Wait for the current candidate review to become available.",
   ].filter((item): item is string => typeof item === "string");
@@ -220,7 +219,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
         <span aria-label="Elapsed time">{duration(elapsed)}</span>
         {session.state === "Searching" || unresolved(resume)
           ? <Button disabled={blocked || unresolved(pause)} onClick={() => { void runtime?.submitSearch({ kind: "pause", sessionId }); }}>Pause</Button>
-          : <Button disabled={recordsMode || blocked || !ready || !readiness.can_resume || unresolved(resume)}
+          : <Button disabled={blocked || !ready || !readiness.can_resume || unresolved(resume)}
             onClick={() => { void runtime?.submitSearch({ kind: "resume", sessionId }); }}>Resume</Button>}
         {!candidate && <Button variant="destructive" disabled={blocked} onClick={stopSearch}>Stop Search</Button>}
       </div>
@@ -247,8 +246,12 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     </Panel>}
     {help && <ModelessPanel id="live-control-help" title="Control Help"><ModeInstructions mode={mode} heading="h3" /></ModelessPanel>}
     {recoveryOpen && <RecoveryPanel failures={failures} blockers={recoveryBlockers} searching={searching}
-      canAcknowledge={!recordsMode && owner && connected && readiness.components.some(({ component, status }) => component === "Storage" && status === "Ready")}
-      feedback={acknowledgment} acknowledge={(id) => { void runtime?.submitSearch({ kind: "acknowledge", sessionId, failureIds: [id] }); }}
+      manuallyPaused={session.pause_causes.some(({ cause }) => cause === "ManualPause")}
+      canAcknowledge={owner && connected && readiness.components.some(({ component, status }) => component === "Storage" && status === "Ready")}
+      feedback={acknowledgment} acknowledge={(id) => {
+        if (recordsMode) setRecovery(true);
+        void runtime?.submitSearch({ kind: "acknowledge", sessionId, failureIds: [id] });
+      }}
       retry={() => { void runtime?.retrySearch("acknowledge", sessionId); }} />}
     <div role="status" className="visually-hidden">{candidate && "Potential match. Search paused for review."}</div>
     {candidate && <MatchReview key={candidate.evidence_media.id} match={candidate} object={object}
@@ -309,7 +312,8 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     </div>
     <div className={styles.feedback}>
       <ActionFeedback label="Pausing search" feedback={pause} retry={connected ? () => { void runtime?.retrySearch("pause", sessionId); } : undefined} />
-      <ActionFeedback label="Resuming search" feedback={resume} retry={connected ? () => { void runtime?.retrySearch("resume", sessionId); } : undefined} />
+      <ActionFeedback label="Resuming search" feedback={resume} canRetryFailed={recordsMode && ready && readiness.can_resume}
+        retry={connected ? () => { void runtime?.retrySearch("resume", sessionId); } : undefined} />
       <ActionFeedback label="Stopping search" feedback={stop} retry={connected ? () => { void runtime?.retrySearch("stop", sessionId); } : undefined} />
     </div>
     <InputControls mode={mode} disabled={!searching || !ready ||

@@ -16,7 +16,7 @@ export function ActionFeedback({ label, feedback, retry, canRetryFailed = false 
       stage === "committed" ? "success" : "info"}>
       {"message" in feedback ? feedback.message : stage === "unknown" ? retry ? "Retry to check the original request." :
         "Wait for the current search state." :
-        stage === "pending" ? "The fixture accepted the action and is still saving it." : null}
+        stage === "pending" ? "The service accepted the action and is still saving it." : null}
     </Notice>
     {retry && (stage === "unknown" || stage === "pending" || (stage === "failed" && feedback.retryable && canRetryFailed)) &&
       <Button onClick={retry}>Retry original action</Button>}

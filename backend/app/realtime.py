@@ -186,6 +186,8 @@ class Realtime:
         self._lease: Lease | None = None
         self._pause_required_for: str | None = None
         self._starting_session: str | None = None
+        self._resuming_session: str | None = None
+        self._resume_viable = False
         self._active_session: str | None = None
         self._active_owner: str | None = None
         self._active_mode: str | None = None
@@ -260,11 +262,52 @@ class Realtime:
             raise HttpError(409, "OWNERSHIP_MISMATCH", "The active search changed.")
         if mode:
             self.requires_profile()
-            required = ("Command", "RobotVideo", "AI", "Storage", "Webcam" if mode == "Gestures" else "Controller")
-            if (not lease.workspace or not lease.displayed or
-                    any(self.component_cause(name) is not None for name in required)):
+            if not self._required_paths_ready(lease, mode):
                 raise HttpError(503, "NOT_READY", "Restore the required search paths and displayed preview.", True)
         return self._generation
+
+    def _required_paths_ready(self, lease: Lease, mode: str) -> bool:
+        required = ("QualificationProfile", "Command", "RobotVideo", "AI", "Storage",
+                    "Webcam" if mode == "Gestures" else "Controller")
+        return (lease.workspace and lease.displayed and not lease.setup_handoff
+                and all(self.component_cause(name) is None for name in required))
+
+    def _check_resume_ready(self, session: str, revision: int) -> None:
+        if self._active_session != session or self._active_state != "Paused":
+            raise HttpError(409, "INVALID_TRANSITION", "Pause the search before resuming.")
+        if revision != self.active_revision:
+            raise HttpError(409, "REVISION_CONFLICT", "The saved search changed. Refresh and try again.",
+                            revision=self.active_revision)
+        if self._projection and self._projection["pending_candidate"] is not None:
+            raise HttpError(409, "PENDING_REVIEW", "Complete the pending review before resuming.")
+        if self.failures_for(session):
+            raise HttpError(409, "RECOVERY_REQUIRED", "Restore and acknowledge each outstanding failure.")
+        lease, mode = self._lease, self._active_mode
+        if lease is None or mode is None or not self._required_paths_ready(lease, mode):
+            raise HttpError(503, "NOT_READY", "Restore the required search paths and displayed preview.", True)
+
+    def begin_resume(self, session: str, revision: int) -> None:
+        if self._resuming_session is not None:
+            raise HttpError(409, "INVALID_TRANSITION", "A Resume is already saving.")
+        self._check_resume_ready(session, revision)
+        self._resuming_session = session
+        self._resume_viable = True
+
+    def check_resume(self, session: str, revision: int) -> None:
+        if self.resume_superseded(session):
+            raise HttpError(409, "INVALID_TRANSITION", "A safety stop superseded Resume.")
+        self._check_resume_ready(session, revision)
+
+    def resume_superseded(self, session: str) -> bool:
+        return self._resuming_session != session or not self._resume_viable
+
+    def finish_resume(self, session: str, grant: bool) -> None:
+        self._resuming_session = None
+        self._resume_viable = False
+        if grant:
+            # A saved Resume starts a new input/display generation before Searching is published.
+            self._pause_required_for = None
+            self._rotate_motion_generation(publish=False)
 
     def prepare_start(self, session: str) -> None:
         # A loss after the last writer guard still knows which session to pause.
@@ -283,6 +326,8 @@ class Realtime:
             self._pause_required_for = None
 
     def suspend_search(self, session: str) -> None:
+        if self._resuming_session == session:
+            self._resume_viable = False
         had_permission = self._motion and self._motion.permission != "Disarmed"
         if self._motion:
             self._motion.stop("SearchSuspended")
@@ -324,6 +369,7 @@ class Realtime:
             self._revoke("SessionEnded")
 
     def _revoke(self, reason: str, request_id: str | None = None) -> None:
+        self._resume_viable = False
         if self._motion:
             self._motion.stop(reason)
         lease, self._lease = self._lease, None
@@ -374,7 +420,7 @@ class Realtime:
             return self._input_scope()
         return None
 
-    def _rotate_motion_generation(self) -> None:
+    def _rotate_motion_generation(self, *, publish: bool = True) -> None:
         lease = self._lease
         if lease is None or self._motion is None:
             return
@@ -387,20 +433,25 @@ class Realtime:
         lease.generation_started = self.monotonic()
         lease.motion_generation = True
         lease.workspace = lease.displayed = False
-        self._publish_snapshot()
+        if publish:
+            self._publish_snapshot()
 
     def _evaluate_motion(self, now: float) -> None:
         self._expire_lease(now)
         scope = self._motion_scope()
-        if scope and self._motion:
+        if (scope or self._resume_viable) and self._motion:
             selected = self._selected_input()
             assert selected is not None
             required = ("RobotVideo", "Command", selected, "AI", "Storage")
             failed = next((PATH_FAILURES[name] for name in required if self.component_cause(name)), None)
             now = self.monotonic()
             self._expire_lease(now)
-            if scope == self._motion_scope() and (failed or (failed := self._motion.tick(scope, now, self.monotonic))):
-                self._revoke(failed)
+            authorized = (scope == self._motion_scope() if scope else self._resume_viable)
+            if authorized:
+                if failed is None and scope is not None:
+                    failed = self._motion.tick(scope, now, self.monotonic)
+                if failed:
+                    self._revoke(failed)
         self._publish_permission()
 
     def _publish_permission(self) -> None:
@@ -644,6 +695,10 @@ class Realtime:
         # The writer can become visible to a read just before its main-loop commit publication.
         if self._starting_session and next_state["session_id"] == self._starting_session:
             return before
+        session = next_state["active_session"]
+        if (self._resuming_session and isinstance(session, dict) and session["id"] == self._resuming_session
+                and session["state"] == "Searching"):
+            return before
         retention = cast(Projection, next_state["retention"])
         if retention["settings"] is None:
             if before is None:
@@ -651,7 +706,6 @@ class Realtime:
             retention["settings"] = cast(Projection, before["retention"])["settings"]
         next_state["event_seq"] = self.sequence
         self._projection = next_state
-        session = next_state["active_session"]
         next_state["failures"] = self.failures_for(cast(str | None, next_state["session_id"]))
         if isinstance(session, dict):
             self.search_committed(session)
@@ -703,6 +757,7 @@ class Realtime:
     def record_failure(self, cause: str, session: str | None, *, publish: bool = True) -> Projection:
         if session is not None and session == self.safety_session:
             self._pause_required_for = session
+            self._resume_viable = False
         if previous := self.failure_for(session, cause):
             return previous
         identity = uuid4().hex
@@ -727,6 +782,7 @@ class Realtime:
         workspace = bool(lease and lease.workspace)
         displayed = bool(workspace and lease and lease.displayed)
         available = {
+            "EmergencyStop": displayed and not self._circle_held,
             "WorkspaceDisconnected": workspace, "WorkspaceHidden": workspace, "WorkspaceUnfocused": workspace,
             "WorkspaceUnusable": workspace, "HeartbeatExpired": workspace, "DisplayStale": displayed,
             "ProtocolMismatch": workspace, "RobotVideoUnavailable": self.component_cause("RobotVideo") is None,
@@ -745,13 +801,26 @@ class Realtime:
             del self._outstanding[key]
             if session is None:
                 del self._failures[identity]
+                changed = True
             else:
-                failure = {**self._failures[identity], "restored": True}
-                self._failures[identity] = failure
-                self.on_failure_changed(failure)
-            changed = True
+                self.on_failure_changed({**self._failures[identity], "restored": True})
         if changed:
             self._publish_failures()
+
+    def reconcile_failures(self, acknowledged: tuple[str, ...], restored: tuple[str, ...]) -> bool:
+        changed = False
+        for status, identities in (("acknowledged", acknowledged), ("restored", restored)):
+            for identity in identities:
+                failure = self._failures.get(identity)
+                if not failure or failure[status]:
+                    continue
+                updated = {**failure, status: True}
+                if updated["restored"] and updated["acknowledged"]:
+                    del self._failures[identity]
+                else:
+                    self._failures[identity] = updated
+                changed = True
+        return changed
 
     @staticmethod
     def _project_operation(state: Projection, operation: Projection) -> bool:
@@ -783,11 +852,14 @@ class Realtime:
             else:
                 self._publish("session_changed", {"session": current, "operation": operation,
                                                   "runtime": self._runtime(self._projection)})
+                if current["state"] == "Paused":
+                    self._publish("readiness_changed", None)
         else:
             self._publish_snapshot()
 
     def publish_search_commit(
         self, session: Projection, operation: Projection | None, target: Projection | None, pending: bool,
+        *, recovery_changed: bool = False,
     ) -> None:
         self.search_committed(session)
         state = self._projection
@@ -814,6 +886,10 @@ class Realtime:
         # The full projection introduces a new owner or lease generation before the typed completion.
         self._publish_snapshot()
         self._publish("session_changed", {"session": session, "operation": operation, "runtime": self._runtime(state)})
+        if recovery_changed:
+            self._publish_failures()
+        if session["state"] == "Paused":
+            self._publish("readiness_changed", None)
 
     def _runtime(self, state: Projection) -> Projection:
         runtime = {**cast(Projection, state["runtime"]), "control_generation": self._generation,
@@ -833,19 +909,28 @@ class Realtime:
                 "DisplayedRobotVideo": bool(owns and lease and lease.displayed),
                 **{name: self.component_cause(name) is None for name in
                    ("Webcam", "Controller", "RobotVideo", "Command", "AI")}}
+        if not projection["storage_problem"] and self.component_cause("Storage") is not None:
+            live["Storage"] = False
         components = [
             {"component": name, "status": "Ready" if live[name] else "Unavailable",
-             "cause_codes": [] if live[name] else ["NOT_READY"]}
+             "cause_codes": [] if live[name] else ["STORAGE_UNAVAILABLE" if name == "Storage" else "NOT_READY"]}
             if (name := str(component["component"])) in live else component
             for component in cast(list[Projection], readiness["components"])
         ]
         statuses = {component["component"]: component["status"] == "Ready" for component in components}
-        shared = (owns and projection["session_id"] is None and bool(projection["eligible_target"])
-                  and all(ready for name, ready in statuses.items() if name not in ("Webcam", "Controller")))
+        shared = owns and all(ready for name, ready in statuses.items() if name not in ("Webcam", "Controller"))
+        start = shared and projection["session_id"] is None and bool(projection["eligible_target"])
+        session = projection["active_session"]
+        runtime = self._runtime(projection)
+        resume = bool(shared and lease and isinstance(session, dict) and lease.session == session["id"]
+                      and session["state"] == "Paused" and self._required_paths_ready(lease, session["control_mode"])
+                      and not runtime["persistence_pending"] and self._resuming_session is None
+                      and projection["pending_candidate"] is None
+                      and not self.failures_for(lease.session))
         state["readiness"] = {**readiness, "components": components,
-                              "can_start": {"Gestures": shared and statuses["Webcam"],
-                                            "Controller": shared and statuses["Controller"]}}
-        state["runtime"] = self._runtime(projection)
+                              "can_start": {"Gestures": start and statuses["Webcam"],
+                                            "Controller": start and statuses["Controller"]}, "can_resume": resume}
+        state["runtime"] = runtime
         state["failures"] = self.failures_for(cast(str | None, projection["session_id"]))
         if self._proximity:
             state["proximity"] = self._proximity.payload
@@ -1287,7 +1372,7 @@ class Realtime:
             # The deadline is anchored to acquisition, so receiving the same identity never extends it.
             if not setup_heartbeat:
                 lease.display_deadline = frame.display_deadline
-        changed = not lease.workspace or lease.displayed != (indication is not None)
+        changed = lease.setup_handoff or not lease.workspace or lease.displayed != (indication is not None)
         lease.heartbeat_seq = data["heartbeat_seq"]
         if setup_heartbeat:
             # An in-flight setup heartbeat cannot renew the newly bound session.

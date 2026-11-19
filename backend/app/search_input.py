@@ -23,11 +23,21 @@ class SearchRequest:
     client: str
     secret: str
     mode: Mode | None
+    failure_ids: tuple[str, ...] = ()
+
+    @property
+    def safety_action(self) -> bool:
+        return self.action in ("pause", "stop")
 
     def fingerprint(self) -> str:
+        payload: dict[str, object] = {}
+        if self.mode:
+            payload["control_mode"] = self.mode
+        if self.failure_ids:
+            payload["failure_ids"] = self.failure_ids
         return sha256(canonical_json({
             "scope": "Object", "action_type": self.action, "resource_id": self.resource_id,
-            "expected_revision": self.revision, "payload": {"control_mode": self.mode} if self.mode else {},
+            "expected_revision": self.revision, "payload": payload,
         }).encode()).hexdigest()
 
 
@@ -48,6 +58,7 @@ async def parse_search(request: Request, session: str | None) -> SearchRequest:
     if not isinstance(data, dict):
         raise invalid
     mode: Mode | None = None
+    failure_ids: tuple[str, ...] = ()
     if session is None:
         fields |= {"object_id", "control_mode"}
         resource = data.get("object_id")
@@ -70,6 +81,7 @@ async def parse_search(request: Request, session: str | None) -> SearchRequest:
             if (not isinstance(ids, list) or not 1 <= len(ids) <= 64
                     or not all(domain_id(item) for item in ids) or len(set(ids)) != len(ids)):
                 raise invalid
+            failure_ids = tuple(sorted(ids))
             fields.add("failure_ids")
         elif action not in ("pause", "stop", "resume"):
             raise invalid
@@ -78,10 +90,10 @@ async def parse_search(request: Request, session: str | None) -> SearchRequest:
             or not token(data.get("client_lease_id"))):
         raise invalid
     check_identity(request, data["client_id"])
-    if action not in ("start", "pause", "stop"):
+    if action in ("confirm", "reject"):
         raise HttpError(503, "NOT_READY", "This search action is unavailable in the simulation.")
     return SearchRequest(data["action_id"], action, cast(str, resource), data["expected_revision"],
-                         data["client_id"], data["client_lease_id"], mode)
+                         data["client_id"], data["client_lease_id"], mode, failure_ids)
 
 
 async def parse_emergency(request: Request) -> tuple[str, str | None]:

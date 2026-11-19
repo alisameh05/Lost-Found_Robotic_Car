@@ -17,12 +17,13 @@ test.use({ baseURL: frontend });
 
 async function startBackend(options: {
   initializationGate?: string; crashAfterCommit?: boolean; registrationGate?: string; clockOffset?: string;
-  cleanupFault?: string; settingsGate?: string; simulation?: boolean;
+  cleanupFault?: string; settingsGate?: string; stopGate?: string; simulation?: boolean;
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
     : options.registrationGate ? ["backend.tests.crash_registration", "journaled", options.registrationGate]
     : options.settingsGate ? ["backend.tests.crash_registration", "retention_before_commit", options.settingsGate]
+    : options.stopGate ? ["backend.tests.crash_registration", "before_stop_commit", options.stopGate]
     : options.clockOffset ? ["backend.tests.crash_registration", "clock", options.clockOffset,
       ...(options.cleanupFault ? ["deny-purge", options.cleanupFault] : [])]
     : ["backend.app"];
@@ -1108,6 +1109,100 @@ test("persists both simulated modes and recovers an interrupted search after ser
   await expect(page.locator(`a[href="${first}"]`)).toBeVisible();
   await expect(page.locator(`a[href="${second}"]`)).toBeVisible();
   expect(requests.filter((request) => request === "POST /api/v1/sessions")).toHaveLength(2);
+});
+
+test("recovers the same saved search deliberately after an emergency, reload and an event gap", async ({ page }) => {
+  test.setTimeout(75_000);
+  const stopGate = join(parent, "finish-stop");
+  await startBackend({ simulation: true, stopGate });
+  await observePreviewFrames(page);
+  const { requests } = observe(page);
+  await selectTarget(page, sourceImage(), "Recovery target");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  await page.getByRole("radio", { name: /PS4 controller/i }).check();
+  const button = (name: string) => page.getByRole("button", { name, exact: true });
+  await button("Acquire control").click();
+  await button("Start Search").click();
+  await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
+  const url = page.url();
+  const resume = button("Resume");
+  const recovery = page.getByRole("region", { name: "Recovery" });
+  const activity = page.getByRole("region", { name: "Session activity" });
+  const feedback = page.getByRole("region", { name: "Controller feedback" });
+  const count = (suffix: string) => requests.filter((request) => request.startsWith("POST ") && request.endsWith(suffix)).length;
+  async function resumeSavedSearch() {
+    const saved = page.waitForResponse((response) => response.url().endsWith("/actions") &&
+      response.request().method() === "POST" && response.request().postDataJSON()?.action === "resume",
+    { timeout: 10_000 });
+    await resume.click();
+    const response = await saved;
+    expect(response.ok(), await response.text()).toBe(true);
+    await expect(activity).toContainText("Committed session · Searching");
+  }
+
+  await button("Pause").click();
+  await expect(activity).toContainText("Committed session · Paused");
+  await button("Recovery").click();
+  await expect(recovery).toContainText("Paused by operator.");
+  await resumeSavedSearch();
+  await expect(feedback.getByText("Motion permission · Armed")).toBeVisible();
+  await button("Emergency Stop").focus();
+  await page.keyboard.press("Enter");
+  await expect(activity).toContainText("Committed session · Paused");
+  await expect(feedback).toContainText("Motion permission · Disarmed");
+
+  await page.reload();
+  await expect(page).toHaveURL(url);
+  await expect(button("Acquire control")).toBeEnabled();
+  await expect(resume).toBeDisabled();
+  await expect(recovery.getByText("Awaiting restoration · Awaiting acknowledgment")).toBeVisible();
+  expect(count("/control-lease")).toBe(1);
+  expect(count("/actions")).toBe(2);
+  await button("Acquire control").click();
+  await expect(recovery.getByText("Restored · Awaiting acknowledgment")).toBeVisible();
+  await expect(resume).toBeDisabled();
+  await recovery.getByRole("button", { name: "Acknowledge", exact: true }).click();
+  await resumeSavedSearch();
+
+  await page.evaluate(() => {
+    const probe = (window as unknown as PreviewWindow).previewProbe;
+    const recent = JSON.parse(probe.initialSnapshot!);
+    probe.events!.dispatchEvent(new MessageEvent("message", { data: JSON.stringify({
+      ...recent, type: "readiness_changed", event_seq: recent.event_seq + 100_000,
+      session_id: null, session_revision: null,
+      payload: { readiness: recent.payload.readiness, runtime: recent.payload.runtime },
+    }) }));
+  });
+  await expect(button("Acquire control")).toBeEnabled();
+  await expect(activity).toContainText("Committed session · Paused");
+  await expect(resume).toBeDisabled();
+  await expect(button("Emergency Stop")).toBeEnabled();
+  await expect(button("Control Help")).toBeEnabled();
+  expect(count("/control-lease")).toBe(2);
+  expect(count("/actions")).toBe(4);
+  await button("Acquire control").click();
+  await expect(recovery.getByRole("strong").filter({ hasText: /^Workspace disconnected$/ })).toBeVisible();
+  await expect(recovery.getByText("Restored · Awaiting acknowledgment")).toBeVisible();
+  await recovery.getByRole("button", { name: "Acknowledge", exact: true }).click();
+  await resumeSavedSearch();
+  await expect(page).toHaveURL(url);
+  await expect(page.getByRole("region", { name: "Active search target" })).toContainText("Recovery target");
+  await expect(page.getByText("PS4 DualShock 4 · Target and mode locked")).toBeVisible();
+  expect(requests.filter((request) => request === "POST /api/v1/sessions")).toHaveLength(1);
+  await button("Pause").click();
+  await expect(activity).toContainText("Committed session · Paused");
+  await button("Stop Search").click();
+  try {
+    await expect(page.getByText("Save pending", { exact: true })).toBeVisible();
+    await expect(page.getByRole("region", { name: "Control ownership" })).toContainText("This workspace holds control.");
+    await expect(resume).toBeDisabled();
+    await expect(button("Emergency Stop")).toBeEnabled();
+  } finally {
+    writeFileSync(stopGate, "");
+  }
+  await expect(page).toHaveURL(url.replace(/\/live$/, "/result"));
 });
 
 test("marks the last connected Workspace frame Not live and stops a held command", async ({ page }) => {
