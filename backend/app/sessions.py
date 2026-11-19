@@ -136,7 +136,14 @@ class SessionCoordinator:
             response = existing or mutation(request.action_id, "Failed", unavailable.status, unavailable)
             if existing:
                 recovered = json.loads(existing.body)["result"]["session"]
-                saved = SavedSearch(recovered, owner, removed=recovered is None, receipt=existing)
+                target = None
+                if request.mode:
+                    try:
+                        target = await asyncio.to_thread(runtime.storage.read_object, owner, runtime.preparing())
+                    except (OSError, sqlite3.Error, HttpError):
+                        # A later eligible projection can still reconcile the committed receipt.
+                        pass
+                saved = SavedSearch(recovered, owner, removed=recovered is None, receipt=existing, target=target)
         finally:
             runtime._pending.pop(request.action_id, None)
             if request.mode:
@@ -248,7 +255,10 @@ class SessionCoordinator:
             self.realtime.publish_search_commit(
                 saved.session, complete.payload() if operation.visible else None, None, bool(runtime._pending),
             )
-        elif saved is None and operation.visible:
+        elif operation.visible:
+            # If Stop won, acknowledge the request without publishing an owner payload.
+            if job.terminal_won:
+                complete = replace(complete, owner=None)
             runtime.publish_terminal(key, complete)
             self.realtime.operation_changed(job.session, complete.payload())
         return receipt

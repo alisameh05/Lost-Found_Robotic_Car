@@ -63,7 +63,7 @@ function LiveSearch({ sessionId }: { sessionId: string }) {
 
 function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snapshot }) {
   const { active_session: session, active_object: object, runtime: effective, lease, readiness } = snapshot;
-  const { workspace, profile, searchActions, recordsMode } = useRuntimeView();
+  const { workspace, profile, searchActions, recordsMode, emergency } = useRuntimeView();
   const connection = useRuntime()?.connection;
   const runtime = connection?.runtime;
   const router = useRouter();
@@ -169,6 +169,9 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     : effective.persistence_pending;
   const unsavedEmergency = failures.some(({ cause, failure_id }) => cause === "EmergencyStop" &&
     !session.pause_causes.some((pauseCause) => pauseCause.failure_id === failure_id));
+  const emergencySaveFailed = unsavedEmergency && (recordsMode
+    ? emergency?.kind === "result" && emergency.response.persistence === "Failed" && emergency.response.session_id === sessionId
+    : !saving);
   const requiredUnavailable = readiness.components.filter(({ component, status }) => status !== "Ready" &&
     component !== (gestures ? "Controller" : "Webcam"));
   const recoveryBlockers = [
@@ -282,7 +285,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
           <p>Search accepted · <RecordTime value={session.started_at_ms} compact /></p>
           <p>Committed session · {session.state}</p>
           {effective.persistence_pending && <p>Session save pending</p>}
-          {unsavedEmergency && !saving && <p>Emergency pause save failed. Retry Emergency Stop to save it.</p>}
+          {emergencySaveFailed && <p>Emergency pause save failed. Retry Emergency Stop to save it.</p>}
         </section>
         <section aria-label="Control ownership">
           <h2>Control ownership</h2>
