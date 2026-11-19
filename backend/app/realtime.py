@@ -167,11 +167,10 @@ class Realtime:
         self.active_revision: int | None = None
         self.emergency_requests: set[str] = set()
         self.failure: Projection | None = None
-        self._session_events: dict[str, tuple[Projection, Projection]] = {}
         self._receipts: dict[str, LeaseReceipt] = {}
         self._projection: Projection | None = None
         self._projection_lock = asyncio.Lock()
-        self._removal_revision = 0
+        self._projection_revision = 0
         self._closed = False
 
     @property
@@ -228,14 +227,16 @@ class Realtime:
         # A loss after the last writer guard still knows which session to pause.
         self._starting_session = session
 
-    def resolve_start(self, session: str, committed: bool) -> None:
+    def resolve_start(self, session: str, committed: bool, *, uncertain: bool = False) -> None:
         if self._starting_session != session:
             return
+        if uncertain:
+            self._revoke("StorageUnavailable")
         self._starting_session = None
         if committed and self._lease is not None:
             self._lease.session = session
             self._lease.setup_handoff = True
-        if not committed and self._pause_required_for == session:
+        if not committed and not uncertain and self._pause_required_for == session:
             self._pause_required_for = None
 
     def suspend_search(self, session: str) -> None:
@@ -464,7 +465,7 @@ class Realtime:
 
     def _envelope(self, kind: EventKind, payload: object) -> bytes:
         session = (payload.get("session") if kind == "session_changed" and isinstance(payload, dict)
-                   else self._projection.get("active_session") if self._projection and kind == "snapshot" else None)
+                   else self._projection.get("active_session") if self._projection and kind in ("snapshot", "recovery_changed") else None)
         return canonical_json({
             "protocol_version": 1, "backend_boot_id": self.boot, "event_seq": self.sequence,
             "session_id": session["id"] if isinstance(session, dict) else None,
@@ -509,9 +510,9 @@ class Realtime:
     async def _refresh_projection(self) -> Projection | None:
         # The caller holds _projection_lock for the read, commit and initial subscription.
         for _ in range(3):
-            revision = self._removal_revision
+            revision = self._projection_revision
             next_state = await self.project()
-            if revision == self._removal_revision:
+            if revision == self._projection_revision:
                 break
         else:
             return None
@@ -563,13 +564,6 @@ class Realtime:
         if before["operations"] != next_state["operations"] or before["failures"] != next_state["failures"]:
             if not self._closed:
                 self._publish_snapshot()
-        events, self._session_events = self._session_events, {}
-        for session_id, (changed, operation) in events.items():
-            if changed == next_state["active_session"] or (
-                changed["state"] == "Ended" and next_state["session_id"] is None
-            ):
-                self._publish("session_changed", {"session": changed, "operation": operation,
-                                                  "runtime": self._runtime(next_state)})
         return next_state
 
     def effective_state(self, state: str | None) -> str:
@@ -583,42 +577,73 @@ class Realtime:
             self._projection["failures"] = [failure]
             self._publish("recovery_changed", {"failures": [failure], "runtime": self._runtime(self._projection)})
 
-    def operation_changed(self, session_id: str, operation: Projection, session: Projection | None = None) -> None:
-        if self._projection is None:
-            return
-        self._removal_revision += 1
+    @staticmethod
+    def _project_operation(state: Projection, operation: Projection) -> bool:
         identity = operation["action_id"], operation["request_id"]
-        operations = [entry for entry in cast(list[Projection], self._projection["operations"])
+        operations = [entry for entry in cast(list[Projection], state["operations"])
                       if (entry["action_id"], entry["request_id"]) != identity]
         operations.append(operation)
         pending = [entry for entry in operations if entry["persistence"] == "Pending"]
         completed = [entry for entry in operations if entry["persistence"] != "Pending"]
-        current = self._projection.get("active_session")
-        runtime = cast(Projection, self._projection["runtime"])
-        runtime["persistence_pending"] = bool(pending)
-        self._projection["operations"] = pending + completed[-64:]
-        if session is None:
-            if isinstance(current, dict) and current["id"] == session_id:
-                if operation["persistence"] == "Failed" and cast(Projection, operation["error"])["code"] == "STORAGE_UNAVAILABLE":
-                    retention = cast(Projection, self._projection["retention"])
-                    self._publish("storage_fault", {
-                        "code": "STORAGE_UNAVAILABLE", "message": "The search could not be saved.",
-                        "operation": operation, "blocked_capabilities": ["Register", "Start", "Resume", "Review", "RetentionChange"],
-                        "deletion": retention["deletion"], "runtime": self._runtime(self._projection),
-                    })
-                else:
-                    self._publish("session_changed", {"session": current, "operation": operation,
-                                                      "runtime": self._runtime(self._projection)})
-            else:
-                self._publish_snapshot()
+        state["operations"] = pending + completed[-64:]
+        return bool(pending)
+
+    def operation_changed(self, session_id: str, operation: Projection) -> None:
+        if self._projection is None:
             return
-        # A fresh owner projection must precede a typed Start or terminal event.
-        self._session_events[session_id] = (session, operation)
+        self._projection_revision += 1
+        current = self._projection["active_session"]
+        runtime = cast(Projection, self._projection["runtime"])
+        runtime["persistence_pending"] = self._project_operation(self._projection, operation)
+        if isinstance(current, dict) and current["id"] == session_id:
+            error = operation["error"]
+            if isinstance(error, dict) and error["code"] == "STORAGE_UNAVAILABLE":
+                retention = cast(Projection, self._projection["retention"])
+                self._publish("storage_fault", {
+                    "code": "STORAGE_UNAVAILABLE", "message": "The search could not be saved.",
+                    "operation": operation, "blocked_capabilities": ["Register", "Start", "Resume", "Review", "RetentionChange"],
+                    "deletion": retention["deletion"], "runtime": self._runtime(self._projection),
+                })
+            else:
+                self._publish("session_changed", {"session": current, "operation": operation,
+                                                  "runtime": self._runtime(self._projection)})
+        else:
+            self._publish_snapshot()
+
+    def publish_search_commit(
+        self, session: Projection, operation: Projection | None, target: Projection | None, pending: bool,
+    ) -> None:
+        self.search_committed(session)
+        state = self._projection
+        if state is None:
+            return
+        self._projection_revision += 1
+        ended = session["state"] == "Ended"
+        target = target or cast(Projection | None, state["active_object"])
+        if not ended and (target is None or target["id"] != session["object_id"]):
+            # Receipt recovery can establish the commit before an eligible owner projection is available.
+            return
+        if operation is not None:
+            self._project_operation(state, operation)
+        state.update(active_session=None if ended else session, active_object=None if ended else target,
+                     session_id=None if ended else session["id"],
+                     failures=[self.failure] if self.failure and not ended else [])
+        runtime = cast(Projection, state["runtime"])
+        runtime.update(effective_session_state=None if ended else session["state"], persistence_pending=pending)
+        retention = cast(Projection, state["retention"])
+        retention.update(active_object_expires_at_ms=target["expires_at_ms"] if target and not ended else None,
+                         active_object_grace=bool(target and not ended and target["retention_grace"]))
+        if self._pause_required_for == session["id"] and session["state"] == "Paused":
+            self._pause_required_for = None
+        # The full projection introduces a new owner or lease generation before the typed completion.
+        self._publish_snapshot()
+        self._publish("session_changed", {"session": session, "operation": operation, "runtime": self._runtime(state)})
 
     def _runtime(self, state: Projection) -> Projection:
         runtime = {**cast(Projection, state["runtime"]), "control_generation": self._generation}
         if self._pause_required_for == state["session_id"] and runtime["effective_session_state"] == "Searching":
             runtime["effective_session_state"] = "Paused"
+            runtime["persistence_pending"] = True
         return runtime
 
     def _public_snapshot(self, projection: Projection, client: str | None) -> Projection:
@@ -762,9 +787,8 @@ class Realtime:
     def object_removed(self, owner: str) -> None:
         if self._closed or not self.profile:
             return
-        self._removal_revision += 1
+        self._projection_revision += 1
         if self._projection is not None:
-            self._session_events = {key: pair for key, pair in self._session_events.items() if pair[0]["object_id"] != owner}
             if self._projection["session_id"] is not None and (
                 isinstance(active := self._projection["active_session"], dict) and active["object_id"] == owner
             ):

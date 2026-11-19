@@ -476,7 +476,7 @@ class RecordsRuntime:
 
     async def operations(self) -> list[dict[str, object]]:
         await self.prune_terminal()
-        return [operation.payload() for operation, _ in self._pending.values()] + [
+        return [operation.payload() for operation, _ in self._pending.values() if operation.visible] + [
             operation.payload() for operation in self._terminal.values()
         ]
 

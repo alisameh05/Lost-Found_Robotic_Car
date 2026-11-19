@@ -224,7 +224,11 @@ def create_app(
                 outcome["snapshot"] = snapshot
             persistence = job.persistence
             if persistence == "Failed":
-                raise LeaseRejected("STORAGE_UNAVAILABLE", permission_revoked=True, snapshot=snapshot)
+                assert job.error is not None
+                return JSONResponse({
+                    **job.error, "permission_revoked": True,
+                    **({"snapshot": snapshot} if snapshot is not None else {}),
+                }, status_code=503)
             return JSONResponse(outcome, status_code=202 if persistence == "Pending" else 200)
         except LeaseRejected as failure:
             status, message, retryable = LEASE_ERRORS[failure.reason]

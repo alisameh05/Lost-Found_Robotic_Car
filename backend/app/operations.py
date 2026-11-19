@@ -19,6 +19,7 @@ class Operation:
     retention_client: str | None = None
     request_id: str | None = None
     slot: str = "ordinary"
+    visible: bool = True
 
     def payload(self) -> dict[str, object]:
         data: dict[str, object] = json.loads(self.response.body)

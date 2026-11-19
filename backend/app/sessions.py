@@ -30,6 +30,7 @@ class SafetySave:
     task: asyncio.Task[Receipt] | None = None
     persistence: str = "Pending"
     error: dict[str, object] | None = None
+    terminal_won: bool = False
 
 
 class SessionCoordinator:
@@ -42,6 +43,7 @@ class SessionCoordinator:
         self.emergency_fallback: asyncio.TimerHandle | None = None
         self._safety_occupied = False
         self._emergency_occupied = False
+        self._deferred_pause: str | None = None
 
     async def action(self, request: SearchRequest) -> Receipt:
         runtime = self.runtime
@@ -112,6 +114,7 @@ class SessionCoordinator:
             asyncio.run_coroutine_threadsafe(authorize(final), loop).result()
 
         saved: SavedSearch | None = None
+        uncertain = False
         try:
             async with runtime._save:
                 saved = await asyncio.to_thread(
@@ -123,19 +126,23 @@ class SessionCoordinator:
             response = mutation(request.action_id, "Failed", error.status, error)
         except (OSError, sqlite3.Error):
             try:
-                existing, _ = await asyncio.to_thread(inspect_search, runtime.storage, request, operation.fingerprint)
+                existing, owner = await asyncio.to_thread(inspect_search, runtime.storage, request, operation.fingerprint)
             except (OSError, sqlite3.Error, HttpError):
                 # Without a readable receipt the caller must reconcile by repeating the identical request.
+                uncertain = True
                 unknown = HttpError(503, "STORAGE_UNAVAILABLE", "The search save outcome is unconfirmed.", True)
                 return Receipt(bytes(unknown.response(action_id=request.action_id).body).decode(), unknown.status, None)
             unavailable = storage_unavailable()
             response = existing or mutation(request.action_id, "Failed", unavailable.status, unavailable)
+            if existing:
+                recovered = json.loads(existing.body)["result"]["session"]
+                saved = SavedSearch(recovered, owner, removed=recovered is None, receipt=existing)
         finally:
             runtime._pending.pop(request.action_id, None)
             if request.mode:
-                self.realtime.resolve_start(session, saved is not None and saved.session is not None)
+                self.realtime.resolve_start(session, saved is not None and saved.session is not None, uncertain=uncertain)
             else:
-                self._safety_occupied = False
+                self.safety_slot_released()
 
         complete = replace(operation, response=response)
         if request.action == "stop" and response.status == 200:
@@ -146,19 +153,40 @@ class SessionCoordinator:
         else:
             runtime.publish_terminal(request.action_id, complete)
             if saved and saved.session:
-                self.realtime.search_committed(saved.session)
-            self.realtime.operation_changed(session, complete.payload(), saved.session if saved else None)
+                self.realtime.publish_search_commit(saved.session, complete.payload(), saved.target, bool(runtime._pending))
+            else:
+                self.realtime.operation_changed(session, complete.payload())
         return response
 
     def revoked(self, revocation: Revocation) -> None:
         if revocation.session is None or revocation.reason in ("EmergencyStop", "SessionEnded"):
             return
+        if self._safety_occupied:
+            # A user action can lose its lease at the writer guard. Remember the
+            # active pause obligation without admitting a second pending operation.
+            self._deferred_pause = revocation.session
+            if revocation.request_id is None:
+                return
         request = revocation.request_id or str(uuid4())
-        job = self.begin_pause(request, revocation.session)
+        job = self.begin_pause(request, revocation.session, visible=revocation.request_id is not None)
         if revocation.request_id and self.realtime.lease_request_used(request):
             self.release_results[request] = job
 
-    def begin_pause(self, request: str, session: str, failure: str | None = None) -> SafetySave:
+    def safety_slot_released(self) -> None:
+        self._safety_occupied = False
+        if self._deferred_pause is not None:
+            asyncio.get_running_loop().call_soon(self.save_deferred_pause)
+
+    def save_deferred_pause(self) -> None:
+        if self._safety_occupied:
+            return
+        session, self._deferred_pause = self._deferred_pause, None
+        if session is not None and self.realtime.safety_session == session and not self.runtime._stopping:
+            self.begin_pause(str(uuid4()), session, visible=False)
+
+    def begin_pause(
+        self, request: str, session: str, failure: str | None = None, *, visible: bool = True,
+    ) -> SafetySave:
         runtime = self.runtime
         if self.emergency_fallback is not None and failure:
             self.emergency_fallback.cancel()
@@ -177,11 +205,12 @@ class SessionCoordinator:
             else:
                 self._safety_occupied = True
             operation = Operation("", mutation(request, "Pending", 202), owner,
-                                  request_id=request, slot=slot)
+                                  request_id=request, slot=slot, visible=visible)
             key = "request:" + request
             job.task = asyncio.create_task(self.finish_pause(key, operation, job))
             runtime._pending[key] = (operation, job.task)
-            self.realtime.operation_changed(session, operation.payload())
+            if visible:
+                self.realtime.operation_changed(session, operation.payload())
         return job
 
     async def finish_pause(self, key: str, operation: "Operation", job: SafetySave) -> Receipt:
@@ -206,18 +235,20 @@ class SessionCoordinator:
             if job.failure:
                 self._emergency_occupied = False
             else:
-                self._safety_occupied = False
+                self.safety_slot_released()
         job.persistence = "Committed" if saved is not None else "Failed"
+        job.terminal_won = saved is not None and saved.session is None
         job.error = json.loads(receipt.body)["error"] if saved is None else None
         job.task = None
         complete = replace(operation, response=receipt)
-        if saved and saved.owner:
+        if saved and saved.owner and saved.session:
             job.owner = saved.owner
-            runtime.publish_terminal(key, complete)
-            if saved.session:
-                self.realtime.search_committed(saved.session)
-            self.realtime.operation_changed(job.session, complete.payload(), saved.session)
-        elif saved is None:
+            if operation.visible:
+                runtime.publish_terminal(key, complete)
+            self.realtime.publish_search_commit(
+                saved.session, complete.payload() if operation.visible else None, None, bool(runtime._pending),
+            )
+        elif saved is None and operation.visible:
             runtime.publish_terminal(key, complete)
             self.realtime.operation_changed(job.session, complete.payload())
         return receipt
@@ -266,8 +297,18 @@ class SessionCoordinator:
             raise HttpError(409, "REQUEST_ID_CONFLICT", "This runtime request ID was already used.")
         if previous is None:
             if self.realtime.request_at_capacity():
-                self.persist_emergency(str(uuid4()), session)
-                raise HttpError(503, "CAPACITY_REACHED", "Emergency request capacity is occupied.")
+                if self.emergency_fallback:
+                    self.emergency_fallback.cancel()
+                    self.emergency_fallback = None
+                failure = self.realtime.failure
+                return 503, {
+                    "request_id": request, "backend_boot_id": self.runtime.boot_id, "permission_revoked": True,
+                    "session_id": session,
+                    "failure_id": failure["failure_id"] if failure and failure["session_id"] == session else None,
+                    "persistence": "Failed",
+                    "error": {"code": "CAPACITY_REACHED", "message": "Emergency request capacity is occupied.",
+                              "retryable": False},
+                }
             self.realtime.emergency_requests.add(request)
             job = self.persist_emergency(request, session)
             self.emergency_results[request] = (client, job)
@@ -277,13 +318,13 @@ class SessionCoordinator:
                 self.persist_emergency(str(uuid4()), session)
         await self.wait_for_save(job)
         eligible = job is not None and job.session == self.realtime.safety_session
-        if job is not None and job.owner is not None and not eligible:
+        if job is not None and not job.terminal_won and job.owner is not None and not eligible:
             eligible = job.owner in await asyncio.to_thread(self.runtime.storage.eligible_owners, {job.owner})
         persistence = job.persistence if job else "Committed"
         error = job.error if job else None
         return {"Pending": 202, "Committed": 200, "Failed": 503}[persistence], {
             "request_id": request, "backend_boot_id": self.runtime.boot_id, "permission_revoked": True,
-            "session_id": job.session if job and eligible else None,
-            "failure_id": job.failure if job and eligible else None,
+            "session_id": job.session if job and eligible and not job.terminal_won else None,
+            "failure_id": job.failure if job and eligible and not job.terminal_won else None,
             "persistence": persistence, "error": error,
         }

@@ -908,6 +908,19 @@ def test_saved_search_lifecycle_and_historical_retry(tmp_path: Path) -> None:
             current = laf.http.get(API + "/objects/" + target["id"], headers=headers).json()
             assert current["revision"] == target["revision"] and current["status"] == "Lost"
 
+            completions, last_sequence = [], None
+            while len(completions) < 4:
+                update = event(events)
+                if last_sequence is not None:
+                    assert update["event_seq"] == last_sequence + 1
+                last_sequence = update["event_seq"]
+                operation = update["payload"].get("operation")
+                if update["type"] == "session_changed" and operation and operation["persistence"] == "Committed":
+                    assert update["session_id"] == session["id"]
+                    completions.append((operation["action_id"], update["session_revision"]))
+            assert completions == [(response.json()["action_id"], revision) for response, revision in
+                                   zip((created, paused, noop, ended), (1, 2, 2, 3), strict=True)]
+
 
 @contextmanager
 def ready_search(laf: Loopback) -> Iterator[tuple[dict, dict, ClientConnection, ClientConnection]]:
@@ -948,10 +961,27 @@ def test_emergency_revokes_while_an_ordinary_writer_is_blocked(tmp_path: Path) -
         try:
             busy = submit(laf.http, headers, wait=False)
             assert busy.status_code == 202 and entered.is_set()
-            malformed = laf.http.post(path, headers={**headers, "Content-Type": "application/json"}, content=b"{")
-            assert malformed.status_code == 400 and malformed.json()["permission_revoked"]
-            emergency = {"request_id": str(uuid4())}
-            reply = laf.http.post(path, headers=headers, json=emergency)
+            body_started, end_body = Event(), Event()
+
+            def stalled_body() -> Iterator[bytes]:
+                yield b"{"
+                body_started.set()
+                assert end_body.wait(4)
+
+            with ThreadPoolExecutor(max_workers=1) as pool:
+                rejected = pool.submit(laf.http.post, path, headers={**headers, "Content-Type": "application/json"},
+                                       content=stalled_body())
+                try:
+                    assert body_started.wait(2)
+                    stopped = wait_for(laf.http, "/snapshot", headers, lambda s: s["lease"]["state"] == "Unowned")
+                    assert stopped["runtime"]["effective_session_state"] == "Paused"
+                    assert not rejected.done()
+                    emergency = {"request_id": str(uuid4())}
+                    reply = laf.http.post(path, headers=headers, json=emergency)
+                finally:
+                    end_body.set()
+                malformed = rejected.result()
+                assert malformed.status_code == 400 and malformed.json()["permission_revoked"]
             assert reply.status_code == 202, reply.text
             validate("EmergencyStopResponse", reply.json())
             snapshot = laf.http.get(API + "/snapshot", headers=headers).json()
@@ -1027,7 +1057,7 @@ def test_failed_pause_retains_effective_stop_and_retries_same_request(tmp_path: 
         snapshot = laf.http.get(API + "/snapshot", headers=headers).json()
         assert snapshot["active_session"] == session
         assert snapshot["runtime"]["effective_session_state"] == "Paused"
-        assert not snapshot["runtime"]["persistence_pending"]
+        assert snapshot["runtime"]["persistence_pending"]
         fail = False
         retry = laf.http.post(path, headers=headers, json=action)
         assert retry.status_code == 200 and retry.json()["result"]["session"]["revision"] == 2
@@ -1106,5 +1136,36 @@ def test_release_failure_keeps_stop_in_effect(tmp_path: Path) -> None:
             snapshot = failed.json()["snapshot"]
             assert snapshot["active_session"]["state"] == "Searching"
             assert snapshot["runtime"]["effective_session_state"] == "Paused"
-            assert not snapshot["runtime"]["persistence_pending"]
+            assert snapshot["runtime"]["persistence_pending"]
             assert snapshot["lease"]["state"] == "Unowned"
+
+
+def test_owner_loss_pauses_after_a_pending_pause_loses_its_lease(tmp_path: Path) -> None:
+    entered, unblock = Event(), Event()
+
+    def checkpoint(point: str) -> None:
+        if point == "before_pause_commit":
+            entered.set()
+            assert unblock.wait(5)
+
+    with service(tmp_path, checkpoint=checkpoint) as laf, ready_search(laf) as (owner, start, events, _):
+        headers = auth(owner)
+        created = laf.http.post(API + "/sessions", headers=headers, json=start)
+        session = created.json()["result"]["session"]
+        path = created.headers["Location"] + "/actions"
+        action = {"action_id": str(uuid4()), "session_id": session["id"], "action": "pause",
+                  "expected_revision": 1, "client_id": owner["client_id"], "client_lease_id": start["client_lease_id"]}
+        try:
+            pending = laf.http.post(path, headers=headers, json=action)
+            assert pending.status_code == 202 and entered.is_set()
+            conflict = laf.http.post(path, headers=headers, json={**action, "action_id": str(uuid4()), "action": "stop"})
+            assert conflict.status_code == 503 and conflict.json()["code"] == "CAPACITY_REACHED"
+            assert conflict.json()["permission_revoked"]
+            events.close()
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["lease"]["state"] == "Unowned")
+        finally:
+            unblock.set()
+        snapshot = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+        assert snapshot["runtime"]["effective_session_state"] == "Paused"
+        assert snapshot["active_session"]["revision"] == 2
+        assert not snapshot["runtime"]["persistence_pending"]

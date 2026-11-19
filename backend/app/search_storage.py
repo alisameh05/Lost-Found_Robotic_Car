@@ -31,6 +31,7 @@ class SavedSearch:
     owner: str | None
     removed: bool = False
     receipt: Receipt | None = None
+    target: Payload | None = None
 
 
 def search_record(db: sqlite3.Connection, request: SearchRequest, now: int, days: int) -> sqlite3.Row:
@@ -111,13 +112,15 @@ def save_search(
             verify_transition(row, request)
             authorize(False)
             match = None
+            target = None
             if request.mode:
                 inspection = storage._inspect(db, now, preparing)
                 if inspection.problem:
                     raise storage_unavailable(inspection.problem)
                 if not clock_valid:
                     raise HttpError(503, "NOT_READY", "The local clock is unavailable.", True)
-                media = storage.object_payload(row, days, now)["reference_media"]
+                target = storage.object_payload(row, days, now)
+                media = target["reference_media"]
                 if not isinstance(media, dict) or media["availability"] != "Available":
                     raise HttpError(503, "MEDIA_UNAVAILABLE", "The target reference is unavailable.")
                 db.execute("""
@@ -161,7 +164,7 @@ def save_search(
             """, (request.action_id, owner, session_id, request.action, fingerprint, saved["revision"],
                   now, receipt.status, receipt.body, receipt.location))
             storage.persist_clock(db, now)
-            return SavedSearch(None if removed else session, owner, removed, receipt)
+            return SavedSearch(None if removed else session, owner, removed, receipt, target)
         finally:
             db.row_factory = None
 

@@ -164,6 +164,9 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     (lease.can_acquire || !!workspace.retryAcquisition);
   const canLeavePaused = session.state === "Paused" && state === "Paused" && !effective.persistence_pending;
   const waitingToLeave = leaving && (unresolved(pause) || canLeavePaused);
+  const saving = recordsMode
+    ? snapshot.operations.some(({ persistence }) => persistence === "Pending")
+    : effective.persistence_pending;
   const unsavedEmergency = failures.some(({ cause, failure_id }) => cause === "EmergencyStop" &&
     !session.pause_causes.some((pauseCause) => pauseCause.failure_id === failure_id));
   const requiredUnavailable = readiness.components.filter(({ component, status }) => status !== "Ready" &&
@@ -176,8 +179,8 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     requiredUnavailable.length > 0 && `Required paths unavailable: ${requiredUnavailable.map(({ component }) => devicePaths[component].label).join(", ")}.`,
     failures.some(({ restored }) => !restored) && "Restore the failed paths.",
     failures.some(({ acknowledged }) => !acknowledged) && "Acknowledge each outstanding failure.",
-    effective.persistence_pending && "Wait for the pending save.",
-    session.state !== "Paused" && state === "Paused" && !effective.persistence_pending && "Save the pause before resuming.",
+    saving && "Wait for the pending save.",
+    session.state !== "Paused" && state === "Paused" && !saving && "Save the pause before resuming.",
     recordsMode && "Resume and recovery actions are unavailable in this simulation.",
     candidate && "Complete the pending match review.",
     !candidate && snapshot.pending_candidate && "Wait for the current candidate review to become available.",
@@ -279,7 +282,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
           <p>Search accepted · <RecordTime value={session.started_at_ms} compact /></p>
           <p>Committed session · {session.state}</p>
           {effective.persistence_pending && <p>Session save pending</p>}
-          {unsavedEmergency && !effective.persistence_pending && <p>Emergency pause save failed. Retry Emergency Stop to save it.</p>}
+          {unsavedEmergency && !saving && <p>Emergency pause save failed. Retry Emergency Stop to save it.</p>}
         </section>
         <section aria-label="Control ownership">
           <h2>Control ownership</h2>
