@@ -3,6 +3,7 @@
 import re
 from dataclasses import dataclass
 from hashlib import sha256
+from typing import Literal
 
 from fastapi import Request
 
@@ -12,6 +13,11 @@ from .registration_input import SAFE_INTEGER, canonical_json
 TOKEN = re.compile(r"[A-Za-z0-9_-]{43}")
 MAX_RUNTIME_RECEIPTS = 8192
 MAX_ISSUED_FRAMES = 128
+LeaseFailure = Literal[
+    "CLIENT_INVALID", "LEASE_EXPIRED", "LEASE_REQUIRED", "LEASE_OWNED", "OWNERSHIP_MISMATCH",
+    "REQUEST_ID_CONFLICT", "INVALID_TRANSITION", "NOT_READY", "CAPACITY_REACHED", "COUNTER_EXHAUSTED",
+    "STORAGE_UNAVAILABLE",
+]
 
 
 def domain_id(value: object) -> bool:
@@ -93,8 +99,11 @@ class LeaseReceipt:
     owner: str | None
     secret: str | None
     can_acquire: bool = False
+    failure: LeaseFailure | None = None
 
     def outcome(self, request_id: str, snapshot: dict[str, object]) -> dict[str, object]:
+        if self.failure is not None:
+            raise LeaseRejected(self.failure, permission_revoked=True, snapshot=snapshot)
         return {
             "request_id": request_id, "client_lease_id": self.secret, "control_generation": self.generation,
             "lease": public_lease(self.owner, self.generation, self.can_acquire), "snapshot": snapshot,
@@ -113,5 +122,10 @@ HEARTBEAT_FIELDS = {
 WORKSPACE_FLAGS = ("workspace_visible", "workspace_focused", "workspace_operational")
 
 
-class ReleaseCapacityReached(HttpError):
-    """The authority was revoked even though the boot receipt store was full."""
+class LeaseRejected(Exception):
+    def __init__(self, reason: LeaseFailure, *, permission_revoked: bool = False,
+                 snapshot: dict[str, object] | None = None):
+        super().__init__(reason)
+        self.reason = reason
+        self.permission_revoked = permission_revoked
+        self.snapshot = snapshot

@@ -8,7 +8,7 @@ from fastapi.responses import JSONResponse, Response
 from PIL import Image
 
 from .config import Config
-from .control import ReleaseCapacityReached, Revocation, parse_lease
+from .control import LeaseFailure, LeaseRejected, Revocation, parse_lease
 from .http import (
     API_PREFIX,
     CLIENT_ROUTES,
@@ -41,6 +41,20 @@ PAGE_ERRORS = {
     "scope_mismatch": (400, "CURSOR_INVALID", "Refresh the first page or use the original page context.", False),
     "capacity": (503, "CAPACITY_REACHED", "Page capacity reached. Retry after pending reads complete.", True),
     "client_expired": (403, "CLIENT_INVALID", "Reconnect to obtain a current page identity.", False),
+}
+
+LEASE_ERRORS: dict[LeaseFailure, tuple[int, str, bool]] = {
+    "CLIENT_INVALID": (403, "Reconnect to obtain a current page identity.", False),
+    "LEASE_EXPIRED": (403, "The control lease is no longer current.", False),
+    "LEASE_REQUIRED": (403, "Release requires the current private control lease.", False),
+    "LEASE_OWNED": (403, "Control is already held.", False),
+    "OWNERSHIP_MISMATCH": (409, "The active search changed.", False),
+    "REQUEST_ID_CONFLICT": (409, "This runtime request ID was already used.", False),
+    "INVALID_TRANSITION": (409, "Confirm takeover to acquire available control.", False),
+    "NOT_READY": (503, "Synchronize the current search workspace and try again.", True),
+    "CAPACITY_REACHED": (503, "Control request capacity reached. Restart the disarmed service.", False),
+    "COUNTER_EXHAUSTED": (503, "Restart the disarmed service before acquiring again.", False),
+    "STORAGE_UNAVAILABLE": (503, "Control was released. The active search pause could not be saved.", False),
 }
 
 
@@ -199,8 +213,15 @@ def create_app(
         parsed = await parse_lease(request, release=route_path(request) == "/control-lease/release")
         try:
             return JSONResponse(await runtime.realtime.change_lease(parsed))
-        except ReleaseCapacityReached as error:
-            return error.response(permission_revoked=True)
+        except LeaseRejected as failure:
+            status, message, retryable = LEASE_ERRORS[failure.reason]
+            error = HttpError(status, failure.reason, message, retryable)
+            details: dict[str, object] = {}
+            if failure.permission_revoked:
+                details["permission_revoked"] = True
+            if failure.snapshot is not None:
+                details["snapshot"] = failure.snapshot
+            return error.response(**details)
 
     @app.websocket(API_PREFIX + "/events")
     @app.websocket(API_PREFIX + "/video/robot")
@@ -269,7 +290,10 @@ def create_app(
         if storage.problem or storage.settings is None:
             error = HttpError(503, "STORAGE_UNAVAILABLE", storage.problem or "Records storage is unavailable.", True)
             if storage.cleanup_pending and storage.settings:
-                return error.response(snapshot=await runtime.snapshot(storage))
+                state = (await runtime.realtime.snapshot(request.headers.get("x-app-client-id"))
+                         if runtime.realtime and runtime.realtime.profile else await runtime.snapshot(storage))
+                if state is not None:
+                    return error.response(snapshot=state)
             return error.response()
         if request.scope["path"] == API_PREFIX + "/settings":
             return JSONResponse(storage.settings)

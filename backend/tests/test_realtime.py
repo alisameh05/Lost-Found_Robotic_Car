@@ -451,8 +451,11 @@ def test_only_current_owner_display_and_fresh_selected_input_make_start_eligible
             events.send(json.dumps(heartbeat(owner, lease, 2, frame(video)[0])))
             no_target = wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "DisplayedRobotVideo") == "Ready")
             assert no_target["readiness"]["can_start"] == {"Gestures": False, "Controller": False}
+            events.send(json.dumps(heartbeat(owner, lease, 3, workspace_operational=False)))
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["lease"]["state"] == "Unowned")
             assert submit(laf.http, headers).status_code == 201
-            events.send(json.dumps(heartbeat(owner, lease, 3, frame(video)[0])))
+            lease = acquire_control(laf, owner, takeover=True)
+            events.send(json.dumps(heartbeat(owner, lease, 1, frame(video)[0])))
             ready = wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_start"]["Controller"])
             assert ready["readiness"]["can_start"] == {"Gestures": False, "Controller": True}
             assert ready["active_session"] is None and ready["runtime"]["motion_permission"] == "Disarmed"
@@ -462,14 +465,14 @@ def test_only_current_owner_display_and_fresh_selected_input_make_start_eligible
             assert status(spectator_state, "DisplayedRobotVideo") == "Unavailable"
             laf.observations.webcam = True
             laf.observations.controller_sample = False
-            events.send(json.dumps(heartbeat(owner, lease, 4, frame(video)[0])))
+            events.send(json.dumps(heartbeat(owner, lease, 2, frame(video)[0])))
             selected = wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_start"]["Gestures"])
             assert selected["readiness"]["can_start"] == {"Gestures": True, "Controller": False}
             laf.observations.gesture_sample = False
-            events.send(json.dumps(heartbeat(owner, lease, 5, frame(video)[0])))
+            events.send(json.dumps(heartbeat(owner, lease, 3, frame(video)[0])))
             unavailable = wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "Webcam") == "Unavailable")
             assert unavailable["readiness"]["can_start"] == {"Gestures": False, "Controller": False}
-            events.send(json.dumps(heartbeat(owner, lease, 6, workspace_focused=False)))
+            events.send(json.dumps(heartbeat(owner, lease, 4, workspace_focused=False)))
             ended = wait_for(laf.http, "/snapshot", headers, lambda s: s["lease"]["state"] == "Unowned")
             assert ended["lease"]["control_generation"] > lease["control_generation"]
             assert status(ended, "DisplayedRobotVideo") == "Unavailable"
@@ -614,11 +617,12 @@ def test_unusable_robot_observation_revokes_even_with_old_display(tmp_path: Path
             assert status(snapshot, "DisplayedRobotVideo") == "Unavailable"
 
 
+@pytest.mark.parametrize("capacity", [1, 2])
 def test_acquire_race_and_runtime_capacity_preserve_owner_and_receipts(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, capacity: int,
 ) -> None:
     assert realtime.MAX_RUNTIME_RECEIPTS == 8192
-    monkeypatch.setattr(realtime, "MAX_RUNTIME_RECEIPTS", 1)
+    monkeypatch.setattr(realtime, "MAX_RUNTIME_RECEIPTS", capacity)
     with service(tmp_path) as laf:
         first, second = laf.bootstrap(), laf.bootstrap()
         wait_for(laf.http, "/health", auth(first))
@@ -646,9 +650,21 @@ def test_acquire_race_and_runtime_capacity_preserve_owner_and_receipts(
                 "request_id": str(uuid4()), "client_id": clients[winner]["client_id"], "session_id": None,
                 "client_lease_id": lease["client_lease_id"], "control_generation": lease["control_generation"],
             })
-            assert (result.status_code, result.json()["code"], result.json()["permission_revoked"]) == (
-                503, "CAPACITY_REACHED", True,
-            )
+            if capacity == 1:
+                assert (result.status_code, result.json()["code"], result.json()["permission_revoked"]) == (
+                    503, "CAPACITY_REACHED", True,
+                )
+            else:
+                assert result.status_code == 200
+                assert not result.json()["lease"]["can_acquire"]
+            spectator = (first_socket, second_socket)[1 - winner]
+            while True:
+                update = event(spectator)
+                if (update["type"] == "snapshot"
+                        and update["payload"]["lease"]["control_generation"] > lease["control_generation"]):
+                    break
+            assert update["payload"]["lease"]["state"] == "Unowned"
+            assert not update["payload"]["lease"]["can_acquire"]
             attempt = laf.http.post(path, headers=headers, json=acquire_body(clients[winner], takeover=True))
             assert (attempt.status_code, attempt.json()["code"]) == (503, "CAPACITY_REACHED")
             replay = laf.http.post(path, headers=headers, json=requests[winner]).json()
@@ -703,10 +719,30 @@ def test_current_active_session_requires_matching_identity_and_takeover(tmp_path
             response = laf.http.post(path + "/release", headers=headers, json={**release, "session_id": None})
             assert response.json()["code"] == "OWNERSHIP_MISMATCH"
             response = laf.http.post(path + "/release", headers=headers, json=release)
-            assert response.status_code == 200
-            assert response.json()["snapshot"]["readiness"]["can_start"] == {"Gestures": False, "Controller": False}
-            assert revocations == [Revocation(owner["client_id"], "active", response.json()["control_generation"],
+            assert (response.status_code, response.json()["code"], response.json()["permission_revoked"]) == (
+                503, "STORAGE_UNAVAILABLE", True,
+            )
+            snapshot = response.json()["snapshot"]
+            assert snapshot["readiness"]["can_start"] == {"Gestures": False, "Controller": False}
+            assert snapshot["lease"]["state"] == "Unowned"
+            assert snapshot["active_session"]["state"] == "Searching"
+            assert snapshot["runtime"]["effective_session_state"] == "Paused"
+            assert snapshot["runtime"]["motion_permission"] == "Disarmed"
+            assert snapshot["runtime"]["persistence_pending"]
+            retry = laf.http.post(path + "/release", headers=headers, json=release)
+            assert (retry.status_code, retry.json()["code"], retry.json()["permission_revoked"]) == (
+                503, "STORAGE_UNAVAILABLE", True,
+            )
+            assert revocations == [Revocation(owner["client_id"], "active", snapshot["runtime"]["control_generation"],
                                              "Released", release["request_id"])]
+            wait_for(laf.http, "/health", headers, lambda health: status(health, "Controller") == "Ready")
+            acquired = laf.http.post(path, headers=headers, json={**body, "request_id": str(uuid4()), "takeover": True})
+            assert acquired.status_code == 200
+            laf.observations.controller_sample = False
+            unavailable = wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "Controller") == "Unavailable")
+            assert unavailable["lease"]["state"] == "Unowned"
+            assert revocations[-1] == Revocation(owner["client_id"], "active", unavailable["runtime"]["control_generation"],
+                                                 "RequiredPathUnavailable", None)
 
 
 def test_video_freshness_dimensions_and_independent_channels(tmp_path: Path) -> None:

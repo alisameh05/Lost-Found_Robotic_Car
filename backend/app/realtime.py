@@ -24,8 +24,8 @@ from .control import (
     WORKSPACE_FLAGS,
     Lease,
     LeaseReceipt,
+    LeaseRejected,
     LeaseRequest,
-    ReleaseCapacityReached,
     Revocation,
     counter,
     domain_id,
@@ -159,6 +159,7 @@ class Realtime:
         self._input_deadlines: dict[str, float] = {}
         self._generation = 1
         self._lease: Lease | None = None
+        self._pause_required_for: str | None = None
         self._receipts: dict[str, LeaseReceipt] = {}
         self._projection: Projection | None = None
         self._projection_lock = asyncio.Lock()
@@ -187,6 +188,8 @@ class Realtime:
         if lease is None:
             return
         self._advance_generation()
+        if lease.session is not None:
+            self._pause_required_for = lease.session
         self.on_control_revoked(Revocation(lease.client, lease.session, self._generation, reason, request_id))
         self._publish_snapshot()
 
@@ -211,26 +214,25 @@ class Realtime:
 
     async def change_lease(self, request: LeaseRequest) -> Projection:
         if not self.touch_client(request.client):
-            raise HttpError(403, "CLIENT_INVALID", "Reconnect to obtain a current page identity.")
+            raise LeaseRejected("CLIENT_INVALID")
         profile = self.requires_profile()
         fingerprint = request.fingerprint()
         # Release revokes before waiting for storage. Acquire refreshes current session/record facts first.
         if request.secret is None and request.request_id not in self._receipts:
             if await self.snapshot(request.client) is None:
-                raise HttpError(503, "NOT_READY", "The current snapshot is unavailable. Retry shortly.", True)
+                raise LeaseRejected("NOT_READY")
             if not self.touch_client(request.client):
-                raise HttpError(403, "CLIENT_INVALID", "Reconnect to obtain a current page identity.")
+                raise LeaseRejected("CLIENT_INVALID")
         self._expire_lease(self.monotonic())
         receipt = self._receipts.get(request.request_id)
         if receipt is not None:
             if receipt.fingerprint != fingerprint:
-                raise HttpError(409, "REQUEST_ID_CONFLICT", "This runtime request ID was already used.")
+                raise LeaseRejected("REQUEST_ID_CONFLICT")
         else:
             receipt = self._change_lease(request, fingerprint, profile)
-            self._receipts[request.request_id] = receipt
         snapshot = await self.snapshot(request.client)
         if snapshot is None:
-            raise HttpError(503, "NOT_READY", "The current snapshot is unavailable. Retry shortly.", True)
+            raise LeaseRejected("NOT_READY", permission_revoked=request.secret is not None)
         return receipt.outcome(request.request_id, snapshot)
 
     def _change_lease(self, request: LeaseRequest, fingerprint: bytes,
@@ -238,33 +240,37 @@ class Realtime:
         lease = self._lease
         full = len(self._receipts) >= MAX_RUNTIME_RECEIPTS
         current_session = self._projection.get("session_id") if self._projection else None
-        capacity = "Control request capacity reached. Restart the disarmed service before acquiring again."
         if request.secret is not None:
             if lease is None or request.generation != self._generation:
-                raise HttpError(403, "LEASE_EXPIRED", "The control lease is no longer current.")
+                raise LeaseRejected("LEASE_EXPIRED")
             if lease.client != request.client or not compare_digest(lease.secret, request.secret):
-                raise HttpError(403, "LEASE_REQUIRED", "Release requires the current private control lease.")
+                raise LeaseRejected("LEASE_REQUIRED")
             if request.session != current_session or request.session != lease.session:
-                raise HttpError(409, "OWNERSHIP_MISMATCH", "The active search changed.")
-            self._revoke("Released", request.request_id)
+                raise LeaseRejected("OWNERSHIP_MISMATCH")
             if full:
-                raise ReleaseCapacityReached(503, "CAPACITY_REACHED", capacity)
-            return LeaseReceipt(fingerprint, self._generation, None, None,
-                                self._can_acquire(request.client) and len(self._receipts) + 1 < MAX_RUNTIME_RECEIPTS)
+                self._revoke("Released", request.request_id)
+                raise LeaseRejected("CAPACITY_REACHED", permission_revoked=True)
+            # An active pause needs the following lifecycle slice's durable writer.
+            receipt = LeaseReceipt(fingerprint, self._generation + 1, None, None,
+                                   self._can_acquire(request.client) and len(self._receipts) + 1 < MAX_RUNTIME_RECEIPTS,
+                                   "STORAGE_UNAVAILABLE" if request.session is not None else None)
+            self._receipts[request.request_id] = receipt
+            self._revoke("Released", request.request_id)
+            return receipt
 
         if lease is not None:
-            raise HttpError(403, "LEASE_OWNED", "Control is already held.")
+            raise LeaseRejected("LEASE_OWNED")
         # Leave a generation available to invalidate the authorization on revocation.
         if self._generation >= SAFE_INTEGER - 1:
-            raise HttpError(503, "COUNTER_EXHAUSTED", "Restart the disarmed service before acquiring again.")
+            raise LeaseRejected("COUNTER_EXHAUSTED")
         if not self._projection or not self._can_acquire(request.client):
-            raise HttpError(503, "NOT_READY", "Open a current event connection before acquiring control.", True)
+            raise LeaseRejected("NOT_READY")
         if request.session != current_session:
-            raise HttpError(409, "OWNERSHIP_MISMATCH", "The active search changed.")
+            raise LeaseRejected("OWNERSHIP_MISMATCH")
         if not request.takeover and (self._generation > 1 or current_session is not None):
-            raise HttpError(409, "INVALID_TRANSITION", "Confirm takeover to acquire available control.")
+            raise LeaseRejected("INVALID_TRANSITION")
         if full:
-            raise HttpError(503, "CAPACITY_REACHED", capacity)
+            raise LeaseRejected("CAPACITY_REACHED")
         now = self.monotonic()
         secret = token_urlsafe(32)
         self._advance_generation()
@@ -272,6 +278,7 @@ class Realtime:
                             now + profile.bound("heartbeat_deadline_ms") / 1000,
                             now + profile.bound("display_deadline_ms") / 1000)
         receipt = LeaseReceipt(fingerprint, self._generation, request.client, secret)
+        self._receipts[request.request_id] = receipt
         self._publish_snapshot()
         return receipt
 
@@ -348,9 +355,20 @@ class Realtime:
             self._invalidate_channel(*key)
 
     def _invalidate_channel(self, client: str, channel: Channel) -> None:
-        if self._lease and self._lease.client == client and channel in ("events", "robot-video"):
-            self._revoke("EventConnectionLost" if channel == "events" else "RobotVideoLost")
+        if self._lease and self._lease.client == client:
+            if channel == "events":
+                self._revoke("EventConnectionLost")
+            elif channel == "robot-video":
+                self._revoke("RobotVideoLost")
+            elif channel == "webcam-video" and self._selected_input() == "Webcam":
+                self._revoke("RequiredPathUnavailable")
         self.invalidate(client, channel)
+
+    def _selected_input(self) -> str | None:
+        session = self._projection.get("active_session") if self._projection else None
+        if not self._lease or not isinstance(session, dict) or session["id"] != self._lease.session:
+            return None
+        return "Webcam" if session["control_mode"] == "Gestures" else "Controller"
 
     def _envelope(self, kind: EventKind, payload: object) -> bytes:
         session = self._projection.get("active_session") if self._projection and kind == "snapshot" else None
@@ -414,6 +432,12 @@ class Realtime:
             retention["settings"] = cast(Projection, before["retention"])["settings"]
         next_state["event_seq"] = self.sequence
         self._projection = next_state
+        session = next_state["active_session"]
+        if self._pause_required_for is not None and not next_state["storage_problem"] and (
+            next_state["session_id"] != self._pause_required_for
+            or (isinstance(session, dict) and session["state"] == "Paused")
+        ):
+            self._pause_required_for = None
         if before is None:
             return next_state
         invalid = ("ActiveSessionChanged" if self._lease and self._lease.session != next_state["session_id"] else
@@ -438,7 +462,11 @@ class Realtime:
         return next_state
 
     def _runtime(self, state: Projection) -> Projection:
-        return {**cast(Projection, state["runtime"]), "control_generation": self._generation}
+        runtime = {**cast(Projection, state["runtime"]), "control_generation": self._generation}
+        if self._pause_required_for == state["session_id"] and runtime["effective_session_state"] == "Searching":
+            runtime["effective_session_state"] = "Paused"
+            runtime["persistence_pending"] = True
+        return runtime
 
     def _public_snapshot(self, projection: Projection, client: str | None) -> Projection:
         state = {key: value for key, value in projection.items()
@@ -461,7 +489,7 @@ class Realtime:
         state["readiness"] = {**readiness, "components": components,
                               "can_start": {"Gestures": shared and statuses["Webcam"],
                                             "Controller": shared and statuses["Controller"]}}
-        state["runtime"] = self._runtime(state)
+        state["runtime"] = self._runtime(projection)
         state["lease"] = public_lease(lease.client if lease else None, self._generation,
                                       self._can_acquire(client) and len(self._receipts) < MAX_RUNTIME_RECEIPTS)
         return state
@@ -531,7 +559,8 @@ class Realtime:
     def _set_readiness(self, observations: dict[str, bool]) -> None:
         if observations == self._readiness:
             return
-        shared_loss = any(self._readiness.get(name) and not observations[name] for name in ("Command", "AI"))
+        required_loss = any(self._readiness.get(name) and not available
+                            for name, available in observations.items() if name in ("Command", "AI", self._selected_input()))
         self._readiness = observations
         if self._projection is not None:
             current = cast(Projection, self._projection["readiness"])
@@ -544,7 +573,7 @@ class Realtime:
             ]}
             if updated != current:
                 self._projection["readiness"] = updated
-                if shared_loss and self._lease:
+                if required_loss and self._lease:
                     self._revoke("RequiredPathUnavailable")
                 else:
                     self._publish("readiness_changed", None)

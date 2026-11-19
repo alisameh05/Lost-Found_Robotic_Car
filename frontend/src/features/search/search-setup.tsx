@@ -58,6 +58,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   const showPreview = !recordsMode || (object.status === "Lost" && !object.retention_grace && referenceDisplayed === true);
   const canvas = useRef<HTMLDivElement>(null);
   const requestedStart = useRef(false);
+  const releaseForNavigation = recordsMode ? () => { void runtime?.releaseWorkspace(); } : undefined;
   useEffect(() => {
     if (canvas.current && profile && showPreview) return runtime?.mountWorkspace(canvas.current);
   }, [runtime, profile, showPreview]);
@@ -133,12 +134,12 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
         </fieldset>
         <Panel className={`${styles.card} ${styles.instructions}`}>
           <ModeInstructions mode={mode} title={mode === "Gestures" ? "Gesture instructions" : "PS4 instructions"} />
-          <Link href={supportHref("/control-guide", context)}>Open Control Guide</Link>
+          <Link href={supportHref("/control-guide", context)} onNavigate={releaseForNavigation}>Open Control Guide</Link>
         </Panel>
         <section aria-labelledby="setup-readiness-title" className={styles.column}>
           <div className={styles.row}>
             <h2 id="setup-readiness-title">Connection readiness</h2>
-            <Link className="button button--secondary" href={supportHref("/devices", context)}>View Devices</Link>
+            <Link className="button button--secondary" href={supportHref("/devices", context)} onNavigate={releaseForNavigation}>View Devices</Link>
           </div>
           {health?.initialization === "Starting" && <Notice title="Initializing services" tone="warning">Checking the backend and managed storage.</Notice>}
           {health?.initialization === "Failed" && <Notice title="Backend diagnostics" tone="danger">Managed storage or startup checks failed.</Notice>}
@@ -176,15 +177,18 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
               ? "Waiting for the displayed robot frame to be acknowledged." : "Acquire control to finish checking readiness."}
           </Notice>}
         {workspace?.message && <p role="status">{workspace.message}</p>}
+        {workspace?.releasing && <p role="status">Releasing control…</p>}
+        {workspace?.releaseNotice && <p role="status">{workspace.releaseNotice}</p>}
         <ActionFeedback label="Starting search" feedback={starting?.stage === "committed" && !active ? undefined : starting} retry={workspace?.eventsLive ? () => {
           requestedStart.current = true;
           void runtime?.retrySearch("start", object.id);
         } : undefined} />
       </div>
       <div className={styles.actions}>
-        <Link className="button button--secondary" href={objectHref(object.id)}>Back to Object Details</Link>
+        <Link className="button button--secondary" href={objectHref(object.id)} onNavigate={releaseForNavigation}>Back to Object Details</Link>
         {recordsMode && workspace?.controlling && <Button variant="secondary" onClick={() => { void runtime?.releaseWorkspace(); }}>Release control</Button>}
-        {!workspace?.controlling && <Button variant="primary" pending={workspace?.acquiring}
+        {workspace?.retryRelease && <Button variant="secondary" onClick={() => { void runtime?.releaseWorkspace(); }}>Retry release</Button>}
+        {!workspace?.controlling && !workspace?.releasing && !workspace?.retryRelease && <Button variant="primary" pending={workspace?.acquiring}
           disabledReason={acquisitionBlocked} onClick={() => { void runtime?.acquireWorkspace(); }}>Acquire control</Button>}
         <Button variant="primary" pending={starting?.stage === "sending"} disabled={recordsMode || !ready || busy}
           onClick={() => {

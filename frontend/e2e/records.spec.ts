@@ -314,17 +314,17 @@ test("acquires, demonstrates readiness, and releases control in connected Search
   await page.getByRole("button", { name: "Acquire control" }).click();
   await expect(page.getByText("Ready to start", { exact: true })).toBeVisible();
   const released = page.waitForResponse((response) =>
-    response.url().endsWith("/api/v1/control-lease/release") && response.status() === 200);
+    response.request().method() === "POST" && response.url().endsWith("/api/v1/control-lease/release"), { timeout: 5_000 });
   await page.getByRole("button", { name: "Release control" }).click();
-  await released;
+  expect((await released).status()).toBe(200);
   await expect(page.getByText("Ready to start", { exact: true })).toHaveCount(0);
   await expect(page.getByRole("button", { name: "Acquire control" })).toBeEnabled();
   await page.getByRole("button", { name: "Acquire control" }).click();
   await expect(page.getByText("Ready to start", { exact: true })).toBeVisible();
   const left = page.waitForResponse((response) =>
-    response.url().endsWith("/api/v1/control-lease/release") && response.status() === 200);
+    response.request().method() === "POST" && response.url().endsWith("/api/v1/control-lease/release"), { timeout: 5_000 });
   await page.getByRole("link", { name: "Back to Object Details" }).click();
-  await left;
+  expect((await left).status()).toBe(200);
   await expect(page.getByRole("heading", { name: "Object Details" })).toBeVisible();
   expect(requests).not.toContain("POST /api/v1/sessions");
 });

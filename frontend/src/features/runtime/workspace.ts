@@ -16,6 +16,9 @@ export type WorkspaceView = {
   acquiring: boolean;
   resynchronizing?: boolean;
   retryAcquisition?: boolean;
+  releasing?: boolean;
+  retryRelease?: boolean;
+  releaseNotice?: string;
   message?: string;
 };
 
@@ -122,6 +125,8 @@ export function openWorkspace({
   let acquisition: LeaseAcquire | undefined;
   let intent = 0;
   let heartbeatTimer: ReturnType<typeof setInterval> | undefined;
+  let pendingRelease: Promise<ReadResult<LeaseResponse>> | undefined;
+  let retainedRelease: LeaseRelease | undefined;
   let start: Pick<StartRequest, "action_id" | "object_id" | "control_mode"> | undefined;
   let handoffSession: string | undefined;
   let waitingForWorkspace = false;
@@ -146,13 +151,17 @@ export function openWorkspace({
     report({ controlling: false });
   }
 
-  function sendRelease(current: NonNullable<typeof lease>): Promise<ReadResult<LeaseResponse>> {
-    const channel = events.current();
-    const body: LeaseRelease = { request_id: crypto.randomUUID(), client_id: context.client_id, client_lease_id: current.secret,
+  function releaseBody(current: NonNullable<typeof lease>): LeaseRelease {
+    return { request_id: crypto.randomUUID(), client_id: context.client_id, client_lease_id: current.secret,
       session_id: current.session, control_generation: current.generation };
+  }
+
+  function sendRelease(body: LeaseRelease): Promise<ReadResult<LeaseResponse>> {
+    const channel = events.current();
     return transport.request("POST /control-lease/release", { body, context }).then<ReadResult<LeaseResponse>>((result) => {
-      if (disposed || !channel || events.current() !== channel ||
-          (result.kind === "ok" && (!conforms("LeaseResponse", result.data) || result.data.request_id !== body.request_id))) {
+      if (!connectedBackend && (disposed || !channel || events.current() !== channel)) return { kind: "unavailable" };
+      if (result.kind === "ok" && (!conforms("LeaseResponse", result.data) || result.data.request_id !== body.request_id ||
+          result.data.client_lease_id !== null)) {
         return { kind: "unavailable" };
       }
       return result;
@@ -173,9 +182,27 @@ export function openWorkspace({
 
   function release(message?: string) {
     const current = lease ?? offeredLease?.lease;
-    const result = current ? sendRelease(current) : undefined;
+    const body = current ? releaseBody(current) : retainedRelease;
     clearControl(message);
-    return result;
+    if (!connectedBackend) return body ? sendRelease(body) : undefined;
+    if (!body || pendingRelease) return pendingRelease;
+    retainedRelease = body;
+    report({ releasing: true, retryRelease: false, releaseNotice: undefined });
+    pendingRelease = sendRelease(body).then((result) => {
+      pendingRelease = undefined;
+      const unconfirmed = result.kind === "unavailable" || (result.kind === "api-error" && result.error.retryable);
+      const retryRelease = unconfirmed && !releaseObserved(body);
+      retainedRelease = retryRelease ? body : undefined;
+      report({ releasing: false, retryRelease, releaseNotice: retryRelease ? "Control release is unconfirmed."
+        : result.kind === "api-error" && result.error.code !== "LEASE_EXPIRED" ? result.error.message : undefined });
+      return result;
+    });
+    return pendingRelease;
+  }
+
+  function releaseObserved(body: LeaseRelease) {
+    return !!state && (state.lease.owner_client_id !== context.client_id ||
+      state.lease.control_generation !== body.control_generation);
   }
 
   function matchesAuthority(next: Snapshot, current: NonNullable<typeof lease>) {
@@ -190,6 +217,10 @@ export function openWorkspace({
 
   function apply(next: Snapshot, removedOwner?: string) {
     state = next;
+    if (retainedRelease && view.retryRelease && releaseObserved(retainedRelease)) {
+      retainedRelease = undefined;
+      report({ retryRelease: false, releaseNotice: undefined });
+    }
     const active = next.active_session;
     const accepted = start && next.operations.find((operation) => operation.action_id === start?.action_id &&
       operation.persistence === "Committed" && operation.result.session?.id === active?.id);
@@ -215,7 +246,7 @@ export function openWorkspace({
       offeredLease = undefined;
       if (matchesAuthority(next, offered) && view.previewLive && usable()) installLease(offered);
       else {
-        if (matchesAuthority(next, offered)) void sendRelease(offered);
+        if (matchesAuthority(next, offered)) void sendRelease(releaseBody(offered));
         clearControl();
       }
     }
@@ -346,7 +377,7 @@ export function openWorkspace({
       workspace_visible: document.visibilityState === "visible", workspace_focused: focused,
       workspace_operational: operational, displayed_robot_frame: null,
     });
-    if (offeredLease) void sendRelease(offeredLease.lease);
+    if (offeredLease) void sendRelease(releaseBody(offeredLease.lease));
     clearControl(message);
   }
 
@@ -402,7 +433,7 @@ export function openWorkspace({
     },
     expectStart(body: StartRequest) { start = body; },
     async acquire() {
-      if (!state || disposed || view.acquiring || lease || !view.eventsLive || !view.previewLive || !usable() ||
+      if (!state || disposed || view.acquiring || view.releasing || view.retryRelease || lease || !view.eventsLive || !view.previewLive || !usable() ||
           (!state.lease.can_acquire && !acquisition)) return;
       const attempt = ++intent;
       const session = state.active_session?.id ?? null;
@@ -422,7 +453,7 @@ export function openWorkspace({
             return;
           }
           if (disposed || attempt !== intent || !view.eventsLive || !view.previewLive || !usable()) {
-            sendRelease(acquired);
+            void sendRelease(releaseBody(acquired));
             if (attempt === intent) acquisition = undefined;
             return;
           }
