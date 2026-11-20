@@ -255,6 +255,8 @@ def save_search(
             if request.mode and expired:
                 raise HttpError(410, "EXPIRED", "The retention period for this record has ended.")
             removed = request.action in ("confirm", "stop") and expired
+            if removed:
+                storage.journal_owner(db, owner, now)
             result = EMPTY_RESULT if removed else {**EMPTY_RESULT, "object": found, "session": session, "match": match}
             receipt = Receipt(canonical_json({
                 "action_id": request.action_id, "persistence": "Committed", "result": result, "error": None,

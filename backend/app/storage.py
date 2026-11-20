@@ -203,6 +203,7 @@ class RecordsStorage:
         self._wall_floor = 0
         self._repair_needed = False
         self._purge_fault = False
+        self._announced_expiry: set[str] = set()
         self._startup_cleanup_pending = False
         self._anchor = (clock(), monotonic())
 
@@ -334,7 +335,10 @@ class RecordsStorage:
         if deadline <= db.execute("SELECT observed_at_ms FROM registration_clock WHERE id = 1").fetchone()[0]:
             return
         try:
-            self.observe_clock(now)
+            if db is self._writer_connection:
+                self.persist_clock(db, now)
+            else:
+                self.observe_clock(now)
         except (OSError, sqlite3.Error) as exc:
             self._purge_fault = True
             raise storage_unavailable(CLEANUP_FAILED) from exc
@@ -369,26 +373,34 @@ class RecordsStorage:
                 paths.append(f"staging/{media}.part")
         return sorted(paths)
 
-    def journal_expired(self, db: sqlite3.Connection, now: int) -> bool:
-        owners = db.execute(f"""
+    def journal_owner(self, db: sqlite3.Connection, owner: str, now: int) -> None:
+        db.execute("UPDATE objects SET deletion_pending = 1 WHERE id = ?", (owner,))
+        db.execute("""
+            INSERT INTO storage_operations VALUES (?, 'Purge', ?, ?, 'Pending', ?, NULL)
+        """, (uuid4().hex, owner, canonical_json(self.owned_paths(db, owner)), now))
+
+    def journal_expired(
+        self, db: sqlite3.Connection, now: int, on_removed: Callable[[str], None] | None = None,
+    ) -> list[str]:
+        owners = [owner for owner, in db.execute(f"""
             SELECT id FROM objects AS o
             WHERE (o.deletion_pending OR {EXPIRED})
               AND NOT EXISTS (SELECT 1 FROM storage_operations
                               WHERE kind = 'Purge' AND owner_object_id = o.id)
-        """, (self.cutoff(db, now),)).fetchall()
+        """, (self.cutoff(db, now),))]
+        if on_removed:
+            # The persisted clock already denies these owners, even if journal creation fails.
+            for owner in owners:
+                if owner not in self._announced_expiry:
+                    self._announced_expiry.add(owner)
+                    on_removed(owner)
         if owners:
             self.checkpoint("purge_before_journal")
-        for owner, in owners:
-            db.execute("UPDATE objects SET deletion_pending = 1 WHERE id = ?", (owner,))
-            db.execute("""
-                INSERT INTO storage_operations VALUES (?, 'Purge', ?, ?, 'Pending', ?, NULL)
-            """, (uuid4().hex, owner, canonical_json(self.owned_paths(db, owner)), now))
-        return bool(owners)
+        for owner in owners:
+            self.journal_owner(db, owner, now)
+        return owners
 
-    def purge_owner(
-        self, db: sqlite3.Connection, operation: str, owner: str | None, encoded_paths: str,
-        on_removed: Callable[[str], None] | None,
-    ) -> None:
+    def purge_owner(self, db: sqlite3.Connection, operation: str, owner: str | None, encoded_paths: str) -> None:
         paths = json.loads(encoded_paths)
         if owner is None or paths != self.owned_paths(db, owner):
             raise OSError("Purge journal does not own the recorded media")
@@ -412,8 +424,6 @@ class RecordsStorage:
         with write_transaction(db):
             db.execute("DELETE FROM objects WHERE id = ?", (owner,))
             db.execute("UPDATE storage_operations SET generated_paths = '[]' WHERE id = ?", (operation,))
-        if exists is not None and on_removed is not None:
-            on_removed(owner)
         self.checkpoint("purge_rows_removed")
         db.execute("DELETE FROM storage_operations WHERE id = ?", (operation,))
         self.checkpoint("purge_journal_removed")
@@ -434,14 +444,15 @@ class RecordsStorage:
                     return  # Preparation recovery must finish before purging owners.
                 self._repair_needed = False
             with write_transaction(db):
-                journaled = self.journal_expired(db, now)
+                journaled = self.journal_expired(db, now, on_removed)
+            self._announced_expiry.difference_update(journaled)
             if journaled:
                 self.checkpoint("purge_journaled")
             for operation, owner, paths in db.execute("""
                 SELECT id, owner_object_id, generated_paths FROM storage_operations WHERE kind = 'Purge'
             """).fetchall():
                 try:
-                    self.purge_owner(db, operation, owner, paths, on_removed)
+                    self.purge_owner(db, operation, owner, paths)
                 except (OSError, sqlite3.Error):
                     db.execute("""
                         UPDATE storage_operations SET phase = 'Failed', last_error_code = 'STORAGE_UNAVAILABLE'
@@ -573,12 +584,12 @@ class RecordsStorage:
 
     def save_retention(
         self, client: str, change: RetentionChange, preview: RetentionPreview, fingerprint: str,
-    ) -> Receipt:
+    ) -> tuple[Receipt, list[str]]:
         with self.mutation_connection() as db, write_transaction(db):
             self.require_inactive(db)
             recovered = self.find_receipt(db, change.action_id, fingerprint)
             if recovered:
-                return recovered
+                return recovered, []
             now, _ = self.now()
             settings = self.settings(db)
             previous_days = settings["retention_days"]
@@ -599,6 +610,7 @@ class RecordsStorage:
                 raise preview_stale()
             if inspection.problem:
                 raise storage_unavailable(inspection.problem)
+            removed = []
             if proposal.retention_days != previous_days:
                 if settings["revision"] >= SAFE_INTEGER:
                     raise HttpError(503, "COUNTER_EXHAUSTED", "The settings revision limit was reached.")
@@ -606,7 +618,7 @@ class RecordsStorage:
                     UPDATE app_settings SET retention_days = ?, revision = revision + 1, updated_at_ms = ? WHERE id = 1
                 """, (proposal.retention_days, now))
                 settings = self.settings(db)
-                self.journal_expired(db, now)
+                removed = self.journal_expired(db, now)
             self.persist_clock(db, now)
             result = {
                 "settings": settings, "deletion": self._inspect(db, now, ()).deletion(),
@@ -632,7 +644,7 @@ class RecordsStorage:
                         SELECT 1 FROM objects WHERE registered_at_ms > ? AND registered_at_ms <= ? LIMIT 1
                     """, (now - duration, checked_at - duration)).fetchone():
                         raise preview_stale()
-            return receipt
+            return receipt, removed
 
     def require_new_registration(self, submitted_at: int, preparing: Collection[str]) -> None:
         now, clock_valid = self.now()
@@ -682,7 +694,9 @@ class RecordsStorage:
             row = self.require_eligible(db, db.execute(OBJECT_ROWS + " WHERE o.id = ?", (object_id,)).fetchone(),
                                         now, days)
             self.check_read_storage(db, now, preparing)
-            return self.object_payload(row, days, now)
+            result = self.object_payload(row, days, now)
+        self.recheck_eligibility(object_id, session=False)
+        return result
 
     def read_objects(
         self, folded_name: str, status: str, limit: int, before: tuple[int, str],
@@ -702,6 +716,9 @@ class RecordsStorage:
                 ORDER BY o.registered_at_ms DESC, o.id COLLATE BINARY DESC LIMIT ?
             """, (now - retention_ms(days), status, status, folded_name, *before, limit + 1)).fetchall()
             items = [self.object_payload(row, days, now) for row in rows[:limit]]
+        if items:
+            eligible = self.eligible_owners({str(item["id"]) for item in items})
+            items = [item for item in items if item["id"] in eligible]
         return items, (rows[limit - 1]["registered_at_ms"], rows[limit - 1]["id"]) if len(rows) > limit else None
 
     def search_setup(self) -> tuple[
@@ -752,38 +769,38 @@ class RecordsStorage:
             },
         }
 
-    def history_parent(
-        self, db: sqlite3.Connection, parent: str, kind: HistoryKind, now: int,
-    ) -> sqlite3.Row:
+    def eligible_record(self, db: sqlite3.Connection, id: str, now: int, *, session: bool) -> sqlite3.Row:
         db.row_factory = sqlite3.Row
-        if kind == "sessions":
-            row = db.execute(f"""
-                SELECT o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting FROM objects AS o WHERE o.id = ?
-            """, (parent,)).fetchone()
-        else:
+        if session:
             row = db.execute(f"""
                 SELECT s.*, o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting
                 FROM sessions AS s JOIN objects AS o ON o.id = s.object_id WHERE s.id = ?
-            """, (parent,)).fetchone()
+            """, (id,)).fetchone()
+        else:
+            row = db.execute(f"""
+                SELECT o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting FROM objects AS o WHERE o.id = ?
+            """, (id,)).fetchone()
         return self.require_eligible(db, row, now, self.settings(db)["retention_days"])
 
-    def check_history_parent(self, parent: str, kind: HistoryKind) -> None:
+    def recheck_eligibility(self, id: str, *, session: bool) -> None:
         with self.connect() as db, read_transaction(db):
-            self.history_parent(db, parent, kind, self.now()[0])
+            self.eligible_record(db, id, self.now()[0], session=session)
 
     def read_session(self, session_id: str, preparing: Collection[str]) -> dict[str, object]:
         with self.connect() as db, read_transaction(db):
             now, _ = self.now()
-            session = self.history_parent(db, session_id, "matches", now)
+            session = self.eligible_record(db, session_id, now, session=True)
             self.check_read_storage(db, now, preparing)
-            return self.session_payload(session)
+            result = self.session_payload(session)
+        self.recheck_eligibility(session_id, session=True)
+        return result
 
     def read_history(
         self, parent: str, kind: HistoryKind, limit: int, before: tuple[int, str], preparing: Collection[str],
     ) -> tuple[list[dict[str, object]], tuple[int, str] | None]:
         with self.connect() as db, read_transaction(db):
             now, _ = self.now()
-            self.history_parent(db, parent, kind, now)
+            self.eligible_record(db, parent, now, session=kind == "matches")
             self.check_read_storage(db, now, preparing)
             parameters = (parent, *before, limit + 1)
             if kind == "sessions":
@@ -803,6 +820,7 @@ class RecordsStorage:
                 """, parameters).fetchall()
                 time_field = "captured_at_ms"
                 items = [self.match_payload(row) for row in rows[:limit]]
+        self.recheck_eligibility(parent, session=kind == "matches")
         return items, (rows[limit - 1][time_field], rows[limit - 1]["id"]) if len(rows) > limit else None
 
     def read_media(self, media_id: str, preparing: Collection[str]) -> tuple[str, bytes]:
@@ -822,6 +840,9 @@ class RecordsStorage:
                 )
             else:
                 availability, data = self.files.read(row["relative_path"], row["byte_length"], row["checksum"])
+        # Media validation can overlap a terminal commit, even while the read
+        # transaction still sees its formerly eligible owner.
+        self.recheck_eligibility(row["object_id"], session=False)
         if data is None:
             raise HttpError(503, "MEDIA_UNAVAILABLE", f"The managed image is {availability.lower()}.", True)
         return row["format"], data

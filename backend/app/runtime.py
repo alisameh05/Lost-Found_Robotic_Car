@@ -223,7 +223,7 @@ class RecordsRuntime:
             cursor = self.resolve_cursor(scope, query.get("cursor"))
         except PageError:
             if parent is not None:
-                await asyncio.to_thread(self.storage.check_history_parent, parent, history)
+                await asyncio.to_thread(self.storage.recheck_eligibility, parent, session=history == "matches")
             raise
         before = cursor.before if cursor else (SAFE_INTEGER + 1, "")
         if cursor is not None:
@@ -382,9 +382,10 @@ class RecordsRuntime:
     ) -> Receipt:
         action = change.action_id
         committed = False
+        removed: list[str] = []
         try:
             async with self._save:
-                receipt = await asyncio.to_thread(self.storage.save_retention, client, change, preview, fingerprint)
+                receipt, removed = await asyncio.to_thread(self.storage.save_retention, client, change, preview, fingerprint)
             committed = True
         except HttpError as error:
             receipt = mutation(action, "Failed", error.status, error)
@@ -403,6 +404,8 @@ class RecordsRuntime:
             self._previews.pop(change.preview_id, None)
         self.publish_terminal(action, Operation(fingerprint, receipt))
         if committed:
+            for owner in removed:
+                self.hide_removed_owner(owner)
             self._retention_changed.set()
             await self.prune_terminal()
         return receipt

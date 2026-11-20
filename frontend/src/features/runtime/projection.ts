@@ -1,9 +1,9 @@
-import type { EmergencyStopRequest, EmergencyStopResponse, FrontendProfile, Health, RetentionChange, RetentionPreviewRequest, Snapshot } from "@/generated/api-v1";
+import type { EmergencyStopRequest, EmergencyStopResponse, EventEnvelope, FrontendProfile, Health, RetentionChange, RetentionPreviewRequest, Snapshot } from "@/generated/api-v1";
 import { compatibleProfile } from "@/lib/fixture-contracts";
 import { pendingReview } from "@/lib/match-evidence";
 import type { ApplicationTransport, HttpRequest, ProtectedPath, ProtectedRequest, ReadEndpoint, ReadParams, ReadResult } from "@/lib/transport";
 import { conforms } from "@/lib/wire-contracts";
-import { openWorkspace, reconnectDelay, type WorkspaceView } from "./workspace";
+import { openEventStream, openWorkspace, reconnectDelay, type WorkspaceView } from "./workspace";
 import { openSearchActions, searchActionKey, type SearchFeedback, type SearchIntent, unresolved } from "./search-actions";
 import { validSnapshot, withoutRemovedOwners } from "./workspace-events";
 
@@ -51,6 +51,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
   let recoveryDelay = 250;
   let uncertainRequest: EmergencyStopRequest | undefined;
   let workspace: ReturnType<typeof openWorkspace> | undefined;
+  let recordEvents: ReturnType<typeof openEventStream> | undefined;
   let surface: HTMLElement | undefined;
   let handoffTimer: ReturnType<typeof setTimeout> | undefined;
   const searchActions = openSearchActions({ transport, signal: lifetime.signal,
@@ -107,14 +108,17 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
   }
 
   function loseRecordsAuthority() {
+    closeRecordEvents();
     workspace?.dispose();
     workspace = undefined;
     surface = undefined;
     context = undefined;
     clock = undefined;
+    uncertainRequest = undefined;
+    searchActions.changeAuthority();
     resetProtectedScope();
     update({ loading: false, connected: false, health: undefined, snapshot: undefined, recordSnapshot: undefined,
-      removedOwners: undefined, profile: undefined, workspace: undefined, failedRead: { kind: "unavailable" },
+      removedOwners: undefined, profile: undefined, workspace: undefined, emergency: undefined, failedRead: { kind: "unavailable" },
       authority: (view.authority ?? 0) + 1, cursorAuthority: (view.cursorAuthority ?? 0) + 1 });
   }
 
@@ -126,6 +130,9 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     const signal = AbortSignal.any([lifetime.signal, controller.signal]);
     if (recordsMode && revalidate && !workspace) {
       clearRecordsView(true);
+    } else if (recordsMode && revalidate) {
+      resetProtectedScope();
+      update({ recordSnapshot: undefined, authority: (view.authority ?? 0) + 1 });
     } else if (!recordsMode || !view.connected) update({ loading: true });
     try {
       if (!context || renewClock || (readBootstrap && !recordsMode)) {
@@ -142,6 +149,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
           }
           workspace?.dispose();
           workspace = undefined;
+          closeRecordEvents();
           resetProtectedScope();
           context = undefined;
           clock = undefined;
@@ -157,6 +165,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
         if (!sameProfile) {
           workspace?.dispose();
           workspace = undefined;
+          closeRecordEvents();
         }
         const authorityChanged = !sameAuthority && context !== undefined;
         if (authorityChanged) {
@@ -165,7 +174,8 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
           uncertainRequest = undefined;
           lastActiveSearch = undefined;
         }
-        context = bootstrap.data;
+        // A refreshed clock does not replace the lifetime of the same page authority.
+        context = sameAuthority && context ? context : bootstrap.data;
         clock = { server: bootstrap.data.server_time_ms, received: recordsMode ? bootstrapReceived : bootstrapStarted };
         update({ connected: !recordsMode, profile: sameProfile ? view.profile : profile,
           ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined,
@@ -188,8 +198,9 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
         return;
       }
       const ordered = workspace !== undefined;
-      const next = status.kind === "ok" && validSnapshot(status.data, request.context.backend_boot_id)
+      const received = status.kind === "ok" && validSnapshot(status.data, request.context.backend_boot_id)
         ? withoutRemovedOwners(status.data, view.removedOwners) : undefined;
+      const next = received && view.snapshot && view.snapshot.event_seq > received.event_seq ? view.snapshot : received;
       if (next && !ordered) {
         observeActiveSearch(next);
         searchActions.synchronize(next, request.context);
@@ -219,7 +230,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       ));
       update({
         snapshot: ordered ? view.snapshot : next ?? view.snapshot,
-        recordSnapshot: ordered || !refreshRecords ? view.recordSnapshot : next ?? view.recordSnapshot,
+        recordSnapshot: (!ordered || !view.recordSnapshot) && refreshRecords ? next ?? view.recordSnapshot : view.recordSnapshot,
         failedRead: next || view.workspace?.eventsLive ? undefined : status.kind === "ok" ? unavailable() : status,
         health: diagnostics,
         ...(recordsMode && { connected: true }),
@@ -238,6 +249,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       }
     } finally {
       if (readRequest === controller) readRequest = undefined;
+      openRecordEvents();
     }
   }
 
@@ -259,6 +271,63 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
   function resetProtectedScope() {
     protectedScope.abort();
     protectedScope = new AbortController();
+  }
+
+  function closeRecordEvents() {
+    recordEvents?.dispose();
+    recordEvents = undefined;
+  }
+
+  function openRecordEvents() {
+    if (!recordsMode || !context || !view.profile || workspace || recordEvents || lifetime.signal.aborted) return;
+    let joined = false;
+    recordEvents = openEventStream({
+      transport, context, profile: view.profile,
+      apply(next, event) {
+        applyEventSnapshot(next, event, !joined);
+        joined = true;
+      },
+      recover() {
+        if (!joined) return;
+        joined = false;
+        loseEventProjection();
+        void refresh();
+      },
+    });
+  }
+
+  function loseEventProjection() {
+    if (recordsMode) resetProtectedScope();
+    update({ recovering: true, reconnectingSessionId: view.snapshot?.active_session?.id,
+      ...(recordsMode && { snapshot: undefined, recordSnapshot: undefined, authority: (view.authority ?? 0) + 1 }) });
+    searchActions.suspend();
+  }
+
+  function applyEventSnapshot(next: Snapshot, event: EventEnvelope, joined = false) {
+    const removedOwner = event.type === "object_removed" ? event.payload.object_id : undefined;
+    if (removedOwner) removeRecords([removedOwner]);
+    // A fresh authority snapshot can establish that already-observed grace ended
+    // even when the socket carrying its removal was dropped.
+    const prior = lastActiveSearch;
+    if (prior?.grace && next.event_seq > prior.sequence &&
+        next.active_session?.id !== prior.sessionId) removeRecords([prior.objectId], prior.sessionId);
+    next = withoutRemovedOwners(next, view.removedOwners);
+    if (recordsMode && !workspace && view.snapshot && next.event_seq < view.snapshot.event_seq) {
+      if (removedOwner) update({ recordSnapshot: view.snapshot });
+      return;
+    }
+    observeActiveSearch(next);
+    const before = view.recordSnapshot;
+    const settingsChanged = recordsMode && before && before.retention.settings.revision !== next.retention.settings.revision;
+    if (settingsChanged) resetProtectedScope();
+    const refreshRecords = joined || removedOwner || view.recovering || recordsChanged(before, next) ||
+      event.type === "retention_changed" || event.type === "storage_fault";
+    recoveryComplete();
+    update({ snapshot: next, failedRead: view.connected ? undefined : view.failedRead, recovering: false,
+      reconnectingSessionId: undefined, ...(refreshRecords && { recordSnapshot: next }),
+      ...(settingsChanged && { authority: (view.authority ?? 0) + 1 }) });
+    if (context) searchActions.synchronize(next, context);
+    reconcileEmergency(next);
   }
 
   function observeActiveSearch(snapshot: Snapshot) {
@@ -320,7 +389,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
 
   async function emergency() {
     if (!context || lifetime.signal.aborted || view.emergency?.kind === "sending") return;
-    const request = { context, signal: AbortSignal.any([protectedScope.signal, lifetime.signal]) };
+    const request = { context, signal: lifetime.signal };
     const generation = view.snapshot?.runtime.control_generation;
     const ownerId = view.snapshot?.active_session?.object_id;
     const body = uncertainRequest ?? { request_id: crypto.randomUUID() };
@@ -328,7 +397,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     update({ emergency: { kind: "sending" } });
     try {
       const result = await transport.emergency(body, request);
-      if (request.signal.aborted) return;
+      if (request.signal.aborted || context !== request.context) return;
       if (result.kind === "ok" && conforms("EmergencyStopResponse", result.data) && result.data.request_id === body.request_id &&
           result.data.backend_boot_id === request.context.backend_boot_id) {
         uncertainRequest = undefined;
@@ -351,7 +420,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
         update({ emergency: { kind: "unavailable" } });
       }
     } catch {
-      if (!request.signal.aborted) update({ emergency: { kind: "unavailable" } });
+      if (!request.signal.aborted && context === request.context) update({ emergency: { kind: "unavailable" } });
     }
   }
 
@@ -381,29 +450,17 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     },
     mountWorkspace(robot: HTMLElement, webcam?: HTMLElement, sessionId?: string) {
       if (!context || !view.profile || lifetime.signal.aborted) return () => {};
+      closeRecordEvents();
       clearTimeout(handoffTimer);
       const reusable = sessionId && workspace?.canHandOff(sessionId) ? workspace : undefined;
       if (!reusable) workspace?.dispose();
       const active = reusable ?? openWorkspace({
         transport, context, profile: view.profile, serverTime, connectedBackend: recordsMode,
         update: (observation) => update({ workspace: observation }),
-        snapshot: (next, removedOwner) => {
-          if (removedOwner) removeRecords([removedOwner]);
-          next = withoutRemovedOwners(next, view.removedOwners);
-          observeActiveSearch(next);
-          const refreshRecords = removedOwner || view.recovering || recordsChanged(view.snapshot, next);
-          recoveryComplete();
-          update({ snapshot: next, failedRead: undefined, recovering: false, reconnectingSessionId: undefined,
-            ...(refreshRecords && { recordSnapshot: next }) });
-          if (context) searchActions.synchronize(next, context);
-          reconcileEmergency(next);
-        },
+        snapshot: applyEventSnapshot,
         recover: () => {
-          update({ recovering: true, reconnectingSessionId: view.snapshot?.active_session?.id,
-            ...(recordsMode && { snapshot: undefined }) });
-          searchActions.suspend();
+          loseEventProjection();
           if (!recordsMode) resetProtectedScope();
-          if (view.emergency?.kind === "sending") update({ emergency: { kind: "unavailable" } });
           void refresh({ readBootstrap: true });
         },
       });
@@ -513,6 +570,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
       clearTimeout(handoffTimer);
       clearTimeout(recoveryTimer);
       workspace?.dispose();
+      closeRecordEvents();
       lifetime.abort();
       searchActions.clear();
       unsubscribeRetention?.();

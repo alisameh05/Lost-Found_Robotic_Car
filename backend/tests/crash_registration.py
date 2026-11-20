@@ -1,12 +1,14 @@
 """Records process test controls for persistence boundaries, cleanup failures and clock changes."""
 import os
 import sys
+from dataclasses import replace
 from pathlib import Path
 from time import monotonic, sleep
 
 from backend.app import __main__ as entry
 from backend.app.config import Config
 from backend.app.main import create_app
+from backend.app.simulation import load_simulation
 from backend.app.storage import RecordsStorage, utc_ms
 
 
@@ -54,6 +56,17 @@ def test_app(config: Config, *, held_owner: bool = False):
             storage.files.discard = deny_media_deletion
     else:
         storage = RecordsStorage(config.data_root, checkpoint=crash_at_checkpoint)
+    if os.environ.get("LAF_TEST_NO_WEBCAM") == "1":
+        simulation = load_simulation(config.simulation_profile)
+        assert simulation is not None
+
+        class WithoutWebcam:
+            def observe(self, now, scope=None):
+                sample = simulation.adapter.observe(now, scope)
+                return replace(sample, webcam=None, gesture_input=None, gesture_sample_at=None)
+
+        return create_app(config, held_owner=held_owner, storage=storage,
+                          simulation=replace(simulation, adapter=WithoutWebcam()))
     return create_app(config, held_owner=held_owner, storage=storage)
 
 
