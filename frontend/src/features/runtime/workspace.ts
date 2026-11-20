@@ -1,4 +1,4 @@
-import type { Channel, FrontendProfile, LeaseAcquire, LeaseRelease, LeaseResponse, Snapshot, StartRequest } from "@/generated/api-v1";
+import type { Channel, EventEnvelope, FrontendProfile, LeaseAcquire, LeaseRelease, LeaseResponse, Snapshot, StartRequest } from "@/generated/api-v1";
 import { conforms } from "@/lib/fixture-contracts";
 import { openFrameDisplay } from "@/lib/frame-display";
 import {
@@ -98,6 +98,49 @@ function readChannel<Socket extends ReadSocket>({
   };
 }
 
+function matchesProfile(state: Snapshot, profile: FrontendProfile) {
+  return state.qualification_profile_id === profile.profile_id && Object.entries(profile)
+    .every(([key, value]) => state.qualification_profile?.[key as keyof FrontendProfile] === value);
+}
+
+export function openEventStream({
+  transport, context, profile, apply, recover,
+}: {
+  transport: ApplicationTransport;
+  context: ClientContext;
+  profile: FrontendProfile;
+  apply(value: Snapshot, event: EventEnvelope): void;
+  recover(): void;
+}) {
+  let state: Snapshot | undefined;
+  let previous: Snapshot | undefined;
+  const events = readChannel<EventSocket>({
+    transport, context, channel: "events",
+    lost() {
+      previous = state ?? previous;
+      state = undefined;
+      recover();
+    },
+    connect: (request, offer, closed) => transport.connectEvents(request, offer, {
+      closed,
+      message(event) {
+        if (request.signal?.aborted) return;
+        const next = projectWorkspaceEvent(state ?? previous, event, context.backend_boot_id, !state);
+        if (!next || !matchesProfile(next, profile)) {
+          events.reconnect();
+          return;
+        }
+        if (next === state) return;
+        previous = undefined;
+        state = next;
+        events.healthy();
+        apply(next, event);
+      },
+    }),
+  });
+  return events;
+}
+
 export function openWorkspace({
   transport, context, profile, serverTime, update, snapshot, recover, connectedBackend = false,
 }: {
@@ -107,7 +150,7 @@ export function openWorkspace({
   connectedBackend?: boolean;
   serverTime(): number | undefined;
   update(view: WorkspaceView): void;
-  snapshot(value: Snapshot, removedOwner?: string): void;
+  snapshot(value: Snapshot, event: EventEnvelope): void;
   recover(): void;
 }) {
   const robot = document.createElement("canvas");
@@ -118,7 +161,6 @@ export function openWorkspace({
   webcam.setAttribute("aria-label", "Fixture laptop webcam view");
   let view: WorkspaceView = { eventsLive: false, previewLive: false, webcamLive: false, controlling: false, usable: false, acquiring: false };
   let state: Snapshot | undefined;
-  let previousState: Snapshot | undefined;
   let disposed = false;
   let lease: { secret: string; generation: number; session: string | null; sequence: number } | undefined;
   let offeredLease: { lease: NonNullable<typeof lease>; watermark: number } | undefined;
@@ -210,12 +252,7 @@ export function openWorkspace({
       next.runtime.control_generation === current.generation && (next.active_session?.id ?? null) === current.session;
   }
 
-  function matchesProfile(next: Snapshot) {
-    return next.qualification_profile_id === profile.profile_id && Object.entries(profile)
-      .every(([key, value]) => next.qualification_profile?.[key as keyof FrontendProfile] === value);
-  }
-
-  function apply(next: Snapshot, removedOwner?: string) {
+  function applySnapshot(next: Snapshot, event: EventEnvelope) {
     state = next;
     if (retainedRelease && view.retryRelease && releaseObserved(retainedRelease)) {
       retainedRelease = undefined;
@@ -240,7 +277,7 @@ export function openWorkspace({
     if (lease && !matchesAuthority(next, lease)) {
       clearControl("Control was released. Acquire control again when available.");
     }
-    snapshot(next, removedOwner);
+    snapshot(next, event);
     if (offeredLease && next.event_seq >= offeredLease.watermark) {
       const offered = offeredLease.lease;
       offeredLease = undefined;
@@ -260,7 +297,6 @@ export function openWorkspace({
   }
 
   function invalidate() {
-    previousState = state ?? previousState;
     state = undefined;
     clearControl();
     report({ eventsLive: false, resynchronizing: true, message: "Search events disconnected. Resynchronizing with the service." });
@@ -269,24 +305,13 @@ export function openWorkspace({
     recover();
   }
 
-  const events = readChannel<EventSocket>({
-    transport, context, channel: "events", lost: invalidate,
-    connect: (request, offer, closed) => transport.connectEvents(request, offer, {
-      closed,
-      message(event) {
-        if (disposed || request.signal?.aborted) return;
-        const next = projectWorkspaceEvent(state ?? previousState, event, context.backend_boot_id, !state);
-        if (!next || !matchesProfile(next)) {
-          events.reconnect();
-          return;
-        }
-        if (next === state) return;
-        previousState = undefined;
-        events.healthy();
-        apply(next, event.type === "object_removed" ? event.payload.object_id : undefined);
-        report({ eventsLive: true, resynchronizing: false, ...(view.resynchronizing && { message: undefined }) });
-      },
-    }),
+  const events = openEventStream({
+    transport, context, profile, recover: invalidate,
+    apply(next, event) {
+      if (disposed) return;
+      applySnapshot(next, event);
+      report({ eventsLive: true, resynchronizing: false, ...(view.resynchronizing && { message: undefined }) });
+    },
   });
 
   function video(surface: HTMLCanvasElement, source: "robot" | "webcam") {
@@ -444,7 +469,7 @@ export function openWorkspace({
       try {
         const result = await transport.request("POST /control-lease", { context, body });
         if (result.kind === "ok" && conforms("LeaseResponse", result.data) && result.data.request_id === body.request_id &&
-            result.data.client_lease_id && validSnapshot(result.data.snapshot, context.backend_boot_id) && matchesProfile(result.data.snapshot)) {
+            result.data.client_lease_id && validSnapshot(result.data.snapshot, context.backend_boot_id) && matchesProfile(result.data.snapshot, profile)) {
           const response = result.data;
           const acquired = { secret: result.data.client_lease_id, generation: response.control_generation, session: body.session_id, sequence: 0 };
           const fresh = state && state.event_seq >= response.snapshot.event_seq ? state : response.snapshot;

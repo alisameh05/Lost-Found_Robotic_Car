@@ -1238,6 +1238,10 @@ async function startReviewSearch(page: Page, mode: "Gestures" | "PS4 controller"
   await selectTarget(page, sourceImage(), "Review target");
   await setTargetCoordinates(page);
   await page.getByRole("button", { name: "Register Object" }).click();
+  return startSavedSearch(page, mode);
+}
+
+async function startSavedSearch(page: Page, mode: "Gestures" | "PS4 controller") {
   await page.getByRole("link", { name: "Open Search Setup" }).click();
   await page.getByRole("radio", { name: mode }).check();
   await page.getByRole("button", { name: "Acquire control" }).click();
@@ -1245,6 +1249,93 @@ async function startReviewSearch(page: Page, mode: "Gestures" | "PS4 controller"
   await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
   return new URL(page.url()).pathname.replace(/\/live$/, "");
 }
+
+test("ends expired review and clears connected records before failed cleanup is repaired", async ({ page, context }) => {
+  test.setTimeout(80_000);
+  const day = 86_400_000;
+  const clock = join(parent, "retention-clock");
+  const cleanupFault = join(parent, "deny-cleanup");
+  const source = sourceImage();
+  const original = readFileSync(source);
+  writeFileSync(clock, String(-7 * day));
+  await startBackend({ clockOffset: clock });
+  await selectTarget(page, source, "Expiring review target");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await expect(page).toHaveURL(/\/objects\/[^/]+$/);
+  const target = new URL(page.url()).pathname;
+  await stopBackend();
+
+  writeFileSync(clock, "-18000");
+  writeFileSync(cleanupFault, "");
+  await startBackend({ reviewSimulation: true, clockOffset: clock, cleanupFault });
+  await page.goto(target);
+  const session = await startSavedSearch(page, "PS4 controller");
+  const review = page.getByRole("region", { name: "Review potential match" });
+  await expect(review.getByRole("img", { name: "Captured evidence", exact: true })).toBeVisible();
+  const history = await context.newPage();
+  const library = await context.newPage();
+  const dashboard = await context.newPage();
+  const details = await context.newPage();
+  const removed: Record<string, number> = {};
+  const watchRemoval = (tab: Page, label: string) => tab.on("websocket", (socket) => {
+    if (!socket.url().endsWith("/events")) return;
+    socket.on("framereceived", ({ payload }) => {
+      if (typeof payload !== "string") return;
+      const event = JSON.parse(payload);
+      if (event.type === "object_removed" && event.payload.object_id === target.split("/").at(-1)) {
+        removed[label] = event.event_seq;
+      }
+    });
+  });
+  watchRemoval(history, "history");
+  watchRemoval(library, "library");
+  watchRemoval(dashboard, "dashboard");
+  watchRemoval(details, "details");
+  await Promise.all([history.goto(session), library.goto("/objects"), dashboard.goto("/"), details.goto(target)]);
+  const capture = history.getByRole("region", { name: "Captured matches" });
+  const evidence = capture.getByRole("img", { name: "Captured evidence", exact: true });
+  await expect(evidence).toHaveAttribute("src", /^blob:/);
+  const evidenceUrl = await evidence.getAttribute("src");
+  await capture.getByRole("button", { name: "Inspect evidence" }).press("Enter");
+  await expect(capture.getByRole("region", { name: "Enlarged captured evidence" })).toBeFocused();
+  await expect(objectRows(library).getByText("Expiring review target", { exact: true })).toBeVisible();
+  await expect(dashboard.getByRole("link", { name: /Expiring review target/ }).first()).toBeVisible();
+  await expect(details.getByText("Active-session grace", { exact: true })).toBeVisible({ timeout: 23_000 });
+  await expect(evidence).toHaveAttribute("src", evidenceUrl!);
+
+  await page.bringToFront();
+  const confirm = review.getByRole("button", { name: "Confirm Match" });
+  if (!(await confirm.isEnabled())) await page.getByRole("button", { name: "Acquire control", exact: true }).click();
+  const saved = page.waitForResponse((response) => response.url() === `${backend}${session}/actions` &&
+    response.request().method() === "POST" && response.request().postDataJSON().action === "confirm");
+  await confirm.click();
+  const response = await saved;
+  expect(response.status()).toBe(200);
+  expect((await response.json()).result).toEqual({ object: null, session: null, match: null, settings: null, deletion: null });
+  await expect(page.getByText("Record removed after expiry", { exact: true })).toBeVisible();
+  await expect.poll(() => Object.keys(removed).sort()).toEqual(["dashboard", "details", "history", "library"]);
+  expect(new Set(Object.values(removed)).size).toBe(1);
+  await expect(evidence).toHaveCount(0);
+  await expect(capture.getByRole("region", { name: "Enlarged captured evidence" })).toHaveCount(0);
+  expect(await history.evaluate(async (url) => fetch(url!).then(() => true, () => false), evidenceUrl)).toBe(false);
+  await expect(objectRows(library).getByText("Expiring review target", { exact: true })).toHaveCount(0);
+  await expect(dashboard.getByRole("link", { name: /Expiring review target/ })).toHaveCount(0);
+  await expect(details.getByText("Record expired", { exact: true })).toBeVisible();
+  await expect(page.getByText("Local records storage unavailable", { exact: true })).toBeVisible();
+  await history.goto(`${session}/result`);
+  await expect(history.getByText("Session expired", { exact: true })).toBeVisible();
+  expect(await readdir(join(parent, "records", "media"))).toHaveLength(2);
+
+  await stopBackend();
+  unlinkSync(cleanupFault);
+  await startBackend({ reviewSimulation: true, clockOffset: clock });
+  await expect.poll(() => readdir(join(parent, "records", "media"))).toEqual([]);
+  expect(await readdir(join(parent, "records", "staging"))).toEqual([]);
+  expect(readFileSync(source)).toEqual(original);
+  await history.reload();
+  await expect(history.getByText("Session not found", { exact: true })).toBeVisible();
+});
 
 async function replayReviewAction(page: Page, action: SessionAction) {
   return page.evaluate(async ({ backend, action }) => {

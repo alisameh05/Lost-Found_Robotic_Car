@@ -1,3 +1,5 @@
+import sqlite3
+from contextlib import closing
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
@@ -5,6 +7,7 @@ from time import monotonic, sleep
 from uuid import uuid4
 
 import pytest
+from websockets.exceptions import ConnectionClosed
 
 from backend.app import sessions
 from backend.app.simulation import CandidateObservation, FixturePresence, InferenceSample
@@ -23,6 +26,7 @@ from backend.tests.test_realtime import (
     wait_for,
     wait_output,
 )
+from backend.tests.test_registration import PNG, submit
 
 
 def candidate(sample: InferenceSample) -> bool | CandidateObservation:
@@ -266,10 +270,35 @@ def test_superseded_encoder_does_not_suspend_a_new_search(tmp_path: Path, monkey
 @pytest.mark.parametrize("action", ["confirm", "stop"])
 def test_expired_review_ends_grace_without_returning_saved_owner(tmp_path: Path, action: str) -> None:
     offset = 0
-    with service(tmp_path, inference=candidate, wall=lambda: utc_ms() + offset) as laf, driving_search(laf) as (headers, driver):
+    root = tmp_path / "records"
+    original = tmp_path / "original.png"
+    original.write_bytes(PNG)
+    owner_id = ""
+    with service(root, inference=candidate, wall=lambda: utc_ms() + offset) as laf, driving_search(laf) as (headers, driver):
         match, session = review(laf, headers)
+        owner_id = match["object_id"]
+        target = f"{API}/objects/{owner_id}"
+        owner = laf.http.get(target, headers=headers).json()
+        evidence_id = match["evidence_media"]["id"]
+        evidence = root / "media" / f"{evidence_id}.png"
+        staged = root / "staging" / f"{evidence_id}.part"
+        staged.write_bytes(evidence.read_bytes())
         offset += 7 * DAY_MS
-        wait_for(laf.http, "/snapshot", headers, lambda state: state["retention"]["active_object_grace"])
+        graced = wait_for(laf.http, "/snapshot", headers, lambda state: state["retention"]["active_object_grace"])
+        assert graced["active_session"]["state"] == "Paused"
+        assert graced["pending_candidate"]["id"] == match["id"]
+        assert graced["active_object"]["registered_at_ms"] == owner["registered_at_ms"]
+        assert graced["active_object"]["expires_at_ms"] == owner["expires_at_ms"]
+        assert laf.http.get(f"{API}/media/{evidence_id}", headers=headers).status_code == 200
+        settings = {"expected_revision": 1, "retention_days": 30}
+        blocked = laf.http.post(f"{API}/settings/retention-preview", headers=headers, json=settings)
+        assert blocked.status_code == 409 and blocked.json()["code"] == "ACTIVE_SESSION_EXISTS"
+        blocked = laf.http.put(f"{API}/settings/retention", headers=headers, json={
+            **settings, "action_id": str(uuid4()), "preview_id": "saved-preview", "confirmed": True,
+        })
+        assert blocked.status_code == 409 and blocked.json()["code"] == "ACTIVE_SESSION_EXISTS"
+        independent = submit(laf.http, headers, submitted=utc_ms() + offset, image=original.read_bytes())
+        assert independent.status_code == 201, independent.text
         path = f"{API}/sessions/{session['id']}"
         body = action_body(driver, match, session, action)
         ended = laf.http.post(path + "/actions", headers=headers, json=body)
@@ -283,11 +312,95 @@ def test_expired_review_ends_grace_without_returning_saved_owner(tmp_path: Path,
                 break
         else:
             pytest.fail("Expected object removal event")
-        current = wait_for(laf.http, "/snapshot", headers, lambda state: state["active_object"] is None)
+        current = wait_for(laf.http, "/snapshot", headers, lambda state: state["active_object"] is None and
+                           state["retention"]["deletion"]["status"] == "Complete")
         assert current["pending_candidate"] is None and current["active_object"] is None
-        assert current["operations"] == []
+        assert all(operation["action_id"] != body["action_id"] for operation in current["operations"])
         assert laf.http.post(path + "/actions", headers=headers, json=body).status_code in (404, 410)
-        assert laf.http.get(path + "/matches", headers=headers).status_code in (404, 410)
+        assert laf.http.get(path + "/matches", headers=headers).status_code == 404
+        assert laf.http.get(target, headers=headers).status_code == 404
+        assert laf.http.get(f"{API}/media/{evidence_id}", headers=headers).status_code == 404
+        assert not evidence.exists() and not staged.exists()
+        assert original.read_bytes() == PNG
+    with closing(sqlite3.connect(root / "records.sqlite3")) as db:
+        assert db.execute("SELECT id FROM objects WHERE id=?", (owner_id,)).fetchone() is None
+        for table in ("sessions", "match_events", "media", "action_receipts"):
+            assert db.execute(f"SELECT 1 FROM {table} WHERE object_id=?", (owner_id,)).fetchone() is None
+        assert db.execute("SELECT 1 FROM storage_operations WHERE owner_object_id=?", (owner_id,)).fetchone() is None
+
+
+def test_searching_grace_and_removal_are_visible_while_managed_cleanup_is_blocked(tmp_path: Path) -> None:
+    offset = 0
+    deleting, proceed = Event(), Event()
+
+    def checkpoint(point: str) -> None:
+        if point in ("purge_before_journal", "purge_file_removed"):
+            deleting.set()
+            assert proceed.wait(8)
+
+    with service(tmp_path, wall=lambda: utc_ms() + offset, checkpoint=checkpoint) as laf, driving_search(laf) as (headers, driver):
+        session = driver.session
+        path = f"{API}/sessions/{session['id']}"
+        target = f"{API}/objects/{session['object_id']}"
+        owner = laf.http.get(target, headers=headers).json()
+        reference = f"{API}/media/{owner['reference_media']['id']}"
+        offset += 7 * DAY_MS
+        current = wait_for(laf.http, "/snapshot", headers, lambda state: state["retention"]["active_object_grace"])
+        assert current["active_session"]["state"] == "Searching"
+        assert laf.http.get(reference, headers=headers).status_code == 200
+        spectator = auth(laf.bootstrap())
+        with laf.open("/events", laf.ticket(spectator, "events")) as events:
+            initial = event(events)
+            assert initial["payload"]["active_object"]["id"] == owner["id"]
+            body = action_body(driver, None, session, "stop")
+            try:
+                ended = laf.http.post(path + "/actions", headers=headers, json=body)
+                assert ended.status_code == 200, ended.text
+                assert ended.json()["result"] == dict.fromkeys(("object", "session", "match", "settings", "deletion"))
+                assert deleting.wait(2)
+                assert laf.http.get(target, headers=spectator).status_code == 410
+                assert laf.http.get(reference, headers=spectator).status_code == 410
+                assert laf.http.post(path + "/actions", headers=headers, json=body).status_code == 410
+                last_seq = initial["event_seq"]
+                while (message := event(events))["type"] != "object_removed":
+                    assert message["event_seq"] == last_seq + 1
+                    last_seq = message["event_seq"]
+                    assert message["type"] != "session_changed" or message["payload"]["session"]["state"] != "Ended"
+                assert message["event_seq"] == last_seq + 1
+                assert message["payload"] == {"object_id": owner["id"], "reason": "Expired"}
+                with closing(sqlite3.connect(tmp_path / "records.sqlite3")) as db:
+                    assert db.execute("SELECT deletion_pending FROM objects WHERE id=?", (owner["id"],)).fetchone() == (1,)
+                    assert db.execute("SELECT phase FROM storage_operations WHERE owner_object_id=?",
+                                      (owner["id"],)).fetchone() == ("Pending",)
+            finally:
+                proceed.set()
+        wait_for(laf.http, "/snapshot", headers, lambda state: not state["operations"])
+        assert laf.http.get(target, headers=headers).status_code in (404, 410)
+
+
+def test_slow_spectator_drops_queued_review_at_grace_end_and_rejoins_idle(tmp_path: Path) -> None:
+    offset = 0
+    with service(tmp_path, blocked=True, blocked_connection=2, inference=candidate,
+                 wall=lambda: utc_ms() + offset) as laf, driving_search(laf) as (headers, driver):
+        match, session = review(laf, headers)
+        offset += 7 * DAY_MS
+        wait_for(laf.http, "/snapshot", headers, lambda state: state["retention"]["active_object_grace"])
+        spectator = auth(laf.bootstrap())
+        assert laf.blocked
+        with laf.open("/events", laf.ticket(spectator, "events")) as slow:
+            assert laf.blocked.entered[API + "/events"].wait(2)
+            path = f"{API}/sessions/{session['id']}/actions"
+            response = laf.http.post(path, headers=headers, json=action_body(driver, match, session))
+            assert response.status_code in (200, 202), response.text
+            with pytest.raises(ConnectionClosed) as closed:
+                slow.recv(timeout=2)
+            assert closed.value.rcvd and closed.value.rcvd.code == 1008
+        laf.blocked.resume_events.set()
+        with laf.open("/events", laf.ticket(spectator, "events")) as restored:
+            snapshot = event(restored)["payload"]
+            assert snapshot["active_object"] is snapshot["active_session"] is snapshot["pending_candidate"] is None
+            assert snapshot["operations"] == []
+            assert snapshot["lease"]["state"] == "Unowned"
 
 
 def test_confirm_receipt_is_recovered_with_a_new_boot_client_and_lease(tmp_path: Path) -> None:
