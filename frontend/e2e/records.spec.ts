@@ -4,7 +4,7 @@ import { existsSync, linkSync, mkdtempSync, readFileSync, unlinkSync, writeFileS
 import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { SessionAction } from "../src/generated/api-v1";
+import type { Match, SessionAction } from "../src/generated/api-v1";
 
 const frontend = "http://127.0.0.1:3103";
 const backend = "http://127.0.0.1:8110/api/v1";
@@ -20,6 +20,7 @@ async function startBackend(options: {
   initializationGate?: string; crashAfterCommit?: boolean; registrationGate?: string; clockOffset?: string;
   cleanupFault?: string; settingsGate?: string; stopGate?: string; simulation?: boolean;
   reviewSimulation?: boolean; crashCandidate?: boolean; noWebcam?: boolean; crashSearch?: "start" | "resume";
+  yoloe?: { assets: string; robot?: string };
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
@@ -35,13 +36,16 @@ async function startBackend(options: {
     cwd: repo, windowsHide: true, env: {
       ...process.env, LOCALAPPDATA: parent, LAF_DATA_ROOT: join(parent, "records"),
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
-      LAF_SIMULATION_PROFILE: options.reviewSimulation ? "fixture-review-v1" : options.simulation ? "fixture-v1" : undefined,
+      LAF_SIMULATION_PROFILE: options.yoloe ? "local-yoloe-v1"
+        : options.reviewSimulation ? "fixture-review-v1" : options.simulation ? "fixture-v1" : undefined,
+      LAF_YOLOE_ASSETS: options.yoloe?.assets, LAF_RECORDED_ROBOT_JPEG: options.yoloe?.robot,
       LAF_TEST_NO_WEBCAM: options.noWebcam ? "1" : undefined,
     },
   });
   backendProcess = child;
   let message = "";
   child.stderr?.on("data", (chunk) => { message += String(chunk); });
+  child.stdout?.resume();
   child.on("error", (error) => { message += error.message; });
   await expect.poll(async () => {
     if (child.exitCode !== null || message.includes("ENOENT")) throw new Error(message);
@@ -84,9 +88,9 @@ function sourceImage(name = "operator-photo.png") {
   return source;
 }
 
-async function setTargetCoordinates(page: Page) {
-  for (const [label, value] of [["X", "10"], ["Y", "20"], ["Width", "30"], ["Height", "60"]]) {
-    await page.getByRole("textbox", { name: label + " · px", exact: true }).fill(value);
+async function setTargetCoordinates(page: Page, coordinates = ["10", "20", "30", "60"]) {
+  for (const [index, label] of ["X", "Y", "Width", "Height"].entries()) {
+    await page.getByRole("textbox", { name: label + " · px", exact: true }).fill(coordinates[index]);
   }
 }
 
@@ -1281,6 +1285,94 @@ async function startSavedSearch(page: Page, mode: "Gestures" | "PS4 controller")
   await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
   return new URL(page.url()).pathname.replace(/\/live$/, "");
 }
+
+test("shows unavailable offline assets in Search Setup and Devices", async ({ page }) => {
+  await startBackend({ yoloe: { assets: join(parent, "missing-assets") } });
+  await selectTarget(page, sourceImage(), "Matcher diagnostics");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  const diagnostic = "Check the local YOLOE checkpoint or saved reference.";
+  await expect(page.getByText(diagnostic, { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Search", exact: true })).toBeDisabled();
+  await page.getByRole("link", { name: "View Devices" }).click();
+  const matcher = page.locator("summary").filter({ hasText: "Local matching service" });
+  await expect(matcher).toContainText("Unavailable");
+  await matcher.click();
+  await expect(page.getByText(diagnostic, { exact: true })).toBeVisible();
+});
+
+test("reviews and confirms an offline YOLOE match from a recorded robot frame", async ({ page }, info) => {
+  const selection = process.env.LAF_TEST_YOLOE_ASSETS;
+  test.skip(!selection, "Requires the pinned Windows CUDA environment and local probe assets");
+  if (!selection) return;
+  test.setTimeout(155_000);
+  const assets = resolve(selection);
+  const matches: Match[] = [];
+  page.on("websocket", (socket) => {
+    if (!socket.url().endsWith("/events")) return;
+    socket.on("framereceived", ({ payload }) => {
+      if (typeof payload !== "string") return;
+      const event = JSON.parse(payload);
+      if (event.type === "candidate_pending") matches.push(event.payload.match);
+    });
+  });
+  const robot = join(parent, "recorded-robot.jpg");
+  execFileSync(python, ["-c",
+    "import sys; from PIL import Image; im = Image.open(sys.argv[1]); im.thumbnail((640, 480)); im.save(sys.argv[2], quality=88)",
+    join(assets, "zidane.jpg"), robot,
+  ], { windowsHide: true });
+  await loopbackOnly(page);
+  await startBackend({ yoloe: { assets, robot } });
+  await selectTarget(page, join(assets, "bus.jpg"), "Recorded visual prompt");
+  await setTargetCoordinates(page, ["50", "390", "190", "510"]);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  await expect(page.getByText("Offline YOLOE · Simulated robot video, commands and input")).toBeVisible();
+  await page.getByRole("radio", { name: "PS4 controller" }).check();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  const start = page.getByRole("button", { name: "Start Search", exact: true });
+  await expect(start).toBeEnabled({ timeout: 100_000 });
+  await start.click();
+  await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
+  const panel = page.getByRole("region", { name: "Review potential match" });
+  const evidence = panel.getByRole("img", { name: "Captured evidence", exact: true });
+  await expect(evidence).toBeVisible({ timeout: 10_000 });
+  expect(matches).toHaveLength(1);
+  const { box, evidence_media: media } = matches[0];
+  const overlay = await evidence.locator("+ span").evaluate((element) =>
+    ["left", "top", "width", "height"].map((property) =>
+      parseFloat((element as HTMLElement).style.getPropertyValue(property))));
+  expect(overlay[0]).toBeCloseTo(100 * box.x / media.width, 3);
+  expect(overlay[1]).toBeCloseTo(100 * box.y / media.height, 3);
+  expect(overlay[2]).toBeCloseTo(100 * box.width / media.width, 3);
+  expect(overlay[3]).toBeCloseTo(100 * box.height / media.height, 3);
+  await expect(page.getByText("Motion permission · Disarmed", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Emergency Stop" })).toBeVisible();
+  const pixels = await evidence.evaluate(async (img: HTMLImageElement) => {
+    const canvas = document.createElement("canvas");
+    canvas.width = img.naturalWidth;
+    canvas.height = img.naturalHeight;
+    const context = canvas.getContext("2d");
+    if (!context) throw new Error("Canvas unavailable");
+    context.drawImage(img, 0, 0);
+    const data = context.getImageData(0, 0, canvas.width, canvas.height);
+    return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", data.data)));
+  });
+  const expected = execFileSync(python, ["-c",
+    "import hashlib, json, sys; from PIL import Image; print(json.dumps(list(hashlib.sha256(Image.open(sys.argv[1]).convert('RGBA').tobytes()).digest())))",
+    robot,
+  ], { encoding: "utf8", windowsHide: true });
+  expect(pixels).toEqual(JSON.parse(expected));
+  await page.screenshot({ path: info.outputPath("offline-yoloe-review.png") });
+  await panel.getByRole("button", { name: "Confirm Match" }).click();
+  await expect(page.getByRole("heading", { name: "Match confirmed and saved" })).toBeVisible();
+  await stopBackend();
+  await startBackend();
+  await page.reload();
+  await expect(page.getByRole("heading", { name: "Match confirmed and saved" })).toBeVisible();
+  await expect(page.getByRole("img", { name: "Captured evidence", exact: true })).toBeVisible();
+});
 
 for (const action of ["start", "resume"] as const) {
   test(`a process exit before ${action} commit never replays the unfinished request`, async ({ page }) => {

@@ -9,6 +9,7 @@ import { Button } from "@/components/ui/button";
 import { LoadingState, Notice } from "@/components/ui/feedback";
 import { DeletionNotice, useEligibleSearchSetup, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import type { Component, ControlMode, Health } from "@/generated/api-v1";
+import { LOCAL_YOLOE_PROFILE } from "@/lib/config";
 import { searchSetupHref, supportHref, type SearchSetupContext } from "@/lib/search-setup-context";
 import { InactiveInput, PathRow, paths, ProximityAdvisory } from "./device-observations";
 import styles from "./devices.module.css";
@@ -64,13 +65,14 @@ export function ReadinessNotice({ loading, disconnected, health, snapshotFailed,
   </Notice>;
 }
 
-function PathList({ observations }: { observations: Component[] }) {
+function PathList({ observations, localMatching }: { observations: Component[]; localMatching?: boolean }) {
   return <ul className={styles.paths}>{observations.map((observation) =>
-    <PathRow key={observation.component} observation={observation} />)}</ul>;
+    <PathRow key={observation.component} observation={observation} localMatching={localMatching} />)}</ul>;
 }
 
 export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
   const view = useRuntimeView();
+  const localMatching = view.profile?.profile_id === LOCAL_YOLOE_PROFILE;
   const runtimeState = useRuntime();
   const refresh = useRefreshRuntime();
   const { context, checking } = useEligibleSearchSetup(setup);
@@ -82,7 +84,9 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
 
   return (
     <div className={layout.page}>
-      <PageHeader title="Devices" description="Check the paths required for the selected control mode."
+      <PageHeader title="Devices" description={localMatching
+        ? "Offline YOLOE · Simulated robot video, commands and input"
+        : "Check the paths required for the selected control mode."}
         actions={active ? (
           <div className={styles.mode}>
             <strong>{modeLabels[mode]}</strong>
@@ -128,7 +132,7 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
         {activeModeUnavailable && readiness && (
           <section aria-labelledby="reported-readiness-title">
             <h2 id="reported-readiness-title">Reported readiness</h2>
-            <PathList observations={readiness.components} />
+            <PathList observations={readiness.components} localMatching={localMatching} />
           </section>
         )}
         {summary.selected && (
@@ -141,7 +145,8 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
               </div>
               <div>
                 <h3>Shared connections and matching</h3>
-                <PathList observations={summary.shared.filter(({ component }) => connectionAndMatchingComponents.has(component))} />
+                <PathList observations={summary.shared.filter(({ component }) => connectionAndMatchingComponents.has(component))}
+                  localMatching={localMatching} />
               </div>
               <div>
                 <h3>Shared application prerequisites</h3>

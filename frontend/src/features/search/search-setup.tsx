@@ -9,10 +9,11 @@ import { Panel } from "@/components/layout/panel";
 import { Button } from "@/components/ui/button";
 import { LoadingState, Notice, StatusBadge } from "@/components/ui/feedback";
 import { ModeInstructions } from "@/features/control-guide";
-import { describeDeviceReadiness, devicePaths } from "@/features/devices";
+import { describeDeviceReadiness, devicePaths, localMatchingBlocker } from "@/features/devices";
 import { ObjectStatus, objectHref, RecordAbsent, RecordReadFailure, ReferenceImage } from "@/features/objects";
 import { searchActionKey, unresolved, useObjectRecord, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import { componentNames, type ControlMode, type Object as ObjectRecord } from "@/generated/api-v1";
+import { LOCAL_YOLOE_PROFILE } from "@/lib/config";
 import { searchSetupBlockReason, supportHref } from "@/lib/search-setup-context";
 import styles from "./search-setup.module.css";
 import { ActionFeedback } from "./action-feedback";
@@ -55,6 +56,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   const refresh = useRefreshRuntime();
   const router = useRouter();
   const { snapshot, health, workspace, profile, recordsMode } = view;
+  const localMatching = profile?.profile_id === LOCAL_YOLOE_PROFILE;
   const showPreview = !recordsMode || (object.status === "Lost" && !object.retention_grace && referenceDisplayed === true);
   const canvas = useRef<HTMLDivElement>(null);
   const requestedStart = useRef(false);
@@ -101,6 +103,8 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   if (!notice && referenceDisplayed === false) notice = "The reference image is unavailable.";
   if (!notice && !profile && !view.loading) notice = "A compatible qualification profile is unavailable.";
   if (!notice && view.failedRead) notice = "Search readiness is unavailable. Refresh readiness to check again.";
+  const matcher = localMatching ? blockedPaths.find(({ component }) => component === "AI") : undefined;
+  if (!notice && matcher) notice = localMatchingBlocker(matcher);
   if (!notice && blockedPaths.length) notice = blockedPaths.map(({ component }) => devicePaths[component].label).join(", ") + " must report Ready.";
   if (!notice && workspace?.eventsLive && !workspace.previewLive) notice = "Wait for a fresh robot frame.";
 
@@ -118,7 +122,8 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
             <StatusBadge tone={workspace?.previewLive ? "success" : "warning"}>{workspace?.previewLive ? "Live preview" : "Not live"}</StatusBadge>
           </div>
           <div ref={canvas} className={styles.preview} />
-          <p className={styles.muted}>{recordsMode ? "Backend simulation · Disarmed" : workspace?.controlling ? "This workspace holds control." : "Read-only preview."}</p>
+          <p className={styles.muted}>{localMatching ? "Offline YOLOE · Simulated robot video, commands and input"
+            : recordsMode ? "Backend simulation · Disarmed" : workspace?.controlling ? "This workspace holds control." : "Read-only preview."}</p>
         </Panel>}
       </div>
 

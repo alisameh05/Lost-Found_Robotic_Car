@@ -35,7 +35,7 @@ from .registration_input import NAME_LIMIT, normalize_name, parse_registration
 from .retention_input import parse_retention
 from .runtime import PageError, RecordsRuntime
 from .search_input import parse_emergency, parse_search
-from .simulation import IncompatibleProfile, Simulation, load_simulation
+from .simulation import LOCAL_VISION_PROFILE_NAME, IncompatibleProfile, Simulation, load_simulation
 from .storage import RecordsStorage, storage_unavailable
 
 PAGE_ERRORS = {
@@ -96,7 +96,7 @@ def create_app(
     unavailable_code = "NOT_READY"
     if simulation is None:
         try:
-            simulation = load_simulation(config.simulation_profile)
+            simulation = load_simulation(config.simulation_profile, config.recorded_robot_jpeg)
         except IncompatibleProfile:
             unavailable_code = "PROTOCOL_UNSUPPORTED"
         except (OSError, ValueError, KeyError, Image.DecompressionBombError):
@@ -110,13 +110,17 @@ def create_app(
             runtime = RecordsRuntime(storage or RecordsStorage(config.data_root))
             app.state.runtime = runtime
             realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked)
+            if simulation and config.simulation_profile == LOCAL_VISION_PROFILE_NAME:
+                realtime.configure_local_vision(config.yoloe_assets, config.data_root / "vision", runtime.match_prompt)
             startup = asyncio.create_task(runtime.initialize())
             tasks: tuple[asyncio.Task[None], ...] = (
                 asyncio.create_task(realtime.capture()), asyncio.create_task(realtime.maintain_projection()),
                 asyncio.create_task(realtime.maintain_control()),
                 asyncio.create_task(runtime.maintain_safety_storage(realtime)),
             ) if simulation else ()
-            if simulation and simulation.inference:
+            if realtime.local_vision:
+                tasks += (asyncio.create_task(realtime.maintain_local_vision()),)
+            elif simulation and simulation.inference:
                 tasks += (asyncio.create_task(realtime.maintain_inference()),)
             try:
                 yield

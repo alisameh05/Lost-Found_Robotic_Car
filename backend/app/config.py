@@ -18,6 +18,8 @@ class Config:
     frontend_port: int = 3000
     backend_port: int = 8000
     simulation_profile: str | None = None
+    yoloe_assets: Path | None = None
+    recorded_robot_jpeg: Path | None = None
 
     @property
     def host(self) -> str:
@@ -51,4 +53,7 @@ class Config:
         backend = read_port("LAF_BACKEND_PORT", 8000)
         if frontend == backend:
             raise ValueError("LAF_FRONTEND_PORT and LAF_BACKEND_PORT must be different.")
-        return cls(root, frontend, backend, os.environ.get("LAF_SIMULATION_PROFILE"))
+        assets = os.environ.get("LAF_YOLOE_ASSETS")
+        robot = os.environ.get("LAF_RECORDED_ROBOT_JPEG")
+        return cls(root, frontend, backend, os.environ.get("LAF_SIMULATION_PROFILE"),
+                   Path(assets).absolute() if assets else None, Path(robot).absolute() if robot else None)

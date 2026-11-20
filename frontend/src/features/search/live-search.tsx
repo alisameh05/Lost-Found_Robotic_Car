@@ -13,6 +13,7 @@ import { devicePaths } from "@/features/devices";
 import { objectHref, RecordAbsent, RecordReadFailure, RecordTime, ReferenceImage, sessionHref } from "@/features/objects";
 import { recordAbsence, searchActionKey, unresolved, useRefreshRuntime, useRuntime, useRuntimeRead, useRuntimeView } from "@/features/runtime";
 import type { Snapshot } from "@/generated/api-v1";
+import { LOCAL_YOLOE_PROFILE } from "@/lib/config";
 import { pendingReview } from "@/lib/match-evidence";
 import { gestureFeedback } from "@/lib/gesture-input";
 import { ActionFeedback } from "./action-feedback";
@@ -164,7 +165,11 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const input = recordsMode ? connectedInput : gestures ? gestureFeedback(sample) : sample === "invalid" ? "Conflicting D-pad input"
     : sample && sample !== "neutral" ? `Held ${sample}` : "No direction held";
   const searching = state === "Searching";
+  const localMatching = profile?.profile_id === LOCAL_YOLOE_PROFILE;
   const matching = searching && connected && readiness.components.some(({ component, status }) => component === "AI" && status === "Ready");
+  const matchingLabel = localMatching
+    ? matching ? "Offline YOLOE matching active" : "Offline YOLOE matching suspended"
+    : matching ? recordsMode ? "Simulated AI matching active" : "AI matching active" : "AI matching suspended";
   const robotLive = workspace?.previewLive && readiness.components.some(({ component, status }) =>
     component === "RobotVideo" && status === "Ready");
   const canAcquire = connected && !!workspace?.usable && workspace.previewLive &&
@@ -201,7 +206,9 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   }
 
   return <div className={styles.page}>
-    <PageHeader title="Live Search Workspace" description={recordsMode ? `Backend simulation · ${permission}` : undefined} actions={<>
+    <PageHeader title="Live Search Workspace" description={localMatching
+      ? `Simulated robot video, commands and input · ${permission}`
+      : recordsMode ? `Backend simulation · ${permission}` : undefined} actions={<>
       <Button onClick={() => setHelp(!help)} aria-expanded={help} aria-controls={help ? "live-control-help" : undefined}>Control Help</Button>
       {(state === "Paused" || recoveryOpen) && <Button onClick={() => setRecovery(!recoveryOpen)}
         aria-expanded={recoveryOpen} aria-controls={recoveryOpen ? "search-recovery" : undefined}>Recovery</Button>}
@@ -267,7 +274,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
             <header><h2 id="robot-title"><Video aria-hidden="true" />Robot camera</h2>
               <StatusBadge tone={robotLive ? "success" : "warning"}>{robotLive ? "Live sample" : "Not live"}</StatusBadge></header>
             <div ref={robot} className={styles.surface} />
-            <p>{matching ? recordsMode ? "Simulated AI matching active" : "AI matching active" : "AI matching suspended"} · {snapshot.pending_candidate ? "Candidate awaiting review" : "No candidate awaiting review"}</p>
+            <p>{matchingLabel} · {snapshot.pending_candidate ? "Candidate awaiting review" : "No candidate awaiting review"}</p>
           </Panel>
         </div>
         <Panel className={styles.input} aria-label={gestures ? "Gesture feedback" : "Controller feedback"}>

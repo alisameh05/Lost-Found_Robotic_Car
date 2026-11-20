@@ -22,6 +22,7 @@ from .registration_input import SAFE_INTEGER
 FIXTURES = Path(__file__).with_name("preview_fixture")
 PROFILE_NAME = "fixture-v1"
 REVIEW_PROFILE_NAME = "fixture-review-v1"
+LOCAL_VISION_PROFILE_NAME = "local-yoloe-v1"
 PROFILE_FIELDS = Path(__file__).resolve().parents[1] / "contracts" / "v1" / "schemas.json"
 Source = Literal["robot", "webcam"]
 SOURCES: tuple[Source, ...] = ("robot", "webcam")
@@ -317,10 +318,10 @@ class Simulation:
     inference: Inference | None = None
 
 
-def load_simulation(selection: str | None) -> Simulation | None:
+def load_simulation(selection: str | None, recorded_robot_jpeg: Path | None = None) -> Simulation | None:
     if selection is None:
         return None
-    if selection not in (PROFILE_NAME, REVIEW_PROFILE_NAME):
+    if selection not in (PROFILE_NAME, REVIEW_PROFILE_NAME, LOCAL_VISION_PROFILE_NAME):
         raise IncompatibleProfile("The simulation profile is incompatible.")
     manifests = tuple((FIXTURES / name).read_text(encoding="utf-8").encode("utf-8") for name in ("evidence.json", "interfaces.json"))
     evidence, interfaces = manifests
@@ -329,14 +330,17 @@ def load_simulation(selection: str | None) -> Simulation | None:
                               object_pairs_hook=json_fields, parse_constant=reject_nonfinite)
     except HttpError as exc:
         raise ValueError("The simulation profile contains invalid JSON.") from exc
+    if selection == LOCAL_VISION_PROFILE_NAME and isinstance(document, dict):
+        document["profile_id"] = LOCAL_VISION_PROFILE_NAME
     profile = QualificationProfile.validate(document, evidence, interfaces)
     hashes = json.loads(evidence)["frames"]
     samples = []
     for source in SOURCES:
-        path = FIXTURES / f"{source}.jpg"
+        recorded = source == "robot" and selection == LOCAL_VISION_PROFILE_NAME and recorded_robot_jpeg is not None
+        path = recorded_robot_jpeg if recorded_robot_jpeg is not None and recorded else FIXTURES / f"{source}.jpg"
         with path.open("rb") as stream:
             jpeg = stream.read(profile.bound("max_frame_bytes"))
-        if hashes[source] != sha256(jpeg).hexdigest():
+        if not recorded and hashes[source] != sha256(jpeg).hexdigest():
             raise ValueError("The sample does not match the fixture evidence.")
         samples.append(read_sample(jpeg, profile))
     review = selection == REVIEW_PROFILE_NAME
