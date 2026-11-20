@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { LoadingState, Notice } from "@/components/ui/feedback";
 import { DeletionNotice, useEligibleSearchSetup, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import type { Component, ControlMode, Health } from "@/generated/api-v1";
-import { LOCAL_YOLOE_PROFILE } from "@/lib/config";
+import { LOCAL_GESTURES_PROFILE, LOCAL_YOLOE_PROFILE } from "@/lib/config";
 import { searchSetupHref, supportHref, type SearchSetupContext } from "@/lib/search-setup-context";
 import { InactiveInput, PathRow, paths, ProximityAdvisory } from "./device-observations";
 import styles from "./devices.module.css";
@@ -73,6 +73,7 @@ function PathList({ observations, localMatching }: { observations: Component[]; 
 export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
   const view = useRuntimeView();
   const localMatching = view.profile?.profile_id === LOCAL_YOLOE_PROFILE;
+  const localGestures = view.profile?.profile_id === LOCAL_GESTURES_PROFILE;
   const runtimeState = useRuntime();
   const refresh = useRefreshRuntime();
   const { context, checking } = useEligibleSearchSetup(setup);
@@ -84,7 +85,9 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
 
   return (
     <div className={layout.page}>
-      <PageHeader title="Devices" description={localMatching
+      <PageHeader title="Devices" description={localGestures
+        ? "Local webcam gestures · Simulated robot video, commands, matching and controller"
+        : localMatching
         ? "Offline YOLOE · Simulated robot video, commands and input"
         : "Check the paths required for the selected control mode."}
         actions={active ? (

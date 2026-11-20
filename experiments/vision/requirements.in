@@ -6,6 +6,7 @@ mediapipe==0.10.32
 numpy==1.26.4
 opencv-python==4.11.0.86
 opencv-contrib-python==4.11.0.86
+cv2-enumerate-cameras==1.4.0
 fastapi==0.163.2
 uvicorn==0.41.0
 pygame==2.6.1

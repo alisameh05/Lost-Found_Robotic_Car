@@ -38,7 +38,7 @@ from .control import (
     token,
 )
 from .http import DOMAIN_ID, HEADER_LIMIT, HttpError, authorize_address, header, json_fields, read_json
-from .motion import FixtureCommandSink, InputScope, Motion
+from .motion import FixtureCommandSink, InputSample, InputScope, Motion
 from .registration_input import SAFE_INTEGER, canonical_json
 from .simulation import (
     SOURCES,
@@ -68,6 +68,7 @@ from .vision_worker import (
     launch_process,
     reap_after_shutdown,
 )
+from .webcam import POLL_SECONDS, Webcam
 
 Channel = Literal["events", "robot-video", "webcam-video"]
 CHANNELS: dict[str, Channel] = {"/events": "events", "/video/robot": "robot-video", "/video/webcam": "webcam-video"}
@@ -194,6 +195,7 @@ class Realtime:
         on_simulated_emergency: Callable[[], None],
     ):
         self.simulation = simulation
+        self.webcam: Webcam | None = None
         self.unavailable_code = unavailable_code
         self.boot = boot
         self.monotonic = monotonic
@@ -740,7 +742,7 @@ class Realtime:
                 self._revoke(reason or "EventConnectionLost")
             elif channel == "robot-video":
                 self._revoke(reason or "RobotVideoLost")
-            elif channel == "webcam-video" and self._selected_input() == "Webcam":
+            elif channel == "webcam-video" and self.webcam is None and self._selected_input() == "Webcam":
                 self._revoke("InputUnavailable")
         self.invalidate(client, channel)
 
@@ -1125,6 +1127,8 @@ class Realtime:
                 now = self.monotonic()
                 self._expire_lease(now)
                 for source, capture in zip(SOURCES, (observation.robot, observation.webcam), strict=True):
+                    if source == "webcam" and self.webcam:
+                        continue
                     pending = decoding.get(source)
                     if capture is None:
                         if pending:
@@ -1136,6 +1140,8 @@ class Realtime:
                     ("Controller", observation.controller_sample_at, observation.controller_input),
                     ("Webcam", observation.gesture_sample_at, observation.gesture_input),
                 ):
+                    if name == "Webcam" and self.webcam:
+                        continue
                     at = reported_at
                     if scope is not None and name == self._selected_input():
                         if scope != self._input_scope():
@@ -1155,32 +1161,12 @@ class Realtime:
                     "AI": self._vision_cause is None if self.local_vision else observation.inference,
                     "Controller": observation.controller and now < self._input_deadlines.get("Controller", now),
                     "RobotVideo": "robot" in self._live_sources,
-                    "Webcam": "webcam" in self._live_sources and now < self._input_deadlines.get("Webcam", now),
+                    "Webcam": self._webcam_ready(now),
                 })
-                motion = self._motion
-                if motion and scope and scope == self._input_scope():
-                    selected = self._selected_input()
+                selected = self._selected_input()
+                if selected != "Webcam" or not self.webcam:
                     sample = observation.gesture_input if selected == "Webcam" else observation.controller_input
-                    # Circle is routed through the same latch even after a manual Pause.
-                    circle = bool(selected == "Controller" and sample and sample.scope == scope
-                                  and sample.intent == "emergency" and 0 <= now - sample.at < deadline)
-                    if circle:
-                        if not self._circle_held:
-                            self.on_simulated_emergency()
-                    elif scope == self._motion_scope():
-                        if lost := motion.loss(now):
-                            self._revoke(lost)
-                        else:
-                            prior = motion.permission
-                            motion.accept(scope, sample, now)
-                            lease = self._lease
-                            assert lease is not None
-                            if ((prior == "Armed" and motion.permission != "Armed") or
-                                    (motion.permission == "Arming" and not lease.motion_generation)):
-                                self._rotate_motion_generation()
-                    self._circle_held = circle
-                elif scope is None:
-                    self._circle_held = False
+                    self._accept_motion(scope, sample, now, deadline)
                 self._evaluate_motion(self.monotonic())
                 self._restore_failures()
                 if self._proximity:
@@ -1195,6 +1181,73 @@ class Realtime:
                 pending.cancel()
             await asyncio.gather(*decoding.values(), return_exceptions=True)
 
+    def _accept_motion(self, scope: InputScope | None, sample: InputSample | None, now: float, deadline: float) -> None:
+        motion = self._motion
+        if scope is None:
+            self._circle_held = False
+            return
+        if motion is None or scope != self._input_scope():
+            return
+        # Circle is routed through the same latch even after a manual Pause.
+        circle = bool(self._selected_input() == "Controller" and sample and sample.scope == scope
+                      and sample.intent == "emergency" and 0 <= now - sample.at < deadline)
+        if circle:
+            if not self._circle_held:
+                self.on_simulated_emergency()
+        elif scope == self._motion_scope():
+            if lost := motion.loss(now):
+                self._revoke(lost)
+            else:
+                prior = motion.permission
+                motion.accept(scope, sample, now)
+                lease = self._lease
+                assert lease is not None
+                if ((prior == "Armed" and motion.permission != "Armed") or
+                        (motion.permission == "Arming" and not lease.motion_generation)):
+                    self._rotate_motion_generation()
+        self._circle_held = circle
+
+    def _webcam_ready(self, now: float) -> bool:
+        return now < self._input_deadlines.get("Webcam", now) and (self.webcam is not None or "webcam" in self._live_sources)
+
+    async def maintain_webcam(self) -> None:
+        webcam = self.webcam
+        assert webcam
+        profile = self.requires_profile()
+        deadline = profile.bound("input_sample_deadline_ms") / 1000
+        decoding: asyncio.Task[None] | None = None
+        submitted: Capture | None = None
+        try:
+            while not self._closed:
+                scope = self._input_scope()
+                observation = webcam.observe(scope)
+                now = self.monotonic()
+                at = observation.recognition_at
+                if at is None:
+                    self._input_deadlines.pop("Webcam", None)
+                else:
+                    self._input_deadlines["Webcam"] = at + deadline
+                self._set_readiness({**self._readiness, "Webcam": self._webcam_ready(now)})
+                if self._selected_input() == "Webcam":
+                    self._accept_motion(scope, observation.input, now, deadline)
+                self._evaluate_motion(self.monotonic())
+                self._restore_failures()
+
+                preview = observation.preview
+                if preview is None:
+                    if decoding:
+                        decoding.cancel()
+                    submitted = None
+                    self._observe_source("webcam", None, None, now, profile)
+                elif preview is not submitted and (decoding is None or decoding.done()):
+                    submitted = preview
+                    decoding = asyncio.create_task(self._decode_source("webcam", preview, profile, scope))
+                await asyncio.sleep(POLL_SECONDS)
+        finally:
+            if decoding:
+                decoding.cancel()
+                await asyncio.gather(decoding, return_exceptions=True)
+
     async def _decode_source(self, source: Source, capture: Capture, profile: QualificationProfile,
                              scope: InputScope | None) -> None:
         frame = await asyncio.to_thread(
@@ -1207,7 +1260,7 @@ class Realtime:
         self._set_readiness({
             **self._readiness,
             "RobotVideo": "robot" in self._live_sources,
-            "Webcam": "webcam" in self._live_sources and now < self._input_deadlines.get("Webcam", now),
+            "Webcam": self._webcam_ready(now),
         })
 
     async def maintain_inference(self) -> None:
@@ -1489,7 +1542,7 @@ class Realtime:
         previous = self._readiness
         self._readiness = observations
         for name in ("Command", "AI", self._selected_input()):
-            if name and previous.get(name) and not observations[name]:
+            if name and previous.get(name) and not observations.get(name):
                 self._path_lost(name)
         if self._projection is not None:
             current = cast(Projection, self._projection["readiness"])

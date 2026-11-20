@@ -13,7 +13,7 @@ if TYPE_CHECKING:
     from .simulation import QualificationProfile
 
 Direction = Literal["forward", "backward", "left", "right"]
-Intent = Literal[Direction, "neutral", "invalid", "emergency"]
+Intent = Literal[Direction, "neutral", "settling", "invalid", "emergency"]
 DIRECTIONS = get_args(Direction)
 
 
@@ -238,6 +238,9 @@ class Motion:
             return
         self._sample_at = sample.at
         intent = sample.intent
+        if intent == "settling" and self._direction is None:
+            # A candidate hold after validated neutral is not permission to move.
+            return
         if intent not in DIRECTIONS:
             self.stop("InputReleased" if intent == "neutral" else "InputInvalid")
             self._neutral = intent == "neutral"
