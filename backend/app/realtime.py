@@ -19,6 +19,8 @@ from starlette.websockets import WebSocketDisconnect
 
 from .candidate import CandidateCapture, evidence_box
 from .config import Config
+from .continuity import Acquisition, Observation, Position, RejectedTrack
+from .continuity import observe as observe_continuity
 from .control import (
     HEARTBEAT_FIELDS,
     MAX_ISSUED_FRAMES,
@@ -109,6 +111,7 @@ class Frame:
     id: str
     capture: Capture
     captured_at_ms: int
+    scope: InputScope | None
 
     def age(self, now: float) -> int:
         return self.capture.age_ms + math.ceil((now - self.capture.observed_at) * 1000)
@@ -210,6 +213,7 @@ class Realtime:
         self._readiness: dict[str, bool] = {}
         self._input_deadlines: dict[str, float] = {}
         self._generation = 1
+        self._generation_since = 0.0
         self._lease: Lease | None = None
         self._pause_required_for: str | None = None
         self._starting_session: str | None = None
@@ -234,10 +238,14 @@ class Realtime:
         self._inference_until = 0.0
         self.local_vision: LocalVision | None = None
         self._vision_cause: str | None = "INITIALIZING"
+        self._vision_worker: VisionProcess | None = None
         # Supersession invalidates commit authority while the worker still owns the slot.
         self._candidate_work: str | None = None
         self._candidate_valid = False
         self._pending_association: str | None = None
+        self._pending_capture: CandidateCapture | None = None
+        self._rejected_track: RejectedTrack | None = None
+        self._continuity_ready = asyncio.Event()
         self._paused_by_rejection = False
         self._reject_latched = False
         self._rejected_association: str | None = None
@@ -274,7 +282,9 @@ class Realtime:
     def _advance_generation(self) -> None:
         if self._generation < SAFE_INTEGER:
             self._generation += 1
+            self._generation_since = self.monotonic()
             self._exit_observation = None
+            self._interrupt_tracking()
 
     @property
     def safety_session(self) -> str | None:
@@ -399,6 +409,8 @@ class Realtime:
             if rejected and not self._paused_by_rejection:
                 self._reject_latched = True
                 self._rejected_association, self._pending_association = self._pending_association, None
+                self._rejected_track = RejectedTrack(self._pending_capture) if self._pending_capture else None
+                self._pending_capture = None
                 self._exit_observation = None
                 self._candidate_not_before = self.monotonic()
             self._paused_by_rejection = rejected
@@ -426,10 +438,17 @@ class Realtime:
 
     def _clear_review_continuity(self) -> None:
         self._pending_association = self._rejected_association = None
+        if self._rejected_track:
+            self._continuity_ready.set()
+        self._pending_capture = self._rejected_track = None
         self._paused_by_rejection = False
         self._reject_latched = False
         self._exit_observation = None
         self._candidate_not_before = 0.0
+
+    def _interrupt_tracking(self) -> None:
+        if self._rejected_track:
+            self._rejected_track.interrupt()
 
     def _observe_fixture_presence(self, capture: Capture) -> None:
         scope = self._input_scope()
@@ -954,7 +973,7 @@ class Realtime:
 
     def publish_search_commit(
         self, session: Projection, operation: Projection | None, target: Projection | None, pending: bool,
-        *, recovery_changed: bool = False, candidate: Projection | None = None, association: str | None = None,
+        *, recovery_changed: bool = False, candidate: Projection | None = None, capture: CandidateCapture | None = None,
     ) -> None:
         self.search_committed(session)
         state = self._projection
@@ -975,7 +994,10 @@ class Realtime:
             state["pending_candidate"] = None
         elif candidate is not None:
             state["pending_candidate"] = candidate
-            self._pending_association = association
+            if capture:
+                self._pending_association = capture.association
+                if self.local_vision:
+                    self._pending_capture = capture
         runtime = cast(Projection, state["runtime"])
         runtime.update(effective_session_state=None if ended else session["state"], persistence_pending=pending)
         retention = cast(Projection, state["retention"])
@@ -1056,7 +1078,7 @@ class Realtime:
             await asyncio.sleep(PROJECTION_INTERVAL)
 
     def _check_capture(self, source: Source, capture: Capture, previous: Frame | None, now: float,
-                       profile: QualificationProfile) -> Frame | None:
+                       profile: QualificationProfile, scope: InputScope | None) -> Frame | None:
         if (not capture_identity_valid(capture) or not math.isfinite(capture.observed_at)
                 or capture.observed_at > now or not dimensions_allowed(profile, capture.width, capture.height)
                 or len(capture.jpeg) + 4 >= profile.bound("max_frame_bytes")
@@ -1064,7 +1086,7 @@ class Realtime:
             return None
         utc = self.utc()
         age = capture.age_ms + math.ceil((now - capture.observed_at) * 1000)
-        frame = Frame(token_urlsafe(18), capture, max(0, utc - age))
+        frame = Frame(token_urlsafe(18), capture, max(0, utc - age), scope)
         if frame.header(source, now, utc, profile) is None:
             return None
         if previous:
@@ -1109,7 +1131,7 @@ class Realtime:
                             pending.cancel()
                         self._observe_source(source, None, None, now, profile)
                     elif pending is None or pending.done():
-                        decoding[source] = asyncio.create_task(self._decode_source(source, capture, profile))
+                        decoding[source] = asyncio.create_task(self._decode_source(source, capture, profile, scope))
                 for name, reported_at, sample in (
                     ("Controller", observation.controller_sample_at, observation.controller_input),
                     ("Webcam", observation.gesture_sample_at, observation.gesture_input),
@@ -1173,9 +1195,10 @@ class Realtime:
                 pending.cancel()
             await asyncio.gather(*decoding.values(), return_exceptions=True)
 
-    async def _decode_source(self, source: Source, capture: Capture, profile: QualificationProfile) -> None:
+    async def _decode_source(self, source: Source, capture: Capture, profile: QualificationProfile,
+                             scope: InputScope | None) -> None:
         frame = await asyncio.to_thread(
-            self._check_capture, source, capture, self._frames.get(source), self.monotonic(), profile,
+            self._check_capture, source, capture, self._frames.get(source), self.monotonic(), profile, scope,
         )
         now = self.monotonic()
         if frame is not None and frame.age(now) >= profile.bound("capture_age_limit_ms"):
@@ -1220,6 +1243,8 @@ class Realtime:
             return
         self._readiness["AI"] = cause is None
         if previous is None:
+            self._vision_worker = None
+            self._interrupt_tracking()
             self._path_lost("AI")
         if self._projection is not None:
             self._publish("readiness_changed", None)
@@ -1246,6 +1271,7 @@ class Realtime:
                         raise TimeoutError
                     async with asyncio.timeout(remaining):
                         await asyncio.to_thread(worker.initialize)
+                    self._vision_worker = worker
                     self._set_vision_status(None)
                     await self._match_robot_frames(worker, config, profile)
                 except (OSError, EOFError, TimeoutError, WorkerFault, HttpError, ValueError) as exc:
@@ -1265,6 +1291,51 @@ class Realtime:
                             reap_after_shutdown(worker)
                             raise
             await asyncio.sleep(RESTART_INTERVAL)
+
+    def _continuity_frame(self, track: RejectedTrack, scope: InputScope, profile: QualificationProfile) -> Frame | None:
+        frame = self._frames.get("robot")
+        if (self._rejected_track is track and self._input_scope() == scope
+                and self._active_state in ("Searching", "Paused") and frame and frame.scope == scope
+                and "robot" in self._live_sources
+                and self.component_cause("AI") is None
+                and frame.age(self.monotonic()) < profile.bound("capture_age_limit_ms")
+                and frame.capture.observed_at - frame.capture.age_ms / 1000
+                >= max(self._active_since, self._generation_since, self._candidate_not_before)):
+            return frame
+        return None
+
+    async def maintain_continuity(self) -> None:
+        profile = self.requires_profile()
+        cached_track: RejectedTrack | None = None
+        cached_image: bytes | None = None
+        cached_anchor: Position | None = None
+        observation: Observation | None = None
+        while not self._closed:
+            await self._continuity_ready.wait()
+            self._continuity_ready.clear()
+            track, scope, worker = self._rejected_track, self._input_scope(), self._vision_worker
+            if track and scope and worker and worker.process.is_alive():
+                frame = self._continuity_frame(track, scope, profile)
+                if frame and (track.last is None or frame.id != track.last.frame_id):
+                    capture = frame.capture
+                    anchor = track.anchor
+                    if (observation is None or cached_track is not track or cached_image is not capture.jpeg
+                            or cached_anchor != anchor):
+                        observation = await asyncio.to_thread(
+                            observe_continuity, capture.jpeg, (capture.width, capture.height), track.seed,
+                            track.template, anchor,
+                        )
+                        cached_track, cached_image, cached_anchor = track, capture.jpeg, anchor
+                    if (worker is self._vision_worker and worker.process.is_alive()
+                            and frame is self._continuity_frame(track, scope, profile)):
+                        stamp = Acquisition(scope, worker.instance, frame.id, capture.stream_epoch, capture.clock_epoch,
+                                            capture.sequence, capture.source_us)
+                        if track.accept(stamp, observation):
+                            self._rejected_track = None
+                            self._reject_latched = False
+                            self._candidate_not_before = capture.observed_at
+            if self._rejected_track is not cached_track:
+                cached_track = cached_image = cached_anchor = observation = None
 
     def _matching_frame(self, scope: InputScope, profile: QualificationProfile) -> Frame | None:
         frame, lease, now = self._frames.get("robot"), self._lease, self.monotonic()
@@ -1443,12 +1514,15 @@ class Realtime:
             epoch_changed = bool(old and old.capture.stream_epoch != frame.capture.stream_epoch)
             if epoch_changed and source == "robot":
                 self._exit_observation = None
+                self._interrupt_tracking()
                 if self._lease:
                     self._revoke("CameraEpochChanged")
                 elif self.safety_session is not None:
                     self.record_failure("CameraEpochChanged", self.safety_session)
             if source == "robot" and not self.local_vision:
                 self._observe_fixture_presence(frame.capture)
+            elif source == "robot" and self._rejected_track:
+                self._continuity_ready.set()
             for connection in tuple(self._connections.values()):
                 if connection.channel != channel:
                     continue
@@ -1463,6 +1537,7 @@ class Realtime:
             self._live_sources.discard(source)
             if source == "robot":
                 self._exit_observation = None
+                self._interrupt_tracking()
             if was_live and source == "robot" and self._lease is None:
                 self._path_lost("RobotVideo")
             for connection in tuple(self._connections.values()):

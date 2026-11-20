@@ -39,6 +39,9 @@ def controlled_worker(pipe: LocalPipe, boot: str, worker: str, assets: Path | No
             if header["kind"] == "frame" and (settings / "record-next").exists():
                 (settings / "record-next").unlink()
                 publish(settings / "next-frame.json", json.dumps(header))
+            if header["kind"] == "frame" and (settings / "candidate.json").exists():
+                response["box"] = json.loads((settings / "candidate.json").read_text(encoding="utf-8"))
+                publish(settings / "matched.json", json.dumps(header))
             if header["kind"] == "frame" and (settings / "request").exists():
                 directive = (settings / "request").read_text(encoding="utf-8")
                 (settings / "request").unlink()

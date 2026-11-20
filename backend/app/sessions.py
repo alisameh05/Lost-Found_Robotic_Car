@@ -130,7 +130,7 @@ class SessionCoordinator:
                 saved = await asyncio.to_thread(save_candidate, runtime.storage, work, data, current)
                 if saved and saved.session:
                     realtime.publish_search_commit(saved.session, None, None, bool(runtime._pending),
-                                                   candidate=saved.match, association=work.association)
+                                                   candidate=saved.match, capture=work)
         except (OSError, ValueError, sqlite3.Error, HttpError):
             if await authorized():
                 realtime.observe_storage(False, realtime.monotonic())
