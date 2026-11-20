@@ -4,7 +4,7 @@ import json
 import math
 import re
 from collections.abc import Callable, Mapping
-from dataclasses import dataclass
+from dataclasses import dataclass, replace
 from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
@@ -86,6 +86,16 @@ class QualificationProfile:
 
 
 @dataclass(frozen=True)
+class FixturePresence:
+    scope: InputScope
+    stream_epoch: str
+    clock_epoch: str
+    sequence: int
+    association: str
+    present: bool
+
+
+@dataclass(frozen=True)
 class Capture:
     stream_epoch: str
     clock_epoch: str
@@ -96,6 +106,15 @@ class Capture:
     width: int
     height: int
     jpeg: bytes
+    presence: FixturePresence | None = None
+
+    def fixture_presence(self, scope: InputScope) -> FixturePresence | None:
+        sample = self.presence
+        if sample and (sample.scope, sample.stream_epoch, sample.clock_epoch, sample.sequence) == (
+            scope, self.stream_epoch, self.clock_epoch, self.sequence,
+        ):
+            return sample
+        return None
 
 
 @dataclass(frozen=True)
@@ -213,12 +232,13 @@ def read_sample(jpeg: bytes, profile: QualificationProfile, expected: tuple[int,
 
 
 class StaticScene:
-    def __init__(self, robot: Sample, webcam: Sample):
+    def __init__(self, robot: Sample, webcam: Sample, *, review: bool = False):
         self._samples = (robot, webcam)
         self._epochs = (token_urlsafe(18), token_urlsafe(18))
         self._sequence = 0
         self._session: str | None = None
         self._scope_started = 0.0
+        self._review = review
 
     def observe(self, now: float, scope: InputScope | None = None) -> Observation:
         self._sequence += 1
@@ -230,6 +250,10 @@ class StaticScene:
         if scope and scope.session != self._session:
             self._session, self._scope_started = scope.session, now
         elapsed = now - self._scope_started
+        if scope and self._review:
+            presence = FixturePresence(scope, robot.stream_epoch, robot.clock_epoch, robot.sequence,
+                                       "fixture-wallet", not 12.0 <= elapsed % 24.0 < 18.0)
+            robot = replace(robot, presence=presence)
         held = 1.2 <= elapsed < 4.2
         return Observation(
             robot, webcam, command=True, controller=True, inference=True,
@@ -255,6 +279,7 @@ class CandidateObservation:
     clock_epoch: str
     capture_sequence: int
     box: tuple[float, float, float, float]
+    association: str | None = None
 
 
 Inference = Callable[[InferenceSample], bool | CandidateObservation]
@@ -275,9 +300,12 @@ class FixtureInference:
             self.session, self.started = scope.session, capture.observed_at
         if capture.observed_at - self.started < 2.0:
             return True
+        presence = capture.fixture_presence(scope)
+        if capture.presence is not None and (presence is None or not presence.present):
+            return True
         return CandidateObservation(
             scope, sample.frame_id, capture.stream_epoch, capture.clock_epoch, capture.sequence,
-            (303.5, 203.5, 82.0, 40.0),
+            (303.5, 203.5, 82.0, 40.0), presence.association if presence else None,
         )
 
 
@@ -311,8 +339,8 @@ def load_simulation(selection: str | None) -> Simulation | None:
         if hashes[source] != sha256(jpeg).hexdigest():
             raise ValueError("The sample does not match the fixture evidence.")
         samples.append(read_sample(jpeg, profile))
-    return Simulation(profile, StaticScene(*samples),
-                      inference=FixtureInference() if selection == REVIEW_PROFILE_NAME else None)
+    review = selection == REVIEW_PROFILE_NAME
+    return Simulation(profile, StaticScene(*samples, review=review), inference=FixtureInference() if review else None)
 
 
 def capture_identity_valid(capture: Capture) -> bool:

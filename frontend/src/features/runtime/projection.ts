@@ -427,7 +427,6 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     acquireWorkspace: () => workspace?.acquire(),
     releaseWorkspace: () => workspace?.release(),
     submitSearch(intent: SearchIntent) {
-      if (recordsMode && intent.kind === "reject") return;
       const state = view.snapshot;
       if (!context || !workspace || !state || !view.workspace?.eventsLive) return;
       const active = state.active_session;

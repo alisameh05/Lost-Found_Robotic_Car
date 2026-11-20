@@ -129,7 +129,8 @@ class SessionCoordinator:
             async with runtime._save:
                 saved = await asyncio.to_thread(save_candidate, runtime.storage, work, data, current)
                 if saved and saved.session:
-                    realtime.publish_search_commit(saved.session, None, None, bool(runtime._pending), candidate=saved.match)
+                    realtime.publish_search_commit(saved.session, None, None, bool(runtime._pending),
+                                                   candidate=saved.match, association=work.association)
         except (OSError, ValueError, sqlite3.Error, HttpError):
             if await authorized():
                 realtime.observe_storage(False, realtime.monotonic())
@@ -241,8 +242,8 @@ class SessionCoordinator:
         loop = asyncio.get_running_loop()
 
         def authorize(final: bool) -> None:
-            if request.action == "confirm" and self._pending_stop == session:
-                raise HttpError(409, "INVALID_TRANSITION", "Stop superseded the match confirmation.")
+            if request.action in ("confirm", "reject") and self._pending_stop == session:
+                raise HttpError(409, "INVALID_TRANSITION", f"Stop superseded {request.action}.")
             current = self.realtime.authorize_search(
                 request.client, request.secret, None if request.mode else session, request.mode,
             )

@@ -146,27 +146,34 @@ def acknowledge(db: sqlite3.Connection, row: sqlite3.Row, ids: tuple[str, ...]) 
         db.execute("UPDATE sessions SET revision = revision + 1 WHERE id = ?", (row["id"],))
 
 
-def confirm_candidate(
-    storage: RecordsStorage, db: sqlite3.Connection, row: sqlite3.Row, candidate_id: str,
+def review_candidate(
+    storage: RecordsStorage, db: sqlite3.Connection, row: sqlite3.Row, candidate_id: str, action: str,
 ) -> Payload:
     candidate = db.execute("SELECT captured_at_ms FROM match_events WHERE id = ?", (candidate_id,)).fetchone()
     owner = db.execute("SELECT status, revision FROM objects WHERE id = ?", (row["object_id"],)).fetchone()
     if owner["status"] != "Lost":
         raise HttpError(409, "INVALID_TRANSITION", "The target is already Found.")
     advance_revision(row)
-    advance_revision(owner)
     reviewed = max(storage.now()[0], row["started_at_ms"], candidate["captured_at_ms"])
+    disposition = "Confirmed" if action == "confirm" else "Rejected"
     db.execute("""
-        UPDATE match_events SET disposition = 'Confirmed', reviewed_at_ms = ? WHERE id = ?
-    """, (reviewed, candidate_id))
-    db.execute("""
-        UPDATE objects SET status = 'Found', found_at_ms = ?, revision = revision + 1 WHERE id = ?
-    """, (reviewed, row["object_id"]))
-    db.execute("""
-        UPDATE sessions SET state = 'Ended', ended_at_ms = ?, end_reason = 'Confirmed', pause_causes = '[]',
-                            revision = revision + 1 WHERE id = ?
-    """, (reviewed, row["id"]))
-    storage.checkpoint("before_confirm_commit")
+        UPDATE match_events SET disposition = ?, reviewed_at_ms = ? WHERE id = ?
+    """, (disposition, reviewed, candidate_id))
+    if action == "confirm":
+        advance_revision(owner)
+        db.execute("""
+            UPDATE objects SET status = 'Found', found_at_ms = ?, revision = revision + 1 WHERE id = ?
+        """, (reviewed, row["object_id"]))
+        db.execute("""
+            UPDATE sessions SET state = 'Ended', ended_at_ms = ?, end_reason = 'Confirmed', pause_causes = '[]',
+                                revision = revision + 1 WHERE id = ?
+        """, (reviewed, row["id"]))
+    else:
+        causes = [cause for cause in json.loads(row["pause_causes"]) if cause["cause"] != "CandidateReview"]
+        causes.append({"cause": "ReviewRejected", "failure_id": None})
+        db.execute("UPDATE sessions SET pause_causes = ?, revision = revision + 1 WHERE id = ?",
+                   (canonical_json(causes), row["id"]))
+    storage.checkpoint(f"before_{action}_commit")
     match = storage.match_payload(db.execute(MATCH_ROWS + " WHERE c.id = ?", (candidate_id,)).fetchone())
     evidence = match["evidence_media"]
     if not isinstance(evidence, dict) or evidence["availability"] != "Available":
@@ -194,7 +201,7 @@ def save_search(
             authorize(False)
             match = None
             target = None
-            if request.mode or request.action == "confirm":
+            if request.mode or request.action in ("confirm", "reject"):
                 inspection = storage._inspect(db, now, preparing)
                 if inspection.problem:
                     raise storage_unavailable(inspection.problem)
@@ -230,13 +237,13 @@ def save_search(
                 """, (now, session_id, session_id))
                 if pending and row["registered_at_ms"] + retention_ms(days) > now:
                     match = {**storage.match_payload(pending), "disposition": "NotReviewed"}
-            if request.action == "confirm":
+            if request.action in ("confirm", "reject"):
                 assert request.candidate_id is not None
-                match = confirm_candidate(storage, db, row, request.candidate_id)
+                match = review_candidate(storage, db, row, request.candidate_id, request.action)
 
             saved = db.execute("SELECT * FROM sessions WHERE id = ?", (session_id,)).fetchone()
             session = storage.session_payload(saved)
-            if request.action != "confirm":
+            if request.action not in ("confirm", "reject"):
                 storage.checkpoint(f"before_{request.action}_commit")
             found = None
             if request.action == "confirm":
@@ -261,8 +268,8 @@ def save_search(
                                        acknowledged=request.failure_ids)
         finally:
             db.row_factory = None
-    if request.action == "resume":
-        storage.checkpoint("after_resume_commit")
+    if request.action in ("resume", "reject"):
+        storage.checkpoint(f"after_{request.action}_commit")
     return saved_search
 
 

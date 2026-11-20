@@ -28,6 +28,7 @@ class CandidateCapture:
     captured_at_ms: int
     capture: Capture
     box: Box
+    association: str | None = None
 
 
 def evidence_box(raw: tuple[float, float, float, float], width: int, height: int) -> Box | None:
