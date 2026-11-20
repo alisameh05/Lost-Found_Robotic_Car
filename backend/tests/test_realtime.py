@@ -2,7 +2,7 @@ import asyncio
 import json
 import socket
 import sqlite3
-from collections import Counter
+from collections import Counter, deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager
@@ -313,7 +313,8 @@ def test_control_is_exclusive_and_historical_retries_do_not_reacquire(tmp_path: 
 def service(root: Path, *, blocked: bool = False, event_limit: int | None = None,
             frame_limit: int | None = None, revocations: list[Revocation] | None = None,
             inference: Inference | None = None, blocked_connection: int = 1,
-            checkpoint: Callable[[str], None] | None = None, wall: Callable[[], int] | None = None) -> Iterator[Loopback]:
+            checkpoint: Callable[[str], None] | None = None, wall: Callable[[], int] | None = None,
+            local_vision: bool = False) -> Iterator[Loopback]:
     clock = Clock()
     simulation = load_simulation("fixture-v1")
     assert simulation
@@ -337,7 +338,8 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-        app = create_app(Config(root, backend_port=port), storage=storage,
+        config = Config(root, backend_port=port, simulation_profile="local-yoloe-v1" if local_vision else None)
+        app = create_app(config, storage=storage,
                          simulation=Simulation(profile, observations, command, inference),
                          on_channel_invalidated=lambda client, channel: invalidations.append((client, channel)),
                          **({"on_control_revoked": revocations.append} if revocations is not None else {}))
@@ -1054,6 +1056,7 @@ class WorkspaceDriver:
         self.flags: dict[str, object] = {}
         self.freeze = False
         self.latest: dict | None = None
+        self.received_frames: deque[dict] = deque(maxlen=24)
         self.stop = Event()
         self.messages: Queue[dict] = Queue(128)
 
@@ -1083,6 +1086,7 @@ class WorkspaceDriver:
         while not self.stop.is_set():
             try:
                 latest = frame(self.video)[0]
+                self.received_frames.append(latest)
                 if not self.freeze or self.latest is None:
                     self.latest = latest
                 self.events.send(json.dumps(heartbeat(
@@ -1109,6 +1113,9 @@ def driving_search(
         try:
             wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_start"][mode])
             result = laf.http.post(API + "/sessions", headers=headers, json=start)
+            if result.status_code == 202:
+                wait_for(laf.http, "/snapshot", headers, lambda state: state["active_session"] is not None)
+                result = laf.http.post(API + "/sessions", headers=headers, json=start)
             assert result.status_code == 201, result.text
             driver.session = result.json()["result"]["session"]
             yield headers, driver
@@ -1467,13 +1474,15 @@ def test_acknowledgment_rejects_a_failure_from_another_saved_search(tmp_path: Pa
     with service(tmp_path) as laf:
         with driving_search(laf) as (headers, driver):
             emergency = laf.http.post(API + "/emergency-stop", headers=headers, json={"request_id": str(uuid4())})
-            assert emergency.status_code == 200, emergency.text
+            assert emergency.status_code in (200, 202), emergency.text
             failure_id = emergency.json()["failure_id"]
             paused = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
             with recover_workspace(laf, driver.session) as (owner, recovered):
                 settled = wait_for(laf.http, "/snapshot", owner, lambda s: s["failures"][0]["restored"] and
                                    s["active_session"]["revision"] > paused["active_session"]["revision"])
-                assert search_action(laf, owner, recovered, "stop", settled["active_session"]["revision"]).status_code == 200
+                stopped = search_action(laf, owner, recovered, "stop", settled["active_session"]["revision"])
+                assert stopped.status_code in (200, 202), stopped.text
+                wait_for(laf.http, f"/sessions/{driver.session['id']}", owner, lambda session: session["state"] == "Ended")
         with driving_search(laf, takeover=True) as (headers, driver):
             rejected = search_action(laf, headers, driver, "acknowledge", 1, failure_ids=[failure_id])
             assert rejected.status_code == 409 and rejected.json()["code"] == "OWNERSHIP_MISMATCH"
@@ -1696,7 +1705,7 @@ def test_emergency_revokes_while_an_ordinary_writer_is_blocked(tmp_path: Path, m
         hold = True
         try:
             busy = submit(laf.http, headers, wait=False)
-            assert busy.status_code == 202 and entered.is_set()
+            assert busy.status_code == 202 and entered.wait(2)
             excess = submit(laf.http, headers, wait=False)
             assert excess.status_code == 503 and excess.json()["code"] == "CAPACITY_REACHED"
             body_started, end_body = Event(), Event()

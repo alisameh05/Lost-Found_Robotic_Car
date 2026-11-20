@@ -28,7 +28,14 @@ const causes: Partial<Record<ErrorCode, string>> = {
 };
 const tones = { Ready: "success", Initializing: "warning", Unavailable: "danger" } as const;
 
-export function PathRow({ observation }: { observation: Component }) {
+export function localMatchingBlocker(observation: Component) {
+  if (observation.status === "Initializing") return "Offline YOLOE is initializing.";
+  if (observation.cause_codes.includes("MEDIA_UNAVAILABLE")) return "Check the local YOLOE checkpoint or saved reference.";
+  if (observation.cause_codes.includes("PROTOCOL_UNSUPPORTED")) return "Check the pinned YOLOE runtime and worker protocol.";
+  return "Offline YOLOE is unavailable. Check the backend diagnostics.";
+}
+
+export function PathRow({ observation, localMatching }: { observation: Component; localMatching?: boolean }) {
   const { component, status, cause_codes } = observation;
   const { label, icon: Icon, check } = paths[component];
   const explanations = new Set(cause_codes.map((code) => causes[code]).filter(Boolean));
@@ -40,7 +47,9 @@ export function PathRow({ observation }: { observation: Component }) {
           <StatusBadge tone={tones[status]}>{status}</StatusBadge>
         </summary>
         <div className={styles.troubleshooting}>
-          {[...explanations].map((explanation) => <p key={explanation}>{explanation}</p>)}
+          {localMatching && component === "AI" && status !== "Ready"
+            ? <p>{localMatchingBlocker(observation)}</p>
+            : [...explanations].map((explanation) => <p key={explanation}>{explanation}</p>)}
           <p>{check}</p>
         </div>
       </details>

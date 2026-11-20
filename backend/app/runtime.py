@@ -29,6 +29,7 @@ from .storage import (
     storage_unavailable,
 )
 from .unicode_search import casefold
+from .vision_worker import Prompt, WorkerFault
 
 CLIENT_IDLE_SECONDS = 30 * 60
 CURSOR_LIFETIME_SECONDS = 30 * 60
@@ -117,6 +118,22 @@ class RecordsRuntime:
         self.sessions = SessionCoordinator(self, self.realtime)
         self.realtime.on_candidate = self.sessions.admit_candidate
         return self.realtime
+
+    async def match_prompt(self, owner: str) -> Prompt:
+        return await asyncio.to_thread(self._read_match_prompt, owner, self.preparing())
+
+    def _read_match_prompt(self, owner: str, preparing: Collection[str]) -> Prompt:
+        try:
+            target = self.storage.read_object(owner, preparing)
+            reference, roi = target["reference_media"], target["roi"]
+            assert isinstance(reference, dict) and isinstance(roi, dict)
+            if target["status"] != "Lost" or reference["availability"] != "Available":
+                raise WorkerFault("The saved reference is unavailable", "MEDIA_UNAVAILABLE")
+            content_type, image = self.storage.read_media(reference["id"], preparing)
+        except sqlite3.Error as exc:
+            raise WorkerFault("The saved reference could not be read from storage") from exc
+        return Prompt(reference["id"], content_type, reference["width"], reference["height"],
+                      (roi["x"], roi["y"], roi["width"], roi["height"]), image)
 
     def frontend_profile(self) -> dict[str, int | str] | None:
         profile = self.realtime.profile if self.realtime else None
@@ -537,10 +554,9 @@ class RecordsRuntime:
             "components": [
                 {"component": "Backend", "status": "Ready", "cause_codes": []},
                 {"component": "Storage", "status": status, "cause_codes": cause},
-                *({"component": name, "status": "Unavailable" if code else "Ready",
-                   "cause_codes": [code] if code else []}
-                  for name in DEFERRED_COMPONENTS
-                  for code in [self.realtime.component_cause(name) if self.realtime else "NOT_READY"]),
+                *(self.realtime.component_status(name) if self.realtime else
+                  {"component": name, "status": "Unavailable", "cause_codes": ["NOT_READY"]}
+                  for name in DEFERRED_COMPONENTS),
             ],
             "can_start": {"Gestures": False, "Controller": False},
             "can_resume": False,

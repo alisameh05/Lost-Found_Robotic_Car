@@ -8,6 +8,7 @@ from collections import deque
 from collections.abc import Awaitable, Callable, Collection
 from dataclasses import dataclass, field
 from hashlib import sha256
+from pathlib import Path
 from secrets import compare_digest, token_urlsafe
 from typing import Literal, cast
 from uuid import uuid4
@@ -50,6 +51,20 @@ from .simulation import (
     capture_identity_valid,
     dimensions_allowed,
     read_sample,
+)
+from .vision_worker import (
+    PROBE_INTERVAL,
+    PROGRESS_SECONDS,
+    RESTART_INTERVAL,
+    STARTUP_SECONDS,
+    FrameLimits,
+    Prompt,
+    VisionProcess,
+    WorkerFault,
+    bounded_call,
+    close_process,
+    launch_process,
+    reap_after_shutdown,
 )
 
 Channel = Literal["events", "robot-video", "webcam-video"]
@@ -114,6 +129,13 @@ class Frame:
         ):
             return None
         return metadata
+
+
+@dataclass(frozen=True)
+class LocalVision:
+    assets: Path | None
+    settings: Path
+    load_prompt: Callable[[str], Awaitable[Prompt]]
 
 
 @dataclass(frozen=True)
@@ -210,6 +232,8 @@ class Realtime:
         self._storage_ready = False
         self._storage_until = 0.0
         self._inference_until = 0.0
+        self.local_vision: LocalVision | None = None
+        self._vision_cause: str | None = "INITIALIZING"
         # Supersession invalidates commit authority while the worker still owns the slot.
         self._candidate_work: str | None = None
         self._candidate_valid = False
@@ -656,6 +680,8 @@ class Realtime:
         if name == "QualificationProfile":
             return None
         now = self.monotonic()
+        if name == "AI" and self.local_vision:
+            return self._vision_cause or ("NOT_READY" if now >= self._inference_until else None)
         if name == "Storage":
             return None if self._storage_ready and now < self._storage_until else "STORAGE_UNAVAILABLE"
         if name == "RobotVideo":
@@ -671,6 +697,14 @@ class Realtime:
         if name in ("Webcam", "Controller") and now >= self._input_deadlines.get(name, 0):
             return "NOT_READY"
         return None if self._readiness.get(name, False) else "NOT_READY"
+
+    def component_status(self, name: str) -> Projection:
+        cause = self.component_cause(name)
+        return {
+            "component": name,
+            "status": "Initializing" if cause == "INITIALIZING" else "Unavailable" if cause else "Ready",
+            "cause_codes": [cause] if cause else [],
+        }
 
     def remove(self, connection: Connection, code: int) -> None:
         key = (connection.client, connection.channel)
@@ -980,8 +1014,9 @@ class Realtime:
         if not projection["storage_problem"] and self.component_cause("Storage") is not None:
             live["Storage"] = False
         components = [
-            {"component": name, "status": "Ready" if live[name] else "Unavailable",
-             "cause_codes": [] if live[name] else ["STORAGE_UNAVAILABLE" if name == "Storage" else "NOT_READY"]}
+            (self.component_status(name) if name == "AI" else
+             {"component": name, "status": "Ready" if live[name] else "Unavailable",
+              "cause_codes": [] if live[name] else ["STORAGE_UNAVAILABLE" if name == "Storage" else "NOT_READY"]})
             if (name := str(component["component"])) in live else component
             for component in cast(list[Projection], readiness["components"])
         ]
@@ -1094,7 +1129,8 @@ class Realtime:
                     else:
                         self._input_deadlines.pop(name, None)
                 self._set_readiness({
-                    "Command": observation.command, "AI": observation.inference,
+                    "Command": observation.command,
+                    "AI": self._vision_cause is None if self.local_vision else observation.inference,
                     "Controller": observation.controller and now < self._input_deadlines.get("Controller", now),
                     "RobotVideo": "robot" in self._live_sources,
                     "Webcam": "webcam" in self._live_sources and now < self._input_deadlines.get("Webcam", now),
@@ -1171,6 +1207,138 @@ class Realtime:
                     if scope and isinstance(available, CandidateObservation):
                         self._accept_candidate(scope, frame, available, now)
             await asyncio.sleep(CAPTURE_INTERVAL)
+
+    def configure_local_vision(self, assets: Path | None, settings: Path,
+                               load_prompt: Callable[[str], Awaitable[Prompt]]) -> None:
+        self.local_vision = LocalVision(assets, settings, load_prompt)
+
+    def _set_vision_status(self, cause: str | None) -> None:
+        previous, self._vision_cause = self._vision_cause, cause
+        if cause is None:
+            self._inference_until = self.monotonic() + PROGRESS_SECONDS
+        if previous == cause:
+            return
+        self._readiness["AI"] = cause is None
+        if previous is None:
+            self._path_lost("AI")
+        if self._projection is not None:
+            self._publish("readiness_changed", None)
+
+    async def maintain_local_vision(self) -> None:
+        config, profile = self.local_vision, self.requires_profile()
+        assert config is not None
+        limits = FrameLimits(*(profile.bound(key) for key in (
+            "max_frame_bytes", "max_frame_width", "max_frame_height", "max_frame_pixels",
+        )))
+        while not self._closed:
+            started = self.monotonic()
+            try:
+                worker = await launch_process(
+                    lambda: VisionProcess(self.boot, config.assets, config.settings, limits),
+                    STARTUP_SECONDS, lambda: self._set_vision_status("NOT_READY"),
+                )
+            except (OSError, ValueError):
+                self._set_vision_status("NOT_READY")
+            else:
+                try:
+                    remaining = STARTUP_SECONDS - (self.monotonic() - started)
+                    if remaining <= 0:
+                        raise TimeoutError
+                    async with asyncio.timeout(remaining):
+                        await asyncio.to_thread(worker.initialize)
+                    self._set_vision_status(None)
+                    await self._match_robot_frames(worker, config, profile)
+                except (OSError, EOFError, TimeoutError, WorkerFault, HttpError, ValueError) as exc:
+                    cause = exc.cause if isinstance(exc, WorkerFault) else "NOT_READY"
+                    if isinstance(exc, HttpError) and exc.code == "MEDIA_UNAVAILABLE":
+                        cause = exc.code
+                    self._set_vision_status(cause)
+                finally:
+                    while not await close_process(worker):
+                        if self._closed:
+                            reap_after_shutdown(worker)
+                            break
+                        self._set_vision_status("NOT_READY")
+                        try:
+                            await asyncio.sleep(RESTART_INTERVAL)
+                        except asyncio.CancelledError:
+                            reap_after_shutdown(worker)
+                            raise
+            await asyncio.sleep(RESTART_INTERVAL)
+
+    def _matching_frame(self, scope: InputScope, profile: QualificationProfile) -> Frame | None:
+        frame, lease, now = self._frames.get("robot"), self._lease, self.monotonic()
+        if (frame and lease and "robot" in self._live_sources and scope == self._motion_scope()
+                and frame.age(now) < profile.bound("capture_age_limit_ms")
+                and frame.capture.observed_at - frame.capture.age_ms / 1000
+                >= max(self._active_since, lease.generation_started or 0.0)):
+            return frame
+        return None
+
+    async def _match_robot_frames(self, worker: VisionProcess, config: LocalVision,
+                                  profile: QualificationProfile) -> None:
+        prepared: tuple[str, str] | None = None
+        last_frame_id: str | None = None
+        next_probe = 0.0
+        while not self._closed:
+            now, scope = self.monotonic(), self._motion_scope()
+            remaining = self._inference_until - now
+            if remaining <= 0 or not worker.process.is_alive():
+                raise WorkerFault("Local YOLOE stopped making progress")
+            if prepared and prepared[0] != self._active_session:
+                await bounded_call(lambda: worker.exchange("clear"), remaining)
+                prepared = None
+            elif scope is None and now >= next_probe:
+                await bounded_call(lambda: worker.exchange("probe"), remaining)
+                if self.monotonic() >= self._inference_until or not worker.process.is_alive():
+                    raise WorkerFault("Local YOLOE missed its health deadline")
+                if self._motion_scope() is None:
+                    self._set_vision_status(None)
+                next_probe = self.monotonic() + PROBE_INTERVAL
+            elif scope and self._active_owner:
+                if prepared is None or prepared[0] != scope.session:
+                    try:
+                        async with asyncio.timeout(remaining):
+                            prompt = await config.load_prompt(self._active_owner)
+                    except (WorkerFault, HttpError):
+                        if self._active_session != scope.session:
+                            continue
+                        raise
+                    if self._active_session != scope.session:
+                        continue
+                    remaining = self._inference_until - self.monotonic()
+                    await bounded_call(
+                        lambda: worker.exchange("prepare", prompt.fields(scope.session), prompt.image), remaining,
+                    )
+                    prepared = (scope.session, prompt.id)
+                    del prompt  # Only the worker retains the decoded reference.
+                # The acquisition slot is shared with display. Sample it only when the pipe is free,
+                # so every intervening acquisition replaces the one waiting frame.
+                frame = self._matching_frame(scope, profile)
+                if frame and frame.id != last_frame_id:
+                    last_frame_id = frame.id
+                    capture = frame.capture
+                    fields = {
+                        "session": scope.session, "generation": scope.generation, "prompt": prepared[1],
+                        "frame": frame.id, "stream": capture.stream_epoch, "clock": capture.clock_epoch,
+                        "sequence": capture.sequence, "source_us": capture.source_us,
+                        "width": capture.width, "height": capture.height, "size": len(capture.jpeg),
+                    }
+                    box = await bounded_call(lambda: worker.exchange("frame", fields, capture.jpeg),
+                                             self._inference_until - self.monotonic())
+                    latest, now = self._matching_frame(scope, profile), self.monotonic()
+                    if now >= self._inference_until or not worker.process.is_alive():
+                        raise WorkerFault("Local YOLOE missed its frame deadline")
+                    if (latest and frame.age(now) < profile.bound("capture_age_limit_ms")
+                            and (latest.capture.stream_epoch, latest.capture.clock_epoch)
+                            == (capture.stream_epoch, capture.clock_epoch)):
+                        self._set_vision_status(None)
+                        if box:
+                            x, y, right, bottom = box
+                            result = CandidateObservation(scope, frame.id, capture.stream_epoch, capture.clock_epoch,
+                                                          capture.sequence, (x, y, right - x, bottom - y))
+                            self._accept_candidate(scope, frame, result, now)
+            await asyncio.sleep(0.015)
 
     def _accept_candidate(self, scope: InputScope, frame: Frame, result: CandidateObservation, now: float) -> None:
         profile, latest = self.profile, self._frames.get("robot")
@@ -1279,7 +1447,7 @@ class Realtime:
                     self._revoke("CameraEpochChanged")
                 elif self.safety_session is not None:
                     self.record_failure("CameraEpochChanged", self.safety_session)
-            if source == "robot":
+            if source == "robot" and not self.local_vision:
                 self._observe_fixture_presence(frame.capture)
             for connection in tuple(self._connections.values()):
                 if connection.channel != channel:
