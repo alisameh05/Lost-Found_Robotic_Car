@@ -1,4 +1,5 @@
 import type { Channel, EventEnvelope, FrontendProfile, LeaseAcquire, LeaseRelease, LeaseResponse, Snapshot, StartRequest } from "@/generated/api-v1";
+import { LOCAL_GESTURES_PROFILE } from "@/lib/config";
 import { conforms } from "@/lib/fixture-contracts";
 import { openFrameDisplay } from "@/lib/frame-display";
 import {
@@ -158,7 +159,8 @@ export function openWorkspace({
   robot.setAttribute("aria-label", connectedBackend ? "Simulated robot camera view" : "Fixture robot camera view");
   const webcam = document.createElement("canvas");
   webcam.setAttribute("role", "img");
-  webcam.setAttribute("aria-label", "Fixture laptop webcam view");
+  webcam.setAttribute("aria-label", profile.profile_id === LOCAL_GESTURES_PROFILE
+    ? "Mirrored webcam preview and recognition" : "Fixture laptop webcam view");
   let view: WorkspaceView = { eventsLive: false, previewLive: false, webcamLive: false, controlling: false, usable: false, acquiring: false };
   let state: Snapshot | undefined;
   let disposed = false;

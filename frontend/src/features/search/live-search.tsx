@@ -13,7 +13,7 @@ import { devicePaths } from "@/features/devices";
 import { objectHref, RecordAbsent, RecordReadFailure, RecordTime, ReferenceImage, sessionHref } from "@/features/objects";
 import { recordAbsence, searchActionKey, unresolved, useRefreshRuntime, useRuntime, useRuntimeRead, useRuntimeView } from "@/features/runtime";
 import type { Snapshot } from "@/generated/api-v1";
-import { LOCAL_YOLOE_PROFILE } from "@/lib/config";
+import { LOCAL_GESTURES_PROFILE, LOCAL_YOLOE_PROFILE } from "@/lib/config";
 import { pendingReview } from "@/lib/match-evidence";
 import { gestureFeedback } from "@/lib/gesture-input";
 import { ActionFeedback } from "./action-feedback";
@@ -156,20 +156,29 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   if (!session || !object) return null;
   const mode = session.control_mode;
   const gestures = mode === "Gestures";
+  const localGestures = profile?.profile_id === LOCAL_GESTURES_PROFILE;
+  const webcamLive = !!workspace?.webcamLive && (gestures || !localGestures);
+  const recognitionReady = connected && readiness.components.some(
+    ({ component, status }) => component === "Webcam" && status === "Ready",
+  );
   const sample = owner && ready ? connection?.fixture?.search.readInput() : undefined;
   const permission = connected ? effective.motion_permission : "Unknown";
   const connectedInput = permission === "Armed" ? "Simulated direction held"
     : permission === "Arming" ? "Neutral accepted · waiting for a fresh hold"
     : state === "Paused" ? "Simulated movement stopped"
     : "Waiting for neutral simulated input";
-  const input = recordsMode ? connectedInput : gestures ? gestureFeedback(sample) : sample === "invalid" ? "Conflicting D-pad input"
+  const localGestureInput = !recognitionReady ? "Gesture recognition unavailable"
+    : webcamLive ? "Recognition shown on the mirrored preview" : "Webcam preview unavailable";
+  const input = localGestures && gestures ? localGestureInput
+    : recordsMode ? connectedInput : gestures ? gestureFeedback(sample) : sample === "invalid" ? "Conflicting D-pad input"
     : sample && sample !== "neutral" ? `Held ${sample}` : "No direction held";
   const searching = state === "Searching";
   const localMatching = profile?.profile_id === LOCAL_YOLOE_PROFILE;
   const matching = searching && connected && readiness.components.some(({ component, status }) => component === "AI" && status === "Ready");
   const matchingLabel = localMatching
     ? matching ? "Offline YOLOE matching active" : "Offline YOLOE matching suspended"
-    : matching ? recordsMode ? "Simulated AI matching active" : "AI matching active" : "AI matching suspended";
+    : matching ? recordsMode ? "Simulated AI matching active" : "AI matching active"
+      : localGestures ? "Simulated AI matching suspended" : "AI matching suspended";
   const robotLive = workspace?.previewLive && readiness.components.some(({ component, status }) =>
     component === "RobotVideo" && status === "Ready");
   const canAcquire = connected && !!workspace?.usable && workspace.previewLive &&
@@ -206,7 +215,9 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   }
 
   return <div className={styles.page}>
-    <PageHeader title="Live Search Workspace" description={localMatching
+    <PageHeader title="Live Search Workspace" description={localGestures
+      ? `${gestures ? "Local webcam gestures" : "Simulated controller"} · Simulated robot video and commands`
+      : localMatching
       ? `Simulated robot video, commands and input · ${permission}`
       : recordsMode ? `Backend simulation · ${permission}` : undefined} actions={<>
       <Button onClick={() => setHelp(!help)} aria-expanded={help} aria-controls={help ? "live-control-help" : undefined}>Control Help</Button>
@@ -266,9 +277,11 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
         <div className={styles.cameras}>
           <Panel className={styles.camera} aria-labelledby="webcam-title">
             <header><h2 id="webcam-title"><Webcam aria-hidden="true" />Laptop webcam</h2>
-              <StatusBadge tone={workspace?.webcamLive ? "success" : "muted"}>{workspace?.webcamLive ? "Live sample" : "Unavailable"}</StatusBadge></header>
-            <div ref={webcam} className={`${styles.surface} ${gestures ? styles.mirrored : ""}`} data-live={!!workspace?.webcamLive} />
-            <p>{gestures ? input : "Gesture control inactive"}</p>
+              <StatusBadge tone={webcamLive ? "success" : "muted"}>{webcamLive ? localGestures ? "Live • Mirrored" : "Live sample"
+                : localGestures && !gestures ? "Inactive" : "Unavailable"}</StatusBadge></header>
+            <div ref={webcam} className={`${styles.surface} ${gestures && !localGestures ? styles.mirrored : ""}`}
+              data-live={webcamLive} aria-hidden={localGestures && !gestures ? true : undefined} />
+            {(!localGestures || !gestures) && <p>{gestures ? input : "Gesture control inactive"}</p>}
           </Panel>
           <Panel className={styles.camera} aria-labelledby="robot-title">
             <header><h2 id="robot-title"><Video aria-hidden="true" />Robot camera</h2>

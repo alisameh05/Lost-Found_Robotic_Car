@@ -20,6 +20,8 @@ class Config:
     simulation_profile: str | None = None
     yoloe_assets: Path | None = None
     recorded_robot_jpeg: Path | None = None
+    webcam_device_path: str | None = None
+    gesture_assets: Path | None = None
 
     @property
     def host(self) -> str:
@@ -55,5 +57,7 @@ class Config:
             raise ValueError("LAF_FRONTEND_PORT and LAF_BACKEND_PORT must be different.")
         assets = os.environ.get("LAF_YOLOE_ASSETS")
         robot = os.environ.get("LAF_RECORDED_ROBOT_JPEG")
+        gesture_assets = os.environ.get("LAF_GESTURE_ASSETS")
         return cls(root, frontend, backend, os.environ.get("LAF_SIMULATION_PROFILE"),
-                   Path(assets).absolute() if assets else None, Path(robot).absolute() if robot else None)
+                   Path(assets).absolute() if assets else None, Path(robot).absolute() if robot else None,
+                   os.environ.get("LAF_WEBCAM_DEVICE_PATH"), Path(gesture_assets).absolute() if gesture_assets else None)

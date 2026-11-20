@@ -21,6 +21,7 @@ async function startBackend(options: {
   cleanupFault?: string; settingsGate?: string; stopGate?: string; simulation?: boolean;
   reviewSimulation?: boolean; crashCandidate?: boolean; noWebcam?: boolean; crashSearch?: "start" | "resume";
   yoloe?: { assets: string; robot?: string };
+  gestures?: { assets?: string; devicePath?: string };
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
@@ -37,8 +38,10 @@ async function startBackend(options: {
       ...process.env, LOCALAPPDATA: parent, LAF_DATA_ROOT: join(parent, "records"),
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
       LAF_SIMULATION_PROFILE: options.yoloe ? "local-yoloe-v1"
-        : options.reviewSimulation ? "fixture-review-v1" : options.simulation ? "fixture-v1" : undefined,
+        : options.gestures ? "local-gestures-v1"
+          : options.reviewSimulation ? "fixture-review-v1" : options.simulation ? "fixture-v1" : undefined,
       LAF_YOLOE_ASSETS: options.yoloe?.assets, LAF_RECORDED_ROBOT_JPEG: options.yoloe?.robot,
+      LAF_WEBCAM_DEVICE_PATH: options.gestures?.devicePath, LAF_GESTURE_ASSETS: options.gestures?.assets,
       LAF_TEST_NO_WEBCAM: options.noWebcam ? "1" : undefined,
     },
   });
@@ -1285,6 +1288,63 @@ async function startSavedSearch(page: Page, mode: "Gestures" | "PS4 controller")
   await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
   return new URL(page.url()).pathname.replace(/\/live$/, "");
 }
+
+test("blocks Gestures without the selected webcam and keeps Controller available", async ({ page }) => {
+  await startBackend({ gestures: {} });
+  await selectTarget(page, sourceImage(), "Webcam readiness");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  await page.getByRole("radio", { name: "Gestures" }).check();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  const start = page.getByRole("button", { name: "Start Search" });
+  await expect(page.getByText("Local webcam gestures · Simulated robot video, commands and matching")).toBeVisible();
+  await expect(start).toBeDisabled();
+  await page.getByRole("radio", { name: "PS4 controller" }).check();
+  await start.click();
+  await expect(page.getByText("Gesture control inactive")).toBeVisible();
+  await expect(page.getByText("Simulated controller · Simulated robot video and commands")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Emergency Stop", exact: true })).toBeEnabled();
+});
+
+test("receives the selected Windows webcam through the protected mirrored workspace", async ({ page }) => {
+  const assets = process.env.LAF_TEST_GESTURE_ASSETS;
+  const devicePath = process.env.LAF_TEST_WEBCAM_DEVICE_PATH;
+  test.skip(!assets || !devicePath, "Requires the selected Windows camera and pinned Hand Landmarker asset");
+  test.setTimeout(45_000);
+  await startBackend({ gestures: { assets, devicePath } });
+  const { requests, sockets } = observe(page);
+  let webcamFrames = 0;
+  page.on("websocket", (socket) => {
+    if (socket.url().endsWith("/video/webcam")) socket.on("framereceived", () => { webcamFrames++ });
+  });
+  await page.addInitScript(() => {
+    if (navigator.mediaDevices) Object.defineProperty(navigator.mediaDevices, "getUserMedia", {
+      value: () => Promise.reject(new Error("Webcam access belongs to the backend")),
+    });
+  });
+  await selectTarget(page, sourceImage(), "Local webcam preview");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  await page.getByRole("radio", { name: "Gestures" }).check();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  const start = page.getByRole("button", { name: "Start Search" });
+  await expect(start).toBeEnabled({ timeout: 20_000 });
+  await start.click();
+  await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
+  const preview = page.getByRole("img", { name: "Mirrored webcam preview and recognition" });
+  await expect(preview).toHaveAttribute("width", "640");
+  await expect(page.getByText("Live • Mirrored")).toBeVisible();
+  await expect(page.getByText("Recognition shown on the mirrored preview", { exact: true })).toBeVisible();
+  await expect(page.getByText(/^Motion permission · /)).toBeVisible();
+  await expect(page.getByText(/Simulated AI matching active/)).toBeVisible();
+  await expect(page.getByRole("button", { name: "Emergency Stop", exact: true })).toBeEnabled();
+  expect(sockets).toContain("ws://127.0.0.1:8110/api/v1/video/webcam");
+  expect(requests.filter((request) => request.includes("/video/webcam"))).toEqual([]);
+  await expect.poll(() => webcamFrames).toBeGreaterThanOrEqual(8);
+  await expect(page.getByText("Committed session · Searching")).toBeVisible();
+});
 
 test("shows unavailable offline assets in Search Setup and Devices", async ({ page }) => {
   await startBackend({ yoloe: { assets: join(parent, "missing-assets") } });

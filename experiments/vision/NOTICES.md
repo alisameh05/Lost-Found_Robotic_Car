@@ -12,6 +12,7 @@ the model binaries, upstream photographs, Python wheels or a packaged product.
 | [Hand Tracking model card](https://storage.googleapis.com/mediapipe-assets/Model%20Card%20Hand%20Tracking%20%28Lite_Full%29%20with%20Fairness%20Oct%202021.pdf) | October 2021 card; float16 task bundle version 1, exact SHA-256 in assets.json | Card page 2 explicitly states Apache License 2.0. Preserve notices and attribution on redistribution. |
 | [PyTorch 2.6.0](https://github.com/pytorch/pytorch/tree/v2.6.0), [torchvision 0.21.0](https://github.com/pytorch/vision/tree/v0.21.0) | Windows CPython 3.11 CUDA 12.4 wheels, hashes in requirements.lock | BSD family upstream licenses; bundled CUDA/cuDNN and third-party notices also apply. Do not treat all bundled binaries as BSD-only. |
 | OpenCV / opencv-contrib 4.11.0.86 | Exact wheels in requirements.lock | Apache-2.0 plus bundled third-party notices; retain the wheel license inventory. |
+| [cv2-enumerate-cameras](https://github.com/lukehugh/cv2_enumerate_cameras/tree/7eaa2290424b87d0e4f40dfe8395019ee7b3293c) | 1.4.0, Windows x64 abi3 wheel pinned by SHA-256 | MIT. Retain the installed wheel's license and any bundled notices. |
 | FastAPI / Uvicorn | 0.163.2 / 0.41.0 | MIT / BSD family; package metadata and license files inventoried. |
 | Pygame / SDL | Pygame 2.6.1; actual SDL version in evidence | Pygame LGPL; SDL and included libraries have their own notices. Preserve library replacement/source obligations when packaging. |
 | pySerial | 3.5 | BSD family; retained installed license metadata. |

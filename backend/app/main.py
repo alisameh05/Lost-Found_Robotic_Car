@@ -35,8 +35,15 @@ from .registration_input import NAME_LIMIT, normalize_name, parse_registration
 from .retention_input import parse_retention
 from .runtime import PageError, RecordsRuntime
 from .search_input import parse_emergency, parse_search
-from .simulation import LOCAL_VISION_PROFILE_NAME, IncompatibleProfile, Simulation, load_simulation
+from .simulation import (
+    LOCAL_GESTURES_PROFILE_NAME,
+    LOCAL_VISION_PROFILE_NAME,
+    IncompatibleProfile,
+    Simulation,
+    load_simulation,
+)
 from .storage import RecordsStorage, storage_unavailable
+from .webcam import Webcam, encode_preview, open_hand_landmarker, open_windows_camera
 
 PAGE_ERRORS = {
     "cursor_expired": (400, "CURSOR_EXPIRED", "Refresh the first page.", False),
@@ -91,7 +98,7 @@ def _ignore_revocation(_: Revocation) -> None:
 def create_app(
     config: Config, *, held_owner: bool = False, storage: RecordsStorage | None = None,
     simulation: Simulation | None = None, on_channel_invalidated: Callable[[str, Channel], None] = _ignore_invalidation,
-    on_control_revoked: Callable[[Revocation], None] = _ignore_revocation,
+    on_control_revoked: Callable[[Revocation], None] = _ignore_revocation, webcam: Webcam | None = None,
 ) -> FastAPI:
     unavailable_code = "NOT_READY"
     if simulation is None:
@@ -112,6 +119,11 @@ def create_app(
             realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked)
             if simulation and config.simulation_profile == LOCAL_VISION_PROFILE_NAME:
                 realtime.configure_local_vision(config.yoloe_assets, config.data_root / "vision", runtime.match_prompt)
+            if simulation and config.simulation_profile == LOCAL_GESTURES_PROFILE_NAME:
+                realtime.webcam = webcam or Webcam(
+                    simulation.profile, lambda: open_windows_camera(config.webcam_device_path),
+                    lambda: open_hand_landmarker(config.gesture_assets), encode_preview,
+                )
             startup = asyncio.create_task(runtime.initialize())
             tasks: tuple[asyncio.Task[None], ...] = (
                 asyncio.create_task(realtime.capture()), asyncio.create_task(realtime.maintain_projection()),
@@ -123,6 +135,9 @@ def create_app(
                           asyncio.create_task(realtime.maintain_continuity()))
             elif simulation and simulation.inference:
                 tasks += (asyncio.create_task(realtime.maintain_inference()),)
+            if realtime.webcam:
+                realtime.webcam.start()
+                tasks += (asyncio.create_task(realtime.maintain_webcam()),)
             try:
                 yield
             finally:
@@ -132,6 +147,8 @@ def create_app(
                     for task in tasks:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
+                    if realtime.webcam:
+                        await asyncio.to_thread(realtime.webcam.close)
                     await startup
                     await runtime.stop()
                 finally:

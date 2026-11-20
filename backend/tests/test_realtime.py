@@ -54,6 +54,7 @@ from backend.app.simulation import (
     load_simulation,
 )
 from backend.app.storage import RecordsStorage
+from backend.app.webcam import Webcam
 from backend.tests.test_registration import submit
 from backend.tests.test_session_history import captured_png, insert_match
 
@@ -314,9 +315,10 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
             frame_limit: int | None = None, revocations: list[Revocation] | None = None,
             inference: Inference | None = None, blocked_connection: int = 1,
             checkpoint: Callable[[str], None] | None = None, wall: Callable[[], int] | None = None,
-            local_vision: bool = False) -> Iterator[Loopback]:
+            local_vision: bool = False, webcam_factory: Callable[[QualificationProfile, Clock], Webcam] | None = None,
+            local_gestures: bool = False) -> Iterator[Loopback]:
     clock = Clock()
-    simulation = load_simulation("fixture-v1")
+    simulation = load_simulation("local-gestures-v1" if local_gestures else "fixture-v1")
     assert simulation
     observations = Observations(simulation)
 
@@ -338,9 +340,11 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-        config = Config(root, backend_port=port, simulation_profile="local-yoloe-v1" if local_vision else None)
+        config = Config(root, backend_port=port, simulation_profile="local-yoloe-v1" if local_vision
+                        else "local-gestures-v1" if local_gestures else None)
         app = create_app(config, storage=storage,
                          simulation=Simulation(profile, observations, command, inference),
+                         webcam=webcam_factory(profile, clock) if webcam_factory else None,
                          on_channel_invalidated=lambda client, channel: invalidations.append((client, channel)),
                          **({"on_control_revoked": revocations.append} if revocations is not None else {}))
         delayed = PauseDelivery(app, blocked_connection) if blocked else None
