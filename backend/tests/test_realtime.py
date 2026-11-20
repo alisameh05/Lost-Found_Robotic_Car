@@ -132,6 +132,7 @@ class Observations:
         self.proximity: int | None = None
         self.protocol_fault = False
         self.capture_barrier: Event | None = None
+        self.continuity: Callable[[Capture, InputScope], Capture] | None = None
 
     def observe(self, now: float, scope: InputScope | None = None) -> Observation:
         barrier = self.capture_barrier
@@ -151,6 +152,8 @@ class Observations:
             robot = replace(base.robot, width=base.robot.width - 1)
         elif self.robot == "epoch" and base.robot:
             robot = replace(base.robot, stream_epoch="replacement")
+        if self.robot == "live" and robot and scope and self.continuity:
+            robot = self.continuity(robot, scope)
         gesture = gesture_intent(self.fingers, hands=self.hands, certain=self.certain, stable=self.stable)
         controller = controller_intent(self.dpad, circle=self.circle)
         return replace(base, inference=self.inference, webcam=base.webcam if self.webcam else None, robot=robot,

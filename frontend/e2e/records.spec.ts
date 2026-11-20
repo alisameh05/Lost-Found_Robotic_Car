@@ -1287,6 +1287,71 @@ async function replayReviewAction(page: Page, action: SessionAction) {
   }, { backend, action });
 }
 
+test("rejects a connected match, resumes across a fault, and reviews only after fixture re-entry", async ({ page }) => {
+  test.setTimeout(60_000);
+  const alerts: { id: string; captured_at_ms: number }[] = [];
+  page.on("websocket", (socket) => {
+    if (!socket.url().endsWith("/events")) return;
+    socket.on("framereceived", ({ payload }) => {
+      if (typeof payload !== "string") return;
+      const event = JSON.parse(payload);
+      if (event.type === "candidate_pending") alerts.push(event.payload.match);
+    });
+  });
+  await startBackend({ reviewSimulation: true });
+  const session = await startReviewSearch(page, "PS4 controller");
+  const panel = page.getByRole("region", { name: "Review potential match" });
+  const reject = panel.getByRole("button", { name: "Reject Match" });
+  const button = (name: string) => page.getByRole("button", { name, exact: true });
+  const resume = button("Resume");
+  const emergency = button("Emergency Stop");
+  const paused = page.getByText("Committed session · Paused", { exact: true });
+  const searching = page.getByText("Committed session · Searching", { exact: true });
+  const disarmed = page.getByText("Motion permission · Disarmed", { exact: true });
+  const evidence = panel.getByRole("img", { name: "Captured evidence", exact: true });
+  await expect(evidence).toBeVisible();
+  await expect(resume).toBeDisabled();
+  const decision = page.waitForResponse((response) => response.url() === `${backend}${session}/actions` &&
+    response.request().method() === "POST" && response.request().postDataJSON().action === "reject", { timeout: 8_000 });
+  await reject.click();
+  expect((await decision).ok()).toBe(true);
+  await expect(panel).toHaveCount(0);
+  await expect(paused).toBeVisible();
+  await expect(disarmed).toBeVisible();
+  await resume.click();
+  await expect(searching).toBeVisible();
+  expect(alerts).toHaveLength(1);
+  await emergency.focus();
+  await page.keyboard.press("Enter");
+  await expect(paused).toBeVisible();
+  await expect(disarmed).toBeVisible();
+  await expect(resume).toBeDisabled();
+  await button("Acquire control").click();
+  const recovery = page.getByRole("region", { name: "Recovery", exact: true });
+  await expect(recovery.getByText("Restored · Awaiting acknowledgment")).toBeVisible();
+  await button("Acknowledge").click();
+  await resume.click();
+  await expect(searching).toBeVisible();
+  expect(alerts).toHaveLength(1);
+  await expect(panel).toBeVisible({ timeout: 23_000 });
+  expect(alerts).toHaveLength(2);
+  expect(alerts[1].id).not.toBe(alerts[0].id);
+  expect(alerts[1].captured_at_ms - alerts[0].captured_at_ms).toBeGreaterThan(12_000);
+  await expect(paused).toBeVisible();
+  await expect(resume).toBeDisabled();
+  await expect(emergency).toBeEnabled();
+  await panel.getByRole("button", { name: "Stop Search" }).click();
+  await expect(page).toHaveURL(`${frontend}${session}/result`);
+  await stopBackend();
+  await startBackend({ reviewSimulation: true });
+  await page.goto(session);
+  const history = page.getByRole("region", { name: "Captured matches" });
+  await expect(history.getByText("Rejected", { exact: true })).toBeVisible();
+  await expect(history.getByText("Reviewed", { exact: true })).toBeVisible();
+  await expect(history.getByText("Not reviewed", { exact: true })).toBeVisible();
+  await expect(history.getByRole("img", { name: "Captured evidence", exact: true })).toHaveCount(2);
+});
+
 for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const) {
   test(`saved candidate review recovers ${outcome} through a backend restart`, async ({ page }) => {
     test.setTimeout(60_000);
@@ -1312,7 +1377,7 @@ for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const
       expect(parseFloat(overlay.width)).toBeCloseTo(100 * 83 / 480, 4);
       expect(parseFloat(overlay.top)).toBeCloseTo(100 * 203 / 262, 4);
       expect(parseFloat(overlay.height)).toBeCloseTo(100 * 41 / 262, 4);
-      await expect(panel.getByRole("button", { name: "Reject Match" })).toHaveCount(0);
+      await expect(panel.getByRole("button", { name: "Reject Match" })).toBeEnabled();
       await expect(page.getByRole("button", { name: "Resume", exact: true })).toBeDisabled();
       await expect(page.getByRole("button", { name: "Emergency Stop", exact: true })).toBeEnabled();
       if (outcome === "confirm") {

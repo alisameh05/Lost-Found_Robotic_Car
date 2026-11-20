@@ -1,13 +1,13 @@
 from dataclasses import replace
 from pathlib import Path
 from threading import Event
-from time import monotonic
+from time import monotonic, sleep
 from uuid import uuid4
 
 import pytest
 
 from backend.app import sessions
-from backend.app.simulation import CandidateObservation, InferenceSample
+from backend.app.simulation import CandidateObservation, FixturePresence, InferenceSample
 from backend.app.storage import DAY_MS, utc_ms
 from backend.tests.test_realtime import (
     API,
@@ -16,6 +16,7 @@ from backend.tests.test_realtime import (
     auth,
     driving_search,
     event,
+    recover_workspace,
     search_action,
     service,
     validate,
@@ -41,7 +42,7 @@ def action_body(driver, match, session, action="confirm"):
     return {
         "action_id": str(uuid4()), "session_id": session["id"], "expected_revision": session["revision"],
         "action": action, "client_id": driver.owner["client_id"], "client_lease_id": driver.lease["client_lease_id"],
-        **({"candidate_id": match["id"]} if action == "confirm" else {}),
+        **({"candidate_id": match["id"]} if action in ("confirm", "reject") else {}),
     }
 
 
@@ -130,24 +131,25 @@ def test_failed_confirm_keeps_pending_and_original_intent_can_retry(tmp_path: Pa
 
 
 @pytest.mark.parametrize("interrupt", ["stop", "emergency"])
-def test_confirm_race_preserves_the_winning_durable_outcome(tmp_path: Path, interrupt: str) -> None:
+@pytest.mark.parametrize("action", ["confirm", "reject"])
+def test_review_race_preserves_the_winning_durable_outcome(tmp_path: Path, interrupt: str, action: str) -> None:
     entered, release = Event(), Event()
 
     def checkpoint(point: str) -> None:
-        if point == "before_confirm_commit":
+        if point == f"before_{action}_commit":
             entered.set()
             assert release.wait(5)
 
     with service(tmp_path, inference=candidate, checkpoint=checkpoint) as laf, driving_search(laf) as (headers, driver):
         match, session = review(laf, headers)
         path = f"{API}/sessions/{session['id']}"
-        confirm = action_body(driver, match, session)
+        decision = action_body(driver, match, session, action)
         stop = action_body(driver, match, session, "stop")
         try:
-            first = laf.http.post(path + "/actions", headers=headers, json=confirm)
+            first = laf.http.post(path + "/actions", headers=headers, json=decision)
             assert entered.is_set() and first.status_code == 202
-            assert laf.http.post(path + "/actions", headers=headers, json=confirm).content == first.content
-            collision = laf.http.post(path + "/actions", headers=headers, json={**confirm, "candidate_id": "different"})
+            assert laf.http.post(path + "/actions", headers=headers, json=decision).content == first.content
+            collision = laf.http.post(path + "/actions", headers=headers, json={**decision, "candidate_id": "different"})
             assert collision.status_code == 409 and collision.json()["code"] == "ACTION_ID_CONFLICT"
             if interrupt == "stop":
                 overtakes = laf.http.post(path + "/actions", headers=headers, json=stop)
@@ -159,9 +161,9 @@ def test_confirm_race_preserves_the_winning_durable_outcome(tmp_path: Path, inte
         finally:
             release.set()
         completion = wait_for(laf.http, "/snapshot", headers, lambda state: any(
-            op["action_id"] == confirm["action_id"] and op["persistence"] == "Failed" for op in state["operations"]
+            op["action_id"] == decision["action_id"] and op["persistence"] == "Failed" for op in state["operations"]
         ))
-        failure = next(op for op in completion["operations"] if op["action_id"] == confirm["action_id"])
+        failure = next(op for op in completion["operations"] if op["action_id"] == decision["action_id"])
         assert failure["error"]["code"] == ("INVALID_TRANSITION" if interrupt == "stop" else "LEASE_EXPIRED")
         if interrupt == "stop":
             saved = wait_for(laf.http, f"/sessions/{session['id']}", headers, lambda data: data["state"] == "Ended")
@@ -169,7 +171,7 @@ def test_confirm_race_preserves_the_winning_durable_outcome(tmp_path: Path, inte
             first_stop = laf.http.post(path + "/actions", headers=headers, json=stop).json()
             assert first_stop["result"]["match"]["disposition"] == "NotReviewed"
             assert first_stop["result"]["match"]["reviewed_at_ms"] is None
-            assert laf.http.post(path + "/actions", headers=headers, json=confirm).status_code == 409
+            assert laf.http.post(path + "/actions", headers=headers, json=decision).status_code == 409
         else:
             current, _ = review(laf, headers)
             assert current["disposition"] == "Pending" and completion["lease"]["state"] == "Unowned"
@@ -313,3 +315,172 @@ def test_confirm_receipt_is_recovered_with_a_new_boot_client_and_lease(tmp_path:
             assert changed.status_code == 409 and changed.json()["code"] == "ACTION_ID_CONFLICT"
             assert laf.http.get(path, headers=headers).json()["end_reason"] == "Confirmed"
             assert laf.http.get(API + "/snapshot", headers=headers).json()["active_session"] is None
+
+
+def test_reject_rollback_and_lost_completion_preserve_receipt_and_evidence(tmp_path: Path) -> None:
+    fault = "before_reject_commit"
+
+    def checkpoint(point: str) -> None:
+        if point == fault:
+            raise OSError("Injected rejection result failure")
+
+    with service(tmp_path, inference=candidate, checkpoint=checkpoint) as laf, driving_search(laf) as (headers, driver):
+        match, session = review(laf, headers)
+        body = action_body(driver, match, session, "reject")
+        path = f"{API}/sessions/{session['id']}"
+        target_path = f"{API}/objects/{match['object_id']}"
+        evidence_path = f"{API}/media/{match['evidence_media']['id']}"
+        target = laf.http.get(target_path, headers=headers).json()
+        image = laf.http.get(evidence_path, headers=headers).content
+        assert laf.http.get(evidence_path).status_code == 403
+        assert search_action(laf, headers, driver, "resume", session["revision"]).json()["code"] == "PENDING_REVIEW"
+        for change, code in [
+            ({"expected_revision": session["revision"] - 1}, "REVISION_CONFLICT"),
+            ({"candidate_id": "unknown"}, "NOT_FOUND"),
+            ({"client_lease_id": "x" * 43}, "LEASE_REQUIRED"),
+            ({"failure_ids": ["other"]}, "VALIDATION_FAILED"),
+        ]:
+            result = laf.http.post(path + "/actions", headers=headers, json={**body, **change})
+            assert result.json()["code"] == code, result.text
+        failed = laf.http.post(path + "/actions", headers=headers, json=body)
+        assert failed.status_code == 503 and failed.json()["persistence"] == "Failed"
+        assert review(laf, headers) == (match, session)
+        assert laf.http.get(target_path, headers=headers).json() == target
+
+        fault = "after_reject_commit"
+        committed = laf.http.post(path + "/actions", headers=headers, json=body)
+        assert committed.status_code == 200, committed.text
+        validate("MutationResponse", committed.json())
+        outcome = committed.json()["result"]
+        saved, rejected = outcome["session"], outcome["match"]
+        assert saved == {**session, "revision": session["revision"] + 1,
+                         "pause_causes": [{"cause": "ReviewRejected", "failure_id": None}]}
+        assert rejected == {**match, "disposition": "Rejected", "reviewed_at_ms": rejected["reviewed_at_ms"]}
+        assert rejected["reviewed_at_ms"] >= match["captured_at_ms"]
+        assert laf.http.get(target_path, headers=headers).json() == target
+        assert laf.http.post(path + "/actions", headers=headers, json=body).content == committed.content
+        repeat = {**body, "expected_revision": saved["revision"], "action_id": str(uuid4())}
+        assert laf.http.post(path + "/actions", headers=headers, json=repeat).json()["code"] == "INVALID_TRANSITION"
+        state = wait_for(laf.http, "/snapshot", headers, lambda value: value["readiness"]["can_resume"])
+        assert state["active_session"] == saved and state["pending_candidate"] is None
+        while True:
+            message = driver.messages.get(timeout=3)
+            operation = message["payload"].get("operation")
+            if message["type"] == "session_changed" and operation and operation["action_id"] == body["action_id"]:
+                if operation["persistence"] == "Committed":
+                    validate("EventEnvelope", message)
+                    assert operation["result"] == outcome and message["session_revision"] == saved["revision"]
+                    break
+
+    with service(tmp_path) as laf:
+        headers = auth(laf.bootstrap())
+        wait_for(laf.http, "/health", headers)
+        assert laf.http.get(path + "/matches", headers=headers).json()["items"] == [rejected]
+        assert laf.http.get(evidence_path, headers=headers).content == image
+        assert laf.http.get(target_path, headers=headers).json()["revision"] == target["revision"]
+        assert laf.http.get(target_path, headers=headers).json()["status"] == "Lost"
+        replacement = {**body, "client_id": headers["X-App-Client-Id"], "client_lease_id": "y" * 43}
+        assert laf.http.post(path + "/actions", headers=headers, json=replacement).content == committed.content
+
+
+def test_reject_continuity_is_scoped_and_does_not_block_recovery(tmp_path: Path) -> None:
+    presence = True
+    foreign = False
+    sampled = 0
+
+    def infer(sample: InferenceSample) -> bool | CandidateObservation:
+        nonlocal sampled
+        result = candidate(sample)
+        if not isinstance(result, CandidateObservation):
+            return result
+        sampled += 1
+        observation = sample.capture.presence if sample.capture else None
+        return replace(result, association="wallet") if observation and observation.present else True
+
+    def continuity(capture, scope):
+        return replace(capture, presence=FixturePresence(
+            replace(scope, session="foreign") if foreign else scope,
+            capture.stream_epoch, capture.clock_epoch, capture.sequence, "wallet", presence,
+        ))
+
+    with service(tmp_path, inference=infer) as laf:
+        laf.observations.continuity = continuity
+        with driving_search(laf) as (headers, driver):
+            first, initial = review(laf, headers)
+            laf.observations.robot = "missing"
+            paused = wait_for(laf.http, "/snapshot", headers, lambda state:
+                              len(state["active_session"]["pause_causes"]) > 1)["active_session"]
+        laf.observations.robot = "live"
+        with recover_workspace(laf, paused) as (headers, driver):
+            state = wait_for(laf.http, "/snapshot", headers, lambda value: all(
+                failure["restored"] for failure in value["failures"]
+            ))
+            paused = state["active_session"]
+            reject = action_body(driver, first, paused, "reject")
+            path = f"{API}/sessions/{paused['id']}"
+            response = laf.http.post(path + "/actions", headers=headers, json=reject)
+            assert response.status_code == 200, response.text
+            saved = response.json()["result"]["session"]
+            assert saved["revision"] == paused["revision"] + 1
+            assert [cause for cause in saved["pause_causes"] if cause["cause"] != "ReviewRejected"] == [
+                cause for cause in paused["pause_causes"] if cause["cause"] != "CandidateReview"
+            ]
+            assert search_action(laf, headers, driver, "resume", saved["revision"]).json()["code"] == "RECOVERY_REQUIRED"
+            ack = search_action(laf, headers, driver, "acknowledge", saved["revision"],
+                                failure_ids=[failure["failure_id"] for failure in state["failures"]])
+            assert ack.status_code == 200, ack.text
+            ready = wait_for(laf.http, "/snapshot", headers, lambda value: value["readiness"]["can_resume"])
+            laf.observations.dpad = ("forward",)
+            resumed = search_action(laf, headers, driver, "resume", ready["active_session"]["revision"])
+            assert resumed.status_code == 200, resumed.text
+            wait_output(laf, None)
+            before = sampled
+            continuous = wait_for(laf.http, "/snapshot", headers, lambda _: sampled >= before + 5)
+            assert continuous["pending_candidate"] is None and laf.command.output is None
+            laf.observations.dpad = ()
+            arm(laf, headers)
+            stopped = search_action(laf, headers, driver, "pause", continuous["active_session"]["revision"])
+            assert stopped.status_code == 200, stopped.text
+            before = sampled
+            foreign, presence = True, False
+            sleep(0.4)
+            foreign, presence = False, True
+            sleep(0.3)
+            assert sampled == before
+            ready = wait_for(laf.http, "/snapshot", headers, lambda value: value["readiness"]["can_resume"])
+            resumed = search_action(laf, headers, driver, "resume", ready["active_session"]["revision"])
+            assert resumed.status_code == 200, resumed.text
+            current = wait_for(laf.http, "/snapshot", headers, lambda _: sampled >= before + 5)
+            assert current["pending_candidate"] is None
+            presence = False
+            sleep(0.4)
+            laf.observations.robot = "missing"
+            paused = wait_for(laf.http, "/snapshot", headers, lambda value: value["active_session"]["state"] == "Paused")
+            assert paused["pending_candidate"] is None
+        presence = True
+        laf.observations.robot = "live"
+        with recover_workspace(laf, paused["active_session"]) as (headers, driver):
+            state = wait_for(laf.http, "/snapshot", headers, lambda value: all(
+                failure["restored"] for failure in value["failures"]
+            ))
+            ack = search_action(laf, headers, driver, "acknowledge", state["active_session"]["revision"],
+                                failure_ids=[failure["failure_id"] for failure in state["failures"]])
+            assert ack.status_code == 200, ack.text
+            ready = wait_for(laf.http, "/snapshot", headers, lambda value: value["readiness"]["can_resume"])
+            resumed = search_action(laf, headers, driver, "resume", ready["active_session"]["revision"])
+            assert resumed.status_code == 200, resumed.text
+            before = sampled
+            current = wait_for(laf.http, "/snapshot", headers, lambda _: sampled >= before + 5)
+            assert current["active_session"]["state"] == "Searching" and current["pending_candidate"] is None
+            presence = False
+            sleep(0.5)
+            presence = True
+            second, session = review(laf, headers)
+            assert second["id"] != first["id"] and second["frame_id"] != first["frame_id"]
+            assert search_action(laf, headers, driver, "reject", session["revision"], candidate_id=second["id"]).status_code == 200
+            assert search_action(laf, headers, driver, "stop", session["revision"] + 1).status_code == 200
+        with driving_search(laf, takeover=True) as (headers, driver):
+            fresh, session = review(laf, headers)
+            assert fresh["session_id"] != initial["id"]
+            wrong = search_action(laf, headers, driver, "reject", session["revision"], candidate_id=first["id"])
+            assert wrong.status_code == 409 and wrong.json()["code"] == "OWNERSHIP_MISMATCH"

@@ -93,8 +93,6 @@ async def parse_search(request: Request, session: str | None) -> SearchRequest:
             or not token(data.get("client_lease_id"))):
         raise invalid
     check_identity(request, data["client_id"])
-    if action == "reject":
-        raise HttpError(503, "NOT_READY", "This search action is unavailable in the simulation.")
     return SearchRequest(data["action_id"], action, cast(str, resource), data["expected_revision"],
                          data["client_id"], data["client_lease_id"], mode, failure_ids, data.get("candidate_id"))
 

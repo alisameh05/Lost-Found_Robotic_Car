@@ -14,7 +14,7 @@ export function MatchReview({ match, object, canAct, canStop, stop }: {
   match: Match; object: ObjectRecord; canAct: boolean; canStop: boolean; stop(): void;
 }) {
   const runtime = useRuntime()?.connection?.runtime;
-  const { recordsMode, searchActions, snapshot } = useRuntimeView();
+  const { searchActions, snapshot } = useRuntimeView();
   const [displayed, setDisplayed] = useState<boolean>();
   const sessionId = match.session_id;
   const confirm = searchActions?.[searchActionKey("confirm", sessionId)];
@@ -34,7 +34,7 @@ export function MatchReview({ match, object, canAct, canStop, stop }: {
       <CapturedEvidence match={match} onDisplay={setDisplayed} />
     </div>
     <div className={styles.actions}>
-      {!recordsMode && <Button disabled={blocked} onClick={() => decide("reject")}>Reject Match</Button>}
+      <Button disabled={blocked} onClick={() => decide("reject")}>Reject Match</Button>
       <Button variant="primary" disabled={!canConfirm} onClick={() => decide("confirm")}>Confirm Match</Button>
       <Button variant="destructive" disabled={!canStop} onClick={stop}>Stop Search</Button>
     </div>

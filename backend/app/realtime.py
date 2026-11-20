@@ -41,6 +41,7 @@ from .simulation import (
     SOURCES,
     CandidateObservation,
     Capture,
+    FixturePresence,
     InferenceSample,
     ProximityAdvisory,
     QualificationProfile,
@@ -212,6 +213,12 @@ class Realtime:
         # Supersession invalidates commit authority while the worker still owns the slot.
         self._candidate_work: str | None = None
         self._candidate_valid = False
+        self._pending_association: str | None = None
+        self._paused_by_rejection = False
+        self._reject_latched = False
+        self._rejected_association: str | None = None
+        self._exit_observation: FixturePresence | None = None
+        self._candidate_not_before = 0.0
         self.on_candidate: Callable[[CandidateCapture], None] | None = None
         self._motion = None
         self._proximity = None
@@ -243,6 +250,7 @@ class Realtime:
     def _advance_generation(self) -> None:
         if self._generation < SAFE_INTEGER:
             self._generation += 1
+            self._exit_observation = None
 
     @property
     def safety_session(self) -> str | None:
@@ -361,6 +369,15 @@ class Realtime:
         if session["state"] != "Ended":
             if self._active_session != session["id"]:
                 self._active_since = self.monotonic()
+                self._clear_review_continuity()
+            causes = cast(list[Projection], session["pause_causes"])
+            rejected = any(item["cause"] == "ReviewRejected" for item in causes)
+            if rejected and not self._paused_by_rejection:
+                self._reject_latched = True
+                self._rejected_association, self._pending_association = self._pending_association, None
+                self._exit_observation = None
+                self._candidate_not_before = self.monotonic()
+            self._paused_by_rejection = rejected
             self._active_session = str(session["id"])
             self._active_owner = str(session["object_id"])
             self._active_mode = str(session["control_mode"])
@@ -372,6 +389,7 @@ class Realtime:
     def search_ended(self, session: str) -> None:
         if self._active_session == session:
             self._candidate_valid = False
+            self._clear_review_continuity()
             self._active_session = self._active_owner = None
             self._active_mode = self._active_state = None
             self.active_revision = None
@@ -381,6 +399,33 @@ class Realtime:
         self._outstanding = {key: value for key, value in self._outstanding.items() if key[0] != session}
         if self._lease is not None and self._lease.session == session:
             self._revoke("SessionEnded")
+
+    def _clear_review_continuity(self) -> None:
+        self._pending_association = self._rejected_association = None
+        self._paused_by_rejection = False
+        self._reject_latched = False
+        self._exit_observation = None
+        self._candidate_not_before = 0.0
+
+    def _observe_fixture_presence(self, capture: Capture) -> None:
+        scope = self._input_scope()
+        if not self._reject_latched or not scope or capture.observed_at < self._candidate_not_before:
+            return
+        sample = capture.fixture_presence(scope)
+        if capture.presence is not None and sample is None:
+            return
+        previous = self._exit_observation
+        if sample is None or sample.association != self._rejected_association:
+            self._exit_observation = None
+        elif not sample.present:
+            self._exit_observation = sample
+        else:
+            self._exit_observation = None
+            if previous and (previous.scope, previous.stream_epoch, previous.clock_epoch, previous.sequence + 1) == (
+                sample.scope, sample.stream_epoch, sample.clock_epoch, sample.sequence,
+            ):
+                self._reject_latched = False
+                self._candidate_not_before = capture.observed_at
 
     def _revoke(self, reason: str, request_id: str | None = None) -> None:
         self._candidate_valid = False
@@ -875,7 +920,7 @@ class Realtime:
 
     def publish_search_commit(
         self, session: Projection, operation: Projection | None, target: Projection | None, pending: bool,
-        *, recovery_changed: bool = False, candidate: Projection | None = None,
+        *, recovery_changed: bool = False, candidate: Projection | None = None, association: str | None = None,
     ) -> None:
         self.search_committed(session)
         state = self._projection
@@ -892,10 +937,11 @@ class Realtime:
         state.update(active_session=None if ended else session, active_object=None if ended else target,
                      session_id=None if ended else session["id"],
                      failures=self.failures_for(None if ended else str(session["id"])))
-        if ended:
+        if ended or self._paused_by_rejection:
             state["pending_candidate"] = None
         elif candidate is not None:
             state["pending_candidate"] = candidate
+            self._pending_association = association
         runtime = cast(Projection, state["runtime"])
         runtime.update(effective_session_state=None if ended else session["state"], persistence_pending=pending)
         retention = cast(Projection, state["retention"])
@@ -1135,6 +1181,7 @@ class Realtime:
         if (not profile or not latest or not publish or not lease or not owner or revision is None
                 or scope != self._motion_scope() or not self._active_mode
                 or not self._required_paths_ready(lease, self._active_mode) or self._candidate_work is not None
+                or self._reject_latched or frame.capture.observed_at < self._candidate_not_before
                 or (result.scope, result.frame_id, result.stream_epoch, result.clock_epoch, result.capture_sequence)
                 != (scope, frame.id, frame.capture.stream_epoch, frame.capture.clock_epoch, frame.capture.sequence)
                 or latest.capture.stream_epoch != frame.capture.stream_epoch
@@ -1148,11 +1195,17 @@ class Realtime:
         box = evidence_box(result.box, frame.capture.width, frame.capture.height)
         if box is None:
             return
+        presence = frame.capture.fixture_presence(scope)
+        if result.association is not None and (
+            presence is None or not presence.present or result.association != presence.association
+        ):
+            return
         self.suspend_search(scope.session)
         if self._lease is not lease:
             return
         work = CandidateCapture(uuid4().hex, scope.session, owner, revision, self._generation, frame.id,
-                                max(frame.captured_at_ms, session["started_at_ms"]), frame.capture, box)
+                                max(frame.captured_at_ms, session["started_at_ms"]), frame.capture, box,
+                                result.association)
         self._candidate_work = work.id
         self._candidate_valid = True
         publish(work)
@@ -1221,10 +1274,13 @@ class Realtime:
             self._live_sources.add(source)
             epoch_changed = bool(old and old.capture.stream_epoch != frame.capture.stream_epoch)
             if epoch_changed and source == "robot":
+                self._exit_observation = None
                 if self._lease:
                     self._revoke("CameraEpochChanged")
                 elif self.safety_session is not None:
                     self.record_failure("CameraEpochChanged", self.safety_session)
+            if source == "robot":
+                self._observe_fixture_presence(frame.capture)
             for connection in tuple(self._connections.values()):
                 if connection.channel != channel:
                     continue
@@ -1237,6 +1293,8 @@ class Realtime:
               or old.age(now) >= profile.bound("capture_age_limit_ms")):
             was_live = source in self._live_sources
             self._live_sources.discard(source)
+            if source == "robot":
+                self._exit_observation = None
             if was_live and source == "robot" and self._lease is None:
                 self._path_lost("RobotVideo")
             for connection in tuple(self._connections.values()):
