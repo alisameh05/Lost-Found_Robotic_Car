@@ -223,7 +223,7 @@ class RecordsRuntime:
             cursor = self.resolve_cursor(scope, query.get("cursor"))
         except PageError:
             if parent is not None:
-                await asyncio.to_thread(self.storage.check_history_parent, parent, history)
+                await asyncio.to_thread(self.storage.recheck_eligibility, parent, session=history == "matches")
             raise
         before = cursor.before if cursor else (SAFE_INTEGER + 1, "")
         if cursor is not None:

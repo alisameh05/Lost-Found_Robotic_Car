@@ -114,9 +114,11 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     surface = undefined;
     context = undefined;
     clock = undefined;
+    uncertainRequest = undefined;
+    searchActions.changeAuthority();
     resetProtectedScope();
     update({ loading: false, connected: false, health: undefined, snapshot: undefined, recordSnapshot: undefined,
-      removedOwners: undefined, profile: undefined, workspace: undefined, failedRead: { kind: "unavailable" },
+      removedOwners: undefined, profile: undefined, workspace: undefined, emergency: undefined, failedRead: { kind: "unavailable" },
       authority: (view.authority ?? 0) + 1, cursorAuthority: (view.cursorAuthority ?? 0) + 1 });
   }
 
@@ -172,7 +174,8 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
           uncertainRequest = undefined;
           lastActiveSearch = undefined;
         }
-        context = bootstrap.data;
+        // A refreshed clock does not replace the lifetime of the same page authority.
+        context = sameAuthority && context ? context : bootstrap.data;
         clock = { server: bootstrap.data.server_time_ms, received: recordsMode ? bootstrapReceived : bootstrapStarted };
         update({ connected: !recordsMode, profile: sameProfile ? view.profile : profile,
           ...(!sameProfile && { workspace: undefined }), ...(!sameAuthority && { snapshot: undefined, recordSnapshot: undefined,
@@ -386,7 +389,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
 
   async function emergency() {
     if (!context || lifetime.signal.aborted || view.emergency?.kind === "sending") return;
-    const request = { context, signal: AbortSignal.any([protectedScope.signal, lifetime.signal]) };
+    const request = { context, signal: lifetime.signal };
     const generation = view.snapshot?.runtime.control_generation;
     const ownerId = view.snapshot?.active_session?.object_id;
     const body = uncertainRequest ?? { request_id: crypto.randomUUID() };
@@ -394,7 +397,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
     update({ emergency: { kind: "sending" } });
     try {
       const result = await transport.emergency(body, request);
-      if (request.signal.aborted) return;
+      if (request.signal.aborted || context !== request.context) return;
       if (result.kind === "ok" && conforms("EmergencyStopResponse", result.data) && result.data.request_id === body.request_id &&
           result.data.backend_boot_id === request.context.backend_boot_id) {
         uncertainRequest = undefined;
@@ -417,7 +420,7 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
         update({ emergency: { kind: "unavailable" } });
       }
     } catch {
-      if (!request.signal.aborted) update({ emergency: { kind: "unavailable" } });
+      if (!request.signal.aborted && context === request.context) update({ emergency: { kind: "unavailable" } });
     }
   }
 
@@ -458,7 +461,6 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
         recover: () => {
           loseEventProjection();
           if (!recordsMode) resetProtectedScope();
-          if (view.emergency?.kind === "sending") update({ emergency: { kind: "unavailable" } });
           void refresh({ readBootstrap: true });
         },
       });

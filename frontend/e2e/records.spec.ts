@@ -19,7 +19,7 @@ test.use({ baseURL: frontend });
 async function startBackend(options: {
   initializationGate?: string; crashAfterCommit?: boolean; registrationGate?: string; clockOffset?: string;
   cleanupFault?: string; settingsGate?: string; stopGate?: string; simulation?: boolean;
-  reviewSimulation?: boolean; crashCandidate?: boolean;
+  reviewSimulation?: boolean; crashCandidate?: boolean; noWebcam?: boolean; crashSearch?: "start" | "resume";
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
@@ -27,6 +27,7 @@ async function startBackend(options: {
     : options.settingsGate ? ["backend.tests.crash_registration", "retention_before_commit", options.settingsGate]
     : options.stopGate ? ["backend.tests.crash_registration", "before_stop_commit", options.stopGate]
     : options.crashCandidate ? ["backend.tests.crash_registration", "candidate_promoted"]
+    : options.crashSearch ? ["backend.tests.crash_registration", `before_${options.crashSearch}_commit`]
     : options.clockOffset ? ["backend.tests.crash_registration", "clock", options.clockOffset,
       ...(options.cleanupFault ? ["deny-purge", options.cleanupFault] : [])]
     : ["backend.app"];
@@ -35,6 +36,7 @@ async function startBackend(options: {
       ...process.env, LOCALAPPDATA: parent, LAF_DATA_ROOT: join(parent, "records"),
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
       LAF_SIMULATION_PROFILE: options.reviewSimulation ? "fixture-review-v1" : options.simulation ? "fixture-v1" : undefined,
+      LAF_TEST_NO_WEBCAM: options.noWebcam ? "1" : undefined,
     },
   });
   backendProcess = child;
@@ -1201,10 +1203,33 @@ test("recovers the same saved search deliberately after an emergency, reload and
     await expect(page.getByText("Save pending", { exact: true })).toBeVisible();
     await expect(page.getByRole("region", { name: "Control ownership" })).toContainText("This workspace holds control.");
     await expect(resume).toBeDisabled();
-    await expect(button("Emergency Stop")).toBeEnabled();
+    await page.route(`${backend}/emergency-stop`, (route) => route.abort("failed"), { times: 1 });
+    await button("Emergency Stop").press("Enter");
+    await expect(page.getByText("Emergency Stop could not be confirmed", { exact: true })).toBeVisible();
+    let delivered = false;
+    let releaseEmergency = () => {};
+    const held = new Promise<void>((resolve) => { releaseEmergency = resolve; });
+    await page.route(`${backend}/emergency-stop`, async (route) => {
+      const response = await route.fetch();
+      delivered = (await response.json()).permission_revoked;
+      await held;
+      await route.fulfill({ response });
+    }, { times: 1 });
+    try {
+      await button("Emergency Stop").press("Enter");
+      await expect.poll(() => delivered).toBe(true);
+      await page.evaluate(() => window.dispatchEvent(new Event("online")));
+      await expect(page.getByText("Sending Emergency Stop request", { exact: true })).toBeVisible();
+    } finally {
+      releaseEmergency();
+    }
+    await expect(page.getByText("Motion permission revoked", { exact: true })).toBeVisible();
+    await expect(feedback).toContainText("Motion permission · Disarmed");
   } finally {
     writeFileSync(stopGate, "");
   }
+  await button("Acquire control").click();
+  await button("Stop Search").click();
   await expect(page).toHaveURL(url.replace(/\/live$/, "/result"));
 });
 
@@ -1250,6 +1275,40 @@ async function startSavedSearch(page: Page, mode: "Gestures" | "PS4 controller")
   return new URL(page.url()).pathname.replace(/\/live$/, "");
 }
 
+for (const action of ["start", "resume"] as const) {
+  test(`a process exit before ${action} commit never replays the unfinished request`, async ({ page }) => {
+    test.setTimeout(55_000);
+    await startBackend({ simulation: true, crashSearch: action });
+    await selectTarget(page, sourceImage(), "Restart target");
+    await setTargetCoordinates(page);
+    await page.getByRole("button", { name: "Register Object" }).click();
+    await expect(page.getByRole("heading", { name: "Object Details", exact: true })).toBeVisible();
+    const target = new URL(page.url()).pathname;
+    let session: string | undefined;
+    if (action === "start") {
+      await page.getByRole("link", { name: "Open Search Setup" }).click();
+      await page.getByRole("button", { name: "Acquire control" }).click();
+      await page.getByRole("button", { name: "Start Search" }).click();
+    } else {
+      session = await startSavedSearch(page, "PS4 controller");
+      await page.getByRole("button", { name: "Pause", exact: true }).click();
+      await expect(page.getByText("Committed session · Paused", { exact: true })).toBeVisible();
+      await page.getByRole("button", { name: "Resume", exact: true }).click();
+    }
+    await expect.poll(() => backendProcess?.exitCode).toBe(84);
+    await startBackend({ simulation: true });
+    await waitForStorage();
+    await page.goto(session ?? target);
+    await expect(page.getByRole("link", { name: "Return to Active Search" })).toHaveCount(0);
+    if (session) {
+      await expect(page.getByText("Search interrupted", { exact: true })).toBeVisible();
+      await expect(page.getByRole("button", { name: "Resume", exact: true })).toHaveCount(0);
+    } else {
+      await expect(page.getByText("No search sessions", { exact: true })).toBeVisible();
+    }
+  });
+}
+
 test("ends expired review and clears connected records before failed cleanup is repaired", async ({ page, context }) => {
   test.setTimeout(80_000);
   const day = 86_400_000;
@@ -1262,13 +1321,18 @@ test("ends expired review and clears connected records before failed cleanup is 
   await selectTarget(page, source, "Expiring review target");
   await setTargetCoordinates(page);
   await page.getByRole("button", { name: "Register Object" }).click();
-  await expect(page).toHaveURL(/\/objects\/[^/]+$/);
+  await expect(page.getByRole("heading", { name: "Object Details", exact: true })).toBeVisible();
   const target = new URL(page.url()).pathname;
   await stopBackend();
 
   writeFileSync(clock, "-18000");
   writeFileSync(cleanupFault, "");
-  await startBackend({ reviewSimulation: true, clockOffset: clock, cleanupFault });
+  await startBackend({ reviewSimulation: true, clockOffset: clock, cleanupFault, noWebcam: true });
+  await waitForStorage();
+  const boot = await fetch(`${backend}/bootstrap`, { headers: { Origin: frontend } }).then((reply) => reply.json());
+  const health = await fetch(`${backend}/health`, { headers: { "X-App-Capability": boot.capability } })
+    .then((reply) => reply.json());
+  expect(health.readiness.components).toContainEqual(expect.objectContaining({ component: "Webcam", status: "Unavailable" }));
   await page.goto(target);
   const session = await startSavedSearch(page, "PS4 controller");
   const review = page.getByRole("region", { name: "Review potential match" });
@@ -1307,12 +1371,19 @@ test("ends expired review and clears connected records before failed cleanup is 
   await page.bringToFront();
   const confirm = review.getByRole("button", { name: "Confirm Match" });
   if (!(await confirm.isEnabled())) await page.getByRole("button", { name: "Acquire control", exact: true }).click();
-  const saved = page.waitForResponse((response) => response.url() === `${backend}${session}/actions` &&
-    response.request().method() === "POST" && response.request().postDataJSON().action === "confirm");
+  let terminal: { status: number; result: unknown } | undefined;
+  await page.route(`${backend}${session}/actions`, async (route) => {
+    const response = await route.fetch();
+    terminal = { status: response.status(), result: (await response.json()).result };
+    // The ordered removal can cancel the browser read before the reply arrives.
+    await route.fulfill({ response }).catch(() => {});
+  }, { times: 1 });
   await confirm.click();
-  const response = await saved;
-  expect(response.status()).toBe(200);
-  expect((await response.json()).result).toEqual({ object: null, session: null, match: null, settings: null, deletion: null });
+  await expect.poll(() => terminal?.status).toBeGreaterThan(0);
+  expect([200, 202]).toContain(terminal?.status);
+  if (terminal?.status === 200) {
+    expect(terminal.result).toEqual({ object: null, session: null, match: null, settings: null, deletion: null });
+  }
   await expect(page.getByText("Record removed after expiry", { exact: true })).toBeVisible();
   await expect.poll(() => Object.keys(removed).sort()).toEqual(["dashboard", "details", "history", "library"]);
   expect(new Set(Object.values(removed)).size).toBe(1);
@@ -1322,7 +1393,8 @@ test("ends expired review and clears connected records before failed cleanup is 
   await expect(objectRows(library).getByText("Expiring review target", { exact: true })).toHaveCount(0);
   await expect(dashboard.getByRole("link", { name: /Expiring review target/ })).toHaveCount(0);
   await expect(details.getByText("Record expired", { exact: true })).toBeVisible();
-  await expect(page.getByText("Local records storage unavailable", { exact: true })).toBeVisible();
+  await details.goto("/settings");
+  await expect(details.getByText("Deletion failed", { exact: true })).toBeVisible();
   await history.goto(`${session}/result`);
   await expect(history.getByText("Session expired", { exact: true })).toBeVisible();
   expect(await readdir(join(parent, "records", "media"))).toHaveLength(2);

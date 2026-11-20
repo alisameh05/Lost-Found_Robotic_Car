@@ -694,7 +694,9 @@ class RecordsStorage:
             row = self.require_eligible(db, db.execute(OBJECT_ROWS + " WHERE o.id = ?", (object_id,)).fetchone(),
                                         now, days)
             self.check_read_storage(db, now, preparing)
-            return self.object_payload(row, days, now)
+            result = self.object_payload(row, days, now)
+        self.recheck_eligibility(object_id, session=False)
+        return result
 
     def read_objects(
         self, folded_name: str, status: str, limit: int, before: tuple[int, str],
@@ -714,6 +716,9 @@ class RecordsStorage:
                 ORDER BY o.registered_at_ms DESC, o.id COLLATE BINARY DESC LIMIT ?
             """, (now - retention_ms(days), status, status, folded_name, *before, limit + 1)).fetchall()
             items = [self.object_payload(row, days, now) for row in rows[:limit]]
+        if items:
+            eligible = self.eligible_owners({str(item["id"]) for item in items})
+            items = [item for item in items if item["id"] in eligible]
         return items, (rows[limit - 1]["registered_at_ms"], rows[limit - 1]["id"]) if len(rows) > limit else None
 
     def search_setup(self) -> tuple[
@@ -764,38 +769,38 @@ class RecordsStorage:
             },
         }
 
-    def history_parent(
-        self, db: sqlite3.Connection, parent: str, kind: HistoryKind, now: int,
-    ) -> sqlite3.Row:
+    def eligible_record(self, db: sqlite3.Connection, id: str, now: int, *, session: bool) -> sqlite3.Row:
         db.row_factory = sqlite3.Row
-        if kind == "sessions":
-            row = db.execute(f"""
-                SELECT o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting FROM objects AS o WHERE o.id = ?
-            """, (parent,)).fetchone()
-        else:
+        if session:
             row = db.execute(f"""
                 SELECT s.*, o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting
                 FROM sessions AS s JOIN objects AS o ON o.id = s.object_id WHERE s.id = ?
-            """, (parent,)).fetchone()
+            """, (id,)).fetchone()
+        else:
+            row = db.execute(f"""
+                SELECT o.registered_at_ms, {GRACE} AS grace, {DELETING} AS deleting FROM objects AS o WHERE o.id = ?
+            """, (id,)).fetchone()
         return self.require_eligible(db, row, now, self.settings(db)["retention_days"])
 
-    def check_history_parent(self, parent: str, kind: HistoryKind) -> None:
+    def recheck_eligibility(self, id: str, *, session: bool) -> None:
         with self.connect() as db, read_transaction(db):
-            self.history_parent(db, parent, kind, self.now()[0])
+            self.eligible_record(db, id, self.now()[0], session=session)
 
     def read_session(self, session_id: str, preparing: Collection[str]) -> dict[str, object]:
         with self.connect() as db, read_transaction(db):
             now, _ = self.now()
-            session = self.history_parent(db, session_id, "matches", now)
+            session = self.eligible_record(db, session_id, now, session=True)
             self.check_read_storage(db, now, preparing)
-            return self.session_payload(session)
+            result = self.session_payload(session)
+        self.recheck_eligibility(session_id, session=True)
+        return result
 
     def read_history(
         self, parent: str, kind: HistoryKind, limit: int, before: tuple[int, str], preparing: Collection[str],
     ) -> tuple[list[dict[str, object]], tuple[int, str] | None]:
         with self.connect() as db, read_transaction(db):
             now, _ = self.now()
-            self.history_parent(db, parent, kind, now)
+            self.eligible_record(db, parent, now, session=kind == "matches")
             self.check_read_storage(db, now, preparing)
             parameters = (parent, *before, limit + 1)
             if kind == "sessions":
@@ -815,6 +820,7 @@ class RecordsStorage:
                 """, parameters).fetchall()
                 time_field = "captured_at_ms"
                 items = [self.match_payload(row) for row in rows[:limit]]
+        self.recheck_eligibility(parent, session=kind == "matches")
         return items, (rows[limit - 1][time_field], rows[limit - 1]["id"]) if len(rows) > limit else None
 
     def read_media(self, media_id: str, preparing: Collection[str]) -> tuple[str, bytes]:
@@ -836,7 +842,7 @@ class RecordsStorage:
                 availability, data = self.files.read(row["relative_path"], row["byte_length"], row["checksum"])
         # Media validation can overlap a terminal commit, even while the read
         # transaction still sees its formerly eligible owner.
-        self.check_history_parent(row["object_id"], "sessions")
+        self.recheck_eligibility(row["object_id"], session=False)
         if data is None:
             raise HttpError(503, "MEDIA_UNAVAILABLE", f"The managed image is {availability.lower()}.", True)
         return row["format"], data

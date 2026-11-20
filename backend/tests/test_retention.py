@@ -182,8 +182,9 @@ def test_missing_managed_directories_reconcile_without_restart(tmp_path: Path) -
         assert list((tmp_path / "staging").iterdir()) == []
 
 
-def test_a_media_read_overtaken_by_expiry_cannot_return_the_loaded_bytes(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("resource", ["media", "details", "library"])
+def test_a_protected_read_overtaken_by_expiry_cannot_disclose_the_old_owner(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, resource: str,
 ) -> None:
     now = 1_800_000_000_000
     storage = RecordsStorage(tmp_path, clock=lambda: now, monotonic=lambda: 0.0)
@@ -192,17 +193,21 @@ def test_a_media_read_overtaken_by_expiry_cannot_return_the_loaded_bytes(
 
     def held_read(*args, **kwargs):
         result = read_file(*args, **kwargs)
-        if result[1] is not None:
-            loaded.set()
-            assert release.wait(8)
+        loaded.set()
+        assert release.wait(8)
         return result
 
     with TestClient(create_app(Config(tmp_path), storage=storage), base_url=BASE) as browser:
         wait_for_health(browser, headers := credentials(browser))
-        media = submit(browser, headers, submitted=now).json()["result"]["object"]["reference_media"]["id"]
+        owner = submit(browser, headers, submitted=now).json()["result"]["object"]
+        path = {
+            "media": f"/media/{owner['reference_media']['id']}",
+            "details": f"/objects/{owner['id']}",
+            "library": "/objects",
+        }[resource]
         monkeypatch.setattr(storage.files, "read", held_read)
         with ThreadPoolExecutor(max_workers=1) as reader:
-            pending = reader.submit(browser.get, f"/api/v1/media/{media}", headers=headers)
+            pending = reader.submit(browser.get, f"/api/v1{path}", headers=headers)
             try:
                 assert loaded.wait(3)
                 now += 7 * DAY_MS
@@ -210,8 +215,11 @@ def test_a_media_read_overtaken_by_expiry_cannot_return_the_loaded_bytes(
             finally:
                 release.set()
             response = pending.result(timeout=3)
-            assert response.status_code in (404, 410)
-            assert response.json()["code"] in ("NOT_FOUND", "EXPIRED")
+            if resource == "library":
+                assert response.status_code == 200 and response.json()["items"] == []
+            else:
+                assert response.status_code in (404, 410)
+                assert response.json()["code"] in ("NOT_FOUND", "EXPIRED")
 
 
 @pytest.mark.parametrize("fault", ["disk full", "denied", "hard link", "traversal"])
