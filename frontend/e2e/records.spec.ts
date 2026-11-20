@@ -1121,7 +1121,7 @@ test("recovers the same saved search deliberately after an emergency, reload and
   const stopGate = join(parent, "finish-stop");
   await startBackend({ simulation: true, stopGate });
   await observePreviewFrames(page);
-  const { requests } = observe(page);
+  const { requests, sockets } = observe(page);
   await selectTarget(page, sourceImage(), "Recovery target");
   await setTargetCoordinates(page);
   await page.getByRole("button", { name: "Register Object" }).click();
@@ -1171,6 +1171,8 @@ test("recovers the same saved search deliberately after an emergency, reload and
   await recovery.getByRole("button", { name: "Acknowledge", exact: true }).click();
   await resumeSavedSearch();
 
+  const eventConnections = () => sockets.filter((socket) => socket.endsWith("/events")).length;
+  const beforeGap = eventConnections();
   await page.evaluate(() => {
     const probe = (window as unknown as PreviewWindow).previewProbe;
     const recent = JSON.parse(probe.initialSnapshot!);
@@ -1181,6 +1183,7 @@ test("recovers the same saved search deliberately after an emergency, reload and
     }) }));
   });
   await expect(button("Acquire control")).toBeEnabled();
+  await expect.poll(eventConnections).toBeGreaterThan(beforeGap);
   await expect(activity).toContainText("Committed session · Paused");
   await expect(resume).toBeDisabled();
   await expect(button("Emergency Stop")).toBeEnabled();
@@ -1188,7 +1191,11 @@ test("recovers the same saved search deliberately after an emergency, reload and
   expect(count("/control-lease")).toBe(2);
   expect(count("/actions")).toBe(4);
   await button("Acquire control").click();
-  await expect(recovery.getByRole("strong").filter({ hasText: /^Workspace disconnected$/ })).toBeVisible();
+  // A gap tears down the event stream and its display together. Either required
+  // path can reach the backend first and revoke the same lease.
+  await expect(recovery.getByRole("strong").filter({
+    hasText: /^(Workspace disconnected|Robot camera unavailable|Displayed robot video stale)$/,
+  }).first()).toBeVisible();
   await expect(recovery.getByText("Restored · Awaiting acknowledgment")).toBeVisible();
   await recovery.getByRole("button", { name: "Acknowledge", exact: true }).click();
   await resumeSavedSearch();
