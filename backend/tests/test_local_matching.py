@@ -32,8 +32,8 @@ def await_file(path: Path) -> None:
     assert path.exists(), path
 
 
-@pytest.fixture
-def spawned_matcher(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
+@pytest.fixture(name="spawned_matcher")
+def matcher_fixture(tmp_path: Path, monkeypatch: pytest.MonkeyPatch) -> Path:
     monkeypatch.setattr(realtime, "VisionProcess", partial(realtime.VisionProcess, target=controlled_worker))
     return tmp_path / "vision"
 

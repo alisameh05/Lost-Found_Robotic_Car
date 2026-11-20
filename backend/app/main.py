@@ -119,7 +119,8 @@ def create_app(
                 asyncio.create_task(runtime.maintain_safety_storage(realtime)),
             ) if simulation else ()
             if realtime.local_vision:
-                tasks += (asyncio.create_task(realtime.maintain_local_vision()),)
+                tasks += (asyncio.create_task(realtime.maintain_local_vision()),
+                          asyncio.create_task(realtime.maintain_continuity()))
             elif simulation and simulation.inference:
                 tasks += (asyncio.create_task(realtime.maintain_inference()),)
             try:

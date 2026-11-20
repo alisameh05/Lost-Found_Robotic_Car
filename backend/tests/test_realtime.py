@@ -1029,11 +1029,13 @@ def test_saved_search_lifecycle_and_historical_retry(tmp_path: Path) -> None:
 @contextmanager
 def ready_search(
     laf: Loopback, mode: str = "Controller", acquired: dict | None = None, *, takeover: bool = False,
+    target: dict | None = None,
 ) -> Iterator[tuple[dict, dict, ClientConnection, ClientConnection]]:
     owner = laf.bootstrap()
     headers = auth(owner)
     wait_for(laf.http, "/health", headers)
-    target = submit(laf.http, headers, submitted=owner.get("server_time_ms")).json()["result"]["object"]
+    if target is None:
+        target = submit(laf.http, headers, submitted=owner.get("server_time_ms")).json()["result"]["object"]
     with laf.open("/events", laf.ticket(headers, "events")) as events, \
             laf.open("/video/robot", laf.ticket(headers, "robot-video")) as video:
         event(events)
@@ -1100,10 +1102,11 @@ class WorkspaceDriver:
 @contextmanager
 def driving_search(
     laf: Loopback, mode: str = "Controller", *, takeover: bool = False,
+    target: dict | None = None,
 ) -> Iterator[tuple[dict, WorkspaceDriver]]:
     laf.observations.webcam = mode == "Gestures"
     lease: dict = {}
-    with ready_search(laf, mode, lease, takeover=takeover) as (owner, start, events, video):
+    with ready_search(laf, mode, lease, takeover=takeover, target=target) as (owner, start, events, video):
         headers = auth(owner)
         driver = WorkspaceDriver(owner, lease, events, video)
         worker = Thread(target=driver.run, daemon=True)
