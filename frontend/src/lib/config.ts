@@ -1,5 +1,6 @@
 export const LOCAL_YOLOE_PROFILE = "local-yoloe-v1";
 export const LOCAL_GESTURES_PROFILE = "local-gestures-v1";
+export const LOCAL_CONTROLLER_PROFILE = "local-controller-v1";
 
 export function isFixtureMode() {
   return process.env.LAF_MODE === "fixture";

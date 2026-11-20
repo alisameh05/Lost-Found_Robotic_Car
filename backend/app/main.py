@@ -9,6 +9,7 @@ from PIL import Image
 
 from .config import Config
 from .control import LeaseFailure, LeaseRejected, Revocation, parse_lease
+from .controller import Controller, open_windows_controller
 from .http import (
     API_PREFIX,
     CLIENT_ROUTES,
@@ -36,6 +37,7 @@ from .retention_input import parse_retention
 from .runtime import PageError, RecordsRuntime
 from .search_input import parse_emergency, parse_search
 from .simulation import (
+    LOCAL_CONTROLLER_PROFILE_NAME,
     LOCAL_GESTURES_PROFILE_NAME,
     LOCAL_VISION_PROFILE_NAME,
     IncompatibleProfile,
@@ -99,6 +101,7 @@ def create_app(
     config: Config, *, held_owner: bool = False, storage: RecordsStorage | None = None,
     simulation: Simulation | None = None, on_channel_invalidated: Callable[[str, Channel], None] = _ignore_invalidation,
     on_control_revoked: Callable[[Revocation], None] = _ignore_revocation, webcam: Webcam | None = None,
+    controller: Controller | None = None,
 ) -> FastAPI:
     unavailable_code = "NOT_READY"
     if simulation is None:
@@ -124,6 +127,11 @@ def create_app(
                     simulation.profile, lambda: open_windows_camera(config.webcam_device_path),
                     lambda: open_hand_landmarker(config.gesture_assets), encode_preview,
                 )
+            if simulation and config.simulation_profile == LOCAL_CONTROLLER_PROFILE_NAME:
+                realtime.controller = controller or Controller(
+                    config.controller_serial, simulation.profile.bound("input_sample_deadline_ms") / 1000,
+                    open_windows_controller,
+                )
             startup = asyncio.create_task(runtime.initialize())
             tasks: tuple[asyncio.Task[None], ...] = (
                 asyncio.create_task(realtime.capture()), asyncio.create_task(realtime.maintain_projection()),
@@ -138,6 +146,9 @@ def create_app(
             if realtime.webcam:
                 realtime.webcam.start()
                 tasks += (asyncio.create_task(realtime.maintain_webcam()),)
+            if realtime.controller:
+                realtime.controller.start()
+                tasks += (asyncio.create_task(realtime.maintain_controller()),)
             try:
                 yield
             finally:
@@ -149,6 +160,8 @@ def create_app(
                     await asyncio.gather(*tasks, return_exceptions=True)
                     if realtime.webcam:
                         await asyncio.to_thread(realtime.webcam.close)
+                    if realtime.controller:
+                        await asyncio.to_thread(realtime.controller.close)
                     await startup
                     await runtime.stop()
                 finally:

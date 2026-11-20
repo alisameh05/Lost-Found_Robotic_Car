@@ -37,6 +37,8 @@ from .control import (
     public_lease,
     token,
 )
+from .controller import POLL_SECONDS as CONTROLLER_POLL_SECONDS
+from .controller import Controller
 from .http import DOMAIN_ID, HEADER_LIMIT, HttpError, authorize_address, header, json_fields, read_json
 from .motion import FixtureCommandSink, InputSample, InputScope, Motion
 from .registration_input import SAFE_INTEGER, canonical_json
@@ -192,10 +194,11 @@ class Realtime:
         invalidate: Callable[[str, Channel], None], expire_clients: Callable[[], None],
         on_control_revoked: Callable[[Revocation], None],
         on_failure_changed: Callable[[Projection], None],
-        on_simulated_emergency: Callable[[], None],
+        on_controller_emergency: Callable[[], None],
     ):
         self.simulation = simulation
         self.webcam: Webcam | None = None
+        self.controller: Controller | None = None
         self.unavailable_code = unavailable_code
         self.boot = boot
         self.monotonic = monotonic
@@ -206,7 +209,7 @@ class Realtime:
         self.expire_clients = expire_clients
         self.on_control_revoked = on_control_revoked
         self.on_failure_changed = on_failure_changed
-        self.on_simulated_emergency = on_simulated_emergency
+        self.on_controller_emergency = on_controller_emergency
         self.sequence = 1
         self._tickets: dict[bytes, Ticket] = {}
         self._connections: dict[tuple[str, Channel], Connection] = {}
@@ -259,6 +262,7 @@ class Realtime:
         self._fixture_sink = None
         self._published_permission = "Disarmed"
         self._circle_held = False
+        self._controller_sample_at = -math.inf
         if simulation:
             self._proximity = ProximityAdvisory(simulation.profile)
             if simulation.command_sink is None:
@@ -1140,7 +1144,7 @@ class Realtime:
                     ("Controller", observation.controller_sample_at, observation.controller_input),
                     ("Webcam", observation.gesture_sample_at, observation.gesture_input),
                 ):
-                    if name == "Webcam" and self.webcam:
+                    if (name == "Webcam" and self.webcam) or (name == "Controller" and self.controller):
                         continue
                     at = reported_at
                     if scope is not None and name == self._selected_input():
@@ -1159,12 +1163,13 @@ class Realtime:
                 self._set_readiness({
                     "Command": observation.command,
                     "AI": self._vision_cause is None if self.local_vision else observation.inference,
-                    "Controller": observation.controller and now < self._input_deadlines.get("Controller", now),
+                    "Controller": (self._readiness.get("Controller", False) if self.controller else
+                                   observation.controller and now < self._input_deadlines.get("Controller", now)),
                     "RobotVideo": "robot" in self._live_sources,
                     "Webcam": self._webcam_ready(now),
                 })
                 selected = self._selected_input()
-                if selected != "Webcam" or not self.webcam:
+                if not ((selected == "Webcam" and self.webcam) or (selected == "Controller" and self.controller)):
                     sample = observation.gesture_input if selected == "Webcam" else observation.controller_input
                     self._accept_motion(scope, sample, now, deadline)
                 self._evaluate_motion(self.monotonic())
@@ -1189,11 +1194,16 @@ class Realtime:
         if motion is None or scope != self._input_scope():
             return
         # Circle is routed through the same latch even after a manual Pause.
-        circle = bool(self._selected_input() == "Controller" and sample and sample.scope == scope
-                      and sample.intent == "emergency" and 0 <= now - sample.at < deadline)
+        selected_controller = self._selected_input() == "Controller"
+        if selected_controller:
+            if (sample is None or sample.scope != scope or sample.at <= self._controller_sample_at
+                    or not 0 <= now - sample.at < deadline):
+                return
+            self._controller_sample_at = sample.at
+        circle = bool(selected_controller and sample and sample.intent == "emergency")
         if circle:
             if not self._circle_held:
-                self.on_simulated_emergency()
+                self.on_controller_emergency()
         elif scope == self._motion_scope():
             if lost := motion.loss(now):
                 self._revoke(lost)
@@ -1206,6 +1216,33 @@ class Realtime:
                         (motion.permission == "Arming" and not lease.motion_generation)):
                     self._rotate_motion_generation()
         self._circle_held = circle
+
+    async def maintain_controller(self) -> None:
+        controller = self.controller
+        assert controller
+        deadline = self.requires_profile().bound("input_sample_deadline_ms") / 1000
+        generation = 0
+        while not self._closed:
+            selected = self._selected_input() == "Controller"
+            scope = self._input_scope() if selected else None
+            observation = controller.observe(scope)
+            now = self.monotonic()
+            at = observation.at
+            if generation and generation != observation.generation and at is not None:
+                # Even a disconnect/reconnect between coordinator turns counts as loss.
+                self._set_readiness({**self._readiness, "Controller": False})
+            generation = observation.generation
+            ready = at is not None and 0 <= now - at < deadline
+            if ready and at is not None:
+                self._input_deadlines["Controller"] = at + deadline
+            else:
+                self._input_deadlines.pop("Controller", None)
+            self._set_readiness({**self._readiness, "Controller": ready})
+            if selected:
+                self._accept_motion(scope, observation.sample if ready else None, now, deadline)
+            self._evaluate_motion(self.monotonic())
+            self._restore_failures()
+            await asyncio.sleep(CONTROLLER_POLL_SECONDS)
 
     def _webcam_ready(self, now: float) -> bool:
         return now < self._input_deadlines.get("Webcam", now) and (self.webcam is not None or "webcam" in self._live_sources)

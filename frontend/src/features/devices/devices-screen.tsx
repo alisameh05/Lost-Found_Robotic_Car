@@ -9,7 +9,7 @@ import { Button } from "@/components/ui/button";
 import { LoadingState, Notice } from "@/components/ui/feedback";
 import { DeletionNotice, useEligibleSearchSetup, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import type { Component, ControlMode, Health } from "@/generated/api-v1";
-import { LOCAL_GESTURES_PROFILE, LOCAL_YOLOE_PROFILE } from "@/lib/config";
+import { LOCAL_CONTROLLER_PROFILE, LOCAL_GESTURES_PROFILE, LOCAL_YOLOE_PROFILE } from "@/lib/config";
 import { searchSetupHref, supportHref, type SearchSetupContext } from "@/lib/search-setup-context";
 import { InactiveInput, PathRow, paths, ProximityAdvisory } from "./device-observations";
 import styles from "./devices.module.css";
@@ -74,6 +74,7 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
   const view = useRuntimeView();
   const localMatching = view.profile?.profile_id === LOCAL_YOLOE_PROFILE;
   const localGestures = view.profile?.profile_id === LOCAL_GESTURES_PROFILE;
+  const localController = view.profile?.profile_id === LOCAL_CONTROLLER_PROFILE;
   const runtimeState = useRuntime();
   const refresh = useRefreshRuntime();
   const { context, checking } = useEligibleSearchSetup(setup);
@@ -87,6 +88,8 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
     <div className={layout.page}>
       <PageHeader title="Devices" description={localGestures
         ? "Local webcam gestures · Simulated robot video, commands, matching and controller"
+        : localController
+        ? "Selected USB DualShock 4 · Simulated robot video, commands, matching and gestures"
         : localMatching
         ? "Offline YOLOE · Simulated robot video, commands and input"
         : "Check the paths required for the selected control mode."}
