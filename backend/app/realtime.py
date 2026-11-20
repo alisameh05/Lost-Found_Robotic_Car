@@ -1195,12 +1195,13 @@ class Realtime:
             return
         # Circle is routed through the same latch even after a manual Pause.
         selected_controller = self._selected_input() == "Controller"
-        if selected_controller:
+        if selected_controller and self.controller:
             if (sample is None or sample.scope != scope or sample.at <= self._controller_sample_at
                     or not 0 <= now - sample.at < deadline):
                 return
             self._controller_sample_at = sample.at
-        circle = bool(selected_controller and sample and sample.intent == "emergency")
+        circle = bool(selected_controller and sample and sample.scope == scope
+                      and sample.intent == "emergency" and 0 <= now - sample.at < deadline)
         if circle:
             if not self._circle_held:
                 self.on_controller_emergency()
@@ -1228,6 +1229,11 @@ class Realtime:
             observation = controller.observe(scope)
             now = self.monotonic()
             at = observation.at
+            sample = observation.sample
+            # A previously observed Circle can only stop. Give it priority over simultaneous input loss.
+            circle = bool(sample and sample.intent == "emergency")
+            if selected and circle:
+                self._accept_motion(scope, sample, now, deadline)
             if generation and generation != observation.generation and at is not None:
                 # Even a disconnect/reconnect between coordinator turns counts as loss.
                 self._set_readiness({**self._readiness, "Controller": False})
@@ -1238,8 +1244,8 @@ class Realtime:
             else:
                 self._input_deadlines.pop("Controller", None)
             self._set_readiness({**self._readiness, "Controller": ready})
-            if selected:
-                self._accept_motion(scope, observation.sample if ready else None, now, deadline)
+            if selected and ready and not circle:
+                self._accept_motion(scope, sample, now, deadline)
             self._evaluate_motion(self.monotonic())
             self._restore_failures()
             await asyncio.sleep(CONTROLLER_POLL_SECONDS)

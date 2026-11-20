@@ -130,7 +130,7 @@ def create_app(
             if simulation and config.simulation_profile == LOCAL_CONTROLLER_PROFILE_NAME:
                 realtime.controller = controller or Controller(
                     config.controller_serial, simulation.profile.bound("input_sample_deadline_ms") / 1000,
-                    open_windows_controller,
+                    lambda: open_windows_controller(config.controller_serial),
                 )
             startup = asyncio.create_task(runtime.initialize())
             tasks: tuple[asyncio.Task[None], ...] = (

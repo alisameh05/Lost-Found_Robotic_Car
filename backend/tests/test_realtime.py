@@ -56,7 +56,7 @@ from backend.app.simulation import (
 )
 from backend.app.storage import RecordsStorage
 from backend.app.webcam import Webcam
-from backend.tests.test_controller import SERIAL, device
+from backend.tests.test_controller import SERIAL, device, fresh_reports
 from backend.tests.test_registration import submit
 from backend.tests.test_session_history import captured_png, insert_match
 
@@ -1623,13 +1623,17 @@ def test_neutral_fresh_hold_and_release_drive_the_same_sink(tmp_path: Path, mode
             assert current["runtime"]["control_generation"] > lease_at_start
 
 
-@pytest.mark.parametrize("loss", ["unplug", "stalled poll", "browser focus"])
+@pytest.mark.parametrize("loss", ["unplug", "stalled poll", "frozen reports", "browser focus"])
 def test_selected_dualshock_uses_shared_motion_and_recovery(tmp_path: Path, loss: str) -> None:
     devices = [device(1, 14), device(2, 11, serial="01-23-45-67-89-ab")]
     stall, entered, release = Event(), Event(), Event()
+    freeze = Event()
+    captured = ()
 
     def poll():
-        captured = tuple(devices)
+        nonlocal captured
+        if not freeze.is_set():
+            captured = fresh_reports(devices)
         if stall.is_set():
             entered.set()
             assert release.wait(5)
@@ -1666,6 +1670,8 @@ def test_selected_dualshock_uses_shared_motion_and_recovery(tmp_path: Path, loss
             elif loss == "stalled poll":
                 stall.set()
                 assert entered.wait(2)
+            elif loss == "frozen reports":
+                freeze.set()
             else:
                 driver.flags = {"workspace_focused": False}
             cause = "WorkspaceUnfocused" if loss == "browser focus" else "InputUnavailable"
@@ -1677,6 +1683,7 @@ def test_selected_dualshock_uses_shared_motion_and_recovery(tmp_path: Path, loss
             if loss == "unplug":
                 devices.insert(0, device(3, 11))
             stall.clear()
+            freeze.clear()
             release.set()
             wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "Controller") == "Ready")
             assert laf.command.output is None
@@ -1717,7 +1724,7 @@ def test_selected_dualshock_circle_stops_without_waiting_for_other_work(tmp_path
         if point == "before_commit":
             hold()
 
-    with service(tmp_path, controller_poll=lambda: tuple(devices),
+    with service(tmp_path, controller_poll=lambda: fresh_reports(devices),
                  inference=inference if busy == "inference" else None,
                  checkpoint=checkpoint if busy == "writer" else None) as laf, driving_search(laf) as (headers, driver):
         try:
@@ -1761,7 +1768,7 @@ def test_selected_dualshock_circle_stops_without_waiting_for_other_work(tmp_path
 
 def test_local_dualshock_cannot_drive_or_pause_gestures(tmp_path: Path) -> None:
     devices = [device(1)]
-    with service(tmp_path, controller_poll=lambda: tuple(devices)) as laf, driving_search(laf, "Gestures") as (headers, _):
+    with service(tmp_path, controller_poll=lambda: fresh_reports(devices)) as laf, driving_search(laf, "Gestures") as (headers, _):
         wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "Controller") == "Ready")
         arm(laf, headers, "Gestures")
         devices[0] = device(1, 1, 14)

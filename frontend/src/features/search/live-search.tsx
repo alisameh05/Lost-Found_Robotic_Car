@@ -177,6 +177,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const localControllerInput = !controllerReady ? "Selected USB DualShock 4 unavailable"
     : permission === "Armed" ? "D-pad direction accepted"
     : permission === "Arming" ? "Neutral accepted · waiting for a fresh hold"
+    : state === "Searching" && owner && ready ? "Release the D-pad to neutral"
     : "Selected USB DualShock 4 ready";
   const input = localGestures && gestures ? localGestureInput
     : localController && !gestures ? localControllerInput

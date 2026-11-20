@@ -13,7 +13,7 @@ from threading import Event, Lock, Thread
 from time import monotonic
 from typing import Any, cast
 
-from .motion import DIRECTIONS, Direction, InputSample, InputScope, controller_intent
+from .motion import DIRECTIONS, InputSample, InputScope, Intent
 
 POLL_SECONDS = 0.015
 PYGAME_VERSION = "2.6.1"
@@ -21,9 +21,9 @@ SDL_VERSION = (2, 28, 4)
 SONY = 0x054C
 DUALSHOCK_4 = (0x05C4, 0x09CC)
 USB_PATH = re.compile(r"\\\\\?\\hid#vid_054c&pid_(05c4|09cc)(?:&[^#]+)?#[^#]+#\{[0-9a-f-]+\}", re.I)
-DPAD: tuple[tuple[int, Direction], ...] = ((11, "forward"), (12, "backward"), (13, "left"), (14, "right"))
-CIRCLE = 1
-CONTROLS = (CIRCLE, *(index for index, _ in DPAD))
+USB_REPORT_SIZE = 64
+MAX_REPORTS = 64
+HAT: tuple[Intent, ...] = ("forward", "invalid", "right", "invalid", "backward", "invalid", "left", "invalid", "neutral")
 
 
 def serial_key(serial: str | None) -> str | None:
@@ -38,7 +38,20 @@ class DeviceState:
     instance: int
     serial: str
     path: str
-    buttons: frozenset[int] | None  # None until a report proves the pinned profile is usable.
+    reports: tuple[bytes, ...] | None  # None means unavailable. An empty batch cannot refresh freshness.
+    complete: bool = True  # A broken drain can only report an emergency from its valid prefix.
+
+
+def decode_usb_report(report: bytes) -> tuple[int, Intent] | None:
+    # SDL's pinned PS4 USB state report has a 1-byte ID followed by PS4StatePacket_t.
+    if len(report) != USB_REPORT_SIZE or report[0] != 1 or report[31] & 4:
+        return None
+    buttons = report[5]
+    hat = buttons & 0x0F
+    if hat >= len(HAT):
+        return None
+    tick = int.from_bytes(report[10:12], "little")
+    return tick, "emergency" if buttons & 0x40 else HAT[hat]
 
 
 @dataclass(frozen=True)
@@ -51,6 +64,10 @@ class ControllerObservation:
 Poll = Callable[[], tuple[DeviceState, ...]]
 
 
+def same_session(left: InputScope | None, right: InputScope | None) -> bool:
+    return left is not None and right is not None and (left.boot, left.session) == (right.boot, right.session)
+
+
 class Controller:
     def __init__(self, serial: str | None, deadline: float, open_device: Callable[[], AbstractContextManager[Poll]],
                  clock: Callable[[], float] = monotonic) -> None:
@@ -59,6 +76,8 @@ class Controller:
         self._lock, self._stop = Lock(), Event()
         self._scope: InputScope | None = None
         self._instance: tuple[int, str] | None = None
+        self._report_instance: tuple[int, str] | None = None
+        self._report_tick = 0
         self._latest = ControllerObservation(0, None)
         self._emergency: InputSample | None = None
         self._interruption: InputSample | None = None
@@ -75,49 +94,82 @@ class Controller:
         with self._lock:
             self._scope = scope
             latest = self._latest
-            if latest.at is None or not 0 <= self._clock() - latest.at < self._deadline:
+            now = self._clock()
+            ready = latest.at is not None and 0 <= now - latest.at < self._deadline
+            at = latest.at if ready else None
+            emergency = self._emergency
+            self._emergency = None
+            if (emergency and scope and same_session(emergency.scope, scope)
+                    and 0 <= now - emergency.at < self._deadline):
+                # A valid press keeps stop-only authority within the same active session.
+                return ControllerObservation(latest.generation, at, InputSample(scope, emergency.at, "emergency"))
+            if not ready:
                 return ControllerObservation(latest.generation, None)
-            for pending in (self._emergency, self._interruption, latest.sample):
-                if pending and pending.scope == scope and 0 <= self._clock() - pending.at < self._deadline:
-                    if pending is self._emergency:
-                        self._emergency = None
-                    elif pending is self._interruption:
+            for pending in (self._interruption, latest.sample):
+                if pending and pending.scope == scope and 0 <= now - pending.at < self._deadline:
+                    if pending is self._interruption:
                         self._interruption = None
-                    return ControllerObservation(latest.generation, latest.at, pending)
-            return ControllerObservation(latest.generation, latest.at)
+                    return ControllerObservation(latest.generation, at, pending)
+            return ControllerObservation(latest.generation, at)
 
-    def _publish(self, devices: tuple[DeviceState, ...], at: float, scope: InputScope | None) -> None:
+    def _publish(self, devices: tuple[DeviceState, ...], at: float, scope: InputScope | None,
+                 previous_scope: InputScope | None = None) -> None:
         matches = [device for device in devices if serial_key(device.serial) == self._serial]
-        device = matches[0] if len(matches) == 1 else None
         with self._lock:
+            device = matches[0] if len(matches) == 1 else next((
+                old for old in matches if not old.complete and (old.instance, old.path.casefold()) == self._instance
+            ), None)
             previous = self._latest
-            usable = (device is not None and device.buttons is not None and USB_PATH.fullmatch(device.path)
-                      and 0 <= self._clock() - at < self._deadline)
-            if not usable or device is None or device.buttons is None:
-                self._instance = None
-                self._latest = ControllerObservation(previous.generation, None)
-                self._emergency = self._interruption = None
+            reports = (device.reports if device is not None and USB_PATH.fullmatch(device.path) else None)
+            if device is None or reports is None or not 0 <= self._clock() - at < self._deadline:
+                self._unavailable()
                 return
             instance = (device.instance, device.path.casefold())
+            complete = device.complete
+            fresh = []
+            for raw in reports:
+                report = decode_usb_report(raw)
+                if report is None:
+                    complete = False
+                    break
+                tick, intent = report
+                if self._report_instance == instance and not 0 < (tick - self._report_tick) % 65536 < 32768:
+                    continue
+                self._report_instance, self._report_tick = instance, tick
+                fresh.append(intent)
+            if (scope and same_session(previous_scope, scope) and same_session(scope, self._scope)
+                    and "emergency" in fresh):
+                self._emergency = InputSample(scope, at, "emergency")
+            if not complete:
+                self._unavailable()
+                return
+            if not fresh:
+                if self._instance != instance:
+                    self._unavailable()
+                return
             new_connection = (self._instance != instance or previous.at is None
                               or not 0 <= at - previous.at < self._deadline)
             generation = previous.generation + int(new_connection)
             self._instance = instance
-            if new_connection or scope != self._scope:
-                self._emergency = self._interruption = None
+            current_scope = scope is not None and scope == previous_scope == self._scope
+            if new_connection or not current_scope:
+                self._interruption = None
             sample = None
-            if scope is not None and scope == self._scope:
-                intent = controller_intent(tuple(direction for index, direction in DPAD if index in device.buttons),
-                                           circle=CIRCLE in device.buttons)
-                sample = InputSample(scope, at, intent)
-                if intent == "emergency":
-                    self._emergency = sample
-                before = previous.sample
-                if (not new_connection and before and before.scope == scope and before.intent in DIRECTIONS
-                        and before.intent != intent and intent != "emergency"):
-                    # A latest-value mailbox must not hide release, conflict or a direction change.
-                    self._interruption = sample if intent == "neutral" else InputSample(scope, at, "invalid")
+            if scope is not None and current_scope:
+                prior = previous.sample if not new_connection else None
+                for intent in fresh:
+                    sample = InputSample(scope, at, intent)
+                    if (intent == "invalid" or (intent != "emergency" and prior and prior.scope == scope
+                                                and prior.intent in DIRECTIONS and prior.intent != intent)):
+                        # A later direction cannot hide a stop before the coordinator sees it.
+                        self._interruption = sample if intent == "neutral" else InputSample(scope, at, "invalid")
+                    prior = sample
             self._latest = ControllerObservation(generation, at, sample)
+
+    def _unavailable(self) -> None:
+        self._instance = None
+        self._latest = ControllerObservation(self._latest.generation, None)
+        self._interruption = None
 
     def _run(self) -> None:
         if self._serial is None:
@@ -125,10 +177,20 @@ class Controller:
         while not self._stop.is_set():
             try:
                 with self._open_device() as poll:
+                    with self._lock:
+                        previous_poll, previous_scope = self._clock(), self._scope
                     while not self._stop.is_set():
                         with self._lock:
                             at, scope = self._clock(), self._scope
-                        self._publish(poll(), at, scope)
+                        if at <= previous_poll:
+                            # Windows can return the same monotonic tick on adjacent wakes.
+                            # Leave reports queued until they can carry a distinct timestamp.
+                            self._stop.wait(POLL_SECONDS)
+                            continue
+                        # Reports may have accumulated since the previous drain. Use
+                        # the oldest possible timestamp and pass both scope boundaries.
+                        self._publish(poll(), previous_poll, scope, previous_scope)
+                        previous_poll, previous_scope = at, scope
                         self._stop.wait(POLL_SECONDS)
             except Exception:
                 self._publish((), self._clock(), None)
@@ -136,16 +198,17 @@ class Controller:
 
 
 @contextmanager
-def open_windows_controller() -> Iterator[Poll]:
+def open_windows_controller(selected_serial: str | None = None) -> Iterator[Poll]:
     if sys.platform != "win32":
         raise OSError("The controller profile requires Windows.")
     os.environ.setdefault("PYGAME_HIDE_SUPPORT_PROMPT", "1")
+    selected = serial_key(selected_serial)
     pygame = import_module("pygame")
     if pygame.__file__ is None or pygame.version.ver != PYGAME_VERSION or pygame.get_sdl_version() != SDL_VERSION:
         raise ValueError("Install the pinned Windows Pygame/SDL runtime.")
 
-    # Pygame exposes held state and instance IDs. The same SDL DLL also exposes the
-    # serial, OS device path, initial-report check and headless joystick event pump.
+    # Pygame supplies joystick identity and capabilities. Read ordered reports through
+    # the same SDL DLL because the joystick button cache omits both report age and edges.
     sdl = ctypes.CDLL(str(Path(pygame.__file__).with_name("SDL2.dll")))
     sdl.SDL_SetHintWithPriority.argtypes = [ctypes.c_char_p, ctypes.c_char_p, ctypes.c_int]
     for hint in (b"SDL_JOYSTICK_ALLOW_BACKGROUND_EVENTS", b"SDL_JOYSTICK_HIDAPI_PS4"):
@@ -161,20 +224,48 @@ def open_windows_controller() -> Iterator[Poll]:
         query.argtypes, query.restype = [ctypes.c_void_p], ctypes.c_char_p
     sdl.SDL_JoystickGetAttached.argtypes = [ctypes.c_void_p]
     sdl.SDL_JoystickGetAttached.restype = ctypes.c_int
-    sdl.SDL_JoystickGetAxisInitialState.argtypes = [ctypes.c_void_p, ctypes.c_int, ctypes.POINTER(ctypes.c_int16)]
-    sdl.SDL_JoystickGetAxisInitialState.restype = ctypes.c_int
     sdl.SDL_JoystickGetDeviceVendor.argtypes = [ctypes.c_int]
     sdl.SDL_JoystickGetDeviceVendor.restype = ctypes.c_uint16
     sdl.SDL_JoystickGetDeviceProduct.argtypes = [ctypes.c_int]
     sdl.SDL_JoystickGetDeviceProduct.restype = ctypes.c_uint16
     sdl.SDL_JoystickGetDeviceInstanceID.argtypes = [ctypes.c_int]
     sdl.SDL_JoystickGetDeviceInstanceID.restype = ctypes.c_int32
+    sdl.SDL_hid_open_path.argtypes = [ctypes.c_char_p, ctypes.c_int]
+    sdl.SDL_hid_open_path.restype = ctypes.c_void_p
+    sdl.SDL_hid_read_timeout.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t, ctypes.c_int]
+    sdl.SDL_hid_read_timeout.restype = ctypes.c_int
+    sdl.SDL_hid_close.argtypes = [ctypes.c_void_p]
+    sdl.SDL_hid_close.restype = None
     pygame.joystick.init()
+    handles: dict[int, int] = {}
     try:
         sdl.SDL_JoystickEventState(0)  # SDL_IGNORE: poll current state without retaining joystick events.
         joysticks: dict[int, Any] = {}
+        raw_devices: dict[int, tuple[str, bytes]] = {}
+        buffer = (ctypes.c_ubyte * (USB_REPORT_SIZE + 1))()
+
+        def read_reports(instance: int, path: bytes, limit: int = MAX_REPORTS) -> tuple[tuple[bytes, ...], bool]:
+            raw = handles.get(instance)
+            if raw is None:
+                raw = cast(int | None, sdl.SDL_hid_open_path(path, 0))
+                if raw is None:
+                    return (), False
+                handles[instance] = raw
+            reports: list[bytes] = []
+            for _ in range(limit):
+                length = sdl.SDL_hid_read_timeout(raw, buffer, len(buffer), 0)
+                if length == 0:
+                    return tuple(reports), True
+                if length < 0:
+                    break
+                reports.append(bytes(buffer[:length]))
+            # A saturated or broken stream can't prove that these are current reports.
+            sdl.SDL_hid_close(handles.pop(instance))
+            return tuple(reports), False
 
         def poll() -> tuple[DeviceState, ...]:
+            # Read pending reports before SDL's independent joystick handle can announce removal.
+            drained = {instance: read_reports(instance, path) for instance, (_, path) in raw_devices.items()}
             sdl.SDL_JoystickUpdate()
             devices = []
             present = set()
@@ -194,20 +285,40 @@ def open_windows_controller() -> Iterator[Poll]:
                     continue
                 present.add(instance)
                 serial = cast(bytes, sdl.SDL_JoystickGetSerial(handle) or b"").decode("ascii", errors="replace")
-                path = cast(bytes, sdl.SDL_JoystickPath(handle) or b"").decode("utf-8", errors="replace")
+                path_bytes = cast(bytes, sdl.SDL_JoystickPath(handle) or b"")
+                path = path_bytes.decode("utf-8", errors="replace")
                 guid = bytes.fromhex(joystick.get_guid())
-                buttons = None
+                reports = None
+                complete = False
                 if (len(guid) == 16 and guid[14] == ord("h") and joystick.get_numhats() == 0
                         and joystick.get_numbuttons() == 16 and joystick.get_numaxes() == 6
-                        and sdl.SDL_JoystickGetAxisInitialState(handle, 0, ctypes.byref(ctypes.c_int16()))):
-                    buttons = frozenset(button for button in CONTROLS if joystick.get_button(button))
-                devices.append(DeviceState(instance, serial, path, buttons))
+                        and USB_PATH.fullmatch(path) and (selected is None or serial_key(serial) == selected)):
+                    if raw_devices.get(instance) == (serial, path_bytes):
+                        reports, complete = drained[instance]
+                    elif instance not in raw_devices:
+                        reports, complete = read_reports(instance, path_bytes)
+                        raw_devices[instance] = serial, path_bytes
+                devices.append(DeviceState(instance, serial, path, reports, complete))
+            for removed in raw_devices.keys() - present:
+                serial, path_bytes = raw_devices.pop(removed)
+                reports, _ = drained[removed]
+                if removed in handles and len(reports) < MAX_REPORTS:
+                    # The pending raw read may have completed during the SDL removal check.
+                    tail, _ = read_reports(removed, path_bytes, MAX_REPORTS - len(reports))
+                    reports += tail
+                if reports:
+                    path = path_bytes.decode("utf-8", errors="replace")
+                    devices.append(DeviceState(removed, serial, path, reports, False))
+            for removed in handles.keys() - present:
+                sdl.SDL_hid_close(handles.pop(removed))
             for removed in joysticks.keys() - present:
                 joysticks.pop(removed).quit()
             return tuple(devices)
 
         yield poll
     finally:
+        for raw in handles.values():
+            sdl.SDL_hid_close(raw)
         pygame.joystick.quit()
 
 
@@ -215,4 +326,5 @@ if __name__ == "__main__":
     with open_windows_controller() as poll:
         poll()
         Event().wait(0.10)
-        print(poll())
+        print([(device.instance, device.serial, device.path,
+                decode_usb_report(device.reports[-1]) if device.reports else None) for device in poll()])

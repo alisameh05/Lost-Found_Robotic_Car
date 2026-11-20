@@ -12,7 +12,7 @@ from backend.app.controller import Controller
 from backend.app.main import create_app
 from backend.app.simulation import load_simulation
 from backend.app.storage import RecordsStorage, utc_ms
-from backend.tests.test_controller import SERIAL, device
+from backend.tests.test_controller import SERIAL, device, fresh_reports
 
 
 def crash_at_checkpoint(name: str) -> None:
@@ -46,7 +46,7 @@ def test_app(config: Config, *, held_owner: bool = False):
 
         def poll():
             instance, *buttons = map(int, source.read_text(encoding="ascii").split())
-            return (device(instance, *buttons),) if instance else ()
+            return fresh_reports([device(instance, *buttons)]) if instance else ()
 
         simulation = without_webcam(config)
         controller = Controller(SERIAL, simulation.profile.bound("input_sample_deadline_ms") / 1000,
