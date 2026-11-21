@@ -13,7 +13,7 @@ import { describeDeviceReadiness, devicePaths, localMatchingBlocker } from "@/fe
 import { ObjectStatus, objectHref, RecordAbsent, RecordReadFailure, ReferenceImage } from "@/features/objects";
 import { searchActionKey, unresolved, useObjectRecord, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import { componentNames, type ControlMode, type Object as ObjectRecord } from "@/generated/api-v1";
-import { LOCAL_GESTURES_PROFILE, LOCAL_YOLOE_PROFILE } from "@/lib/config";
+import { LOCAL_CONTROLLER_PROFILE, LOCAL_GESTURES_PROFILE, LOCAL_YOLOE_PROFILE } from "@/lib/config";
 import { searchSetupBlockReason, supportHref } from "@/lib/search-setup-context";
 import styles from "./search-setup.module.css";
 import { ActionFeedback } from "./action-feedback";
@@ -58,6 +58,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   const { snapshot, health, workspace, profile, recordsMode } = view;
   const localMatching = profile?.profile_id === LOCAL_YOLOE_PROFILE;
   const localGestures = profile?.profile_id === LOCAL_GESTURES_PROFILE;
+  const localController = profile?.profile_id === LOCAL_CONTROLLER_PROFILE;
   const showPreview = !recordsMode || (object.status === "Lost" && !object.retention_grace && referenceDisplayed === true);
   const canvas = useRef<HTMLDivElement>(null);
   const requestedStart = useRef(false);
@@ -109,6 +110,9 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   if (!notice && localGestures && blockedPaths.some(({ component }) => component === "Webcam")) {
     notice = "Check the selected Windows webcam, camera access, and the local Hand Landmarker installation.";
   }
+  if (!notice && localController && blockedPaths.some(({ component }) => component === "Controller")) {
+    notice = "Connect the configured DualShock 4 by USB and check that Windows recognizes it.";
+  }
   if (!notice && blockedPaths.length) notice = blockedPaths.map(({ component }) => devicePaths[component].label).join(", ") + " must report Ready.";
   if (!notice && workspace?.eventsLive && !workspace.previewLive) notice = "Wait for a fresh robot frame.";
 
@@ -127,6 +131,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
           </div>
           <div ref={canvas} className={styles.preview} />
           <p className={styles.muted}>{localGestures ? "Local webcam gestures · Simulated robot video, commands and matching"
+            : localController ? "Selected USB DualShock 4 · Simulated robot video, commands, matching and gestures"
             : localMatching ? "Offline YOLOE · Simulated robot video, commands and input"
             : recordsMode ? "Backend simulation · Disarmed" : workspace?.controlling ? "This workspace holds control." : "Read-only preview."}</p>
         </Panel>}
@@ -137,7 +142,8 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
           <legend>Control mode</legend>
           {modes.map(({ value, label, detail, icon: Icon }) => <label className={styles.mode} key={value}>
             <Icon aria-hidden="true" size={24} />
-            <span><strong>{label}</strong><small>{localGestures && value === "Controller" ? "Simulated controller input." : detail}</small></span>
+            <span><strong>{label}</strong><small>{localGestures && value === "Controller" ? "Simulated controller input."
+              : localController && value === "Gestures" ? "Simulated gesture input." : detail}</small></span>
             <input type="radio" name="search-control-mode" value={value} checked={mode === value}
               aria-label={label} onChange={() => setMode(value)} />
           </label>)}

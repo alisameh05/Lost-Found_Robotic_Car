@@ -1,6 +1,6 @@
 import { expect, test, type Page } from "@playwright/test";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, linkSync, mkdtempSync, readFileSync, unlinkSync, writeFileSync } from "node:fs";
+import { existsSync, linkSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
@@ -22,8 +22,11 @@ async function startBackend(options: {
   reviewSimulation?: boolean; crashCandidate?: boolean; noWebcam?: boolean; crashSearch?: "start" | "resume";
   yoloe?: { assets: string; robot?: string };
   gestures?: { assets?: string; devicePath?: string };
+  localController?: boolean;
+  controllerSamples?: string;
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
+    : options.controllerSamples ? ["backend.tests.crash_registration", "controller", options.controllerSamples]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
     : options.registrationGate ? ["backend.tests.crash_registration", "journaled", options.registrationGate]
     : options.settingsGate ? ["backend.tests.crash_registration", "retention_before_commit", options.settingsGate]
@@ -39,9 +42,11 @@ async function startBackend(options: {
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
       LAF_SIMULATION_PROFILE: options.yoloe ? "local-yoloe-v1"
         : options.gestures ? "local-gestures-v1"
+          : options.localController || options.controllerSamples ? "local-controller-v1"
           : options.reviewSimulation ? "fixture-review-v1" : options.simulation ? "fixture-v1" : undefined,
       LAF_YOLOE_ASSETS: options.yoloe?.assets, LAF_RECORDED_ROBOT_JPEG: options.yoloe?.robot,
       LAF_WEBCAM_DEVICE_PATH: options.gestures?.devicePath, LAF_GESTURE_ASSETS: options.gestures?.assets,
+      LAF_CONTROLLER_SERIAL: undefined,
       LAF_TEST_NO_WEBCAM: options.noWebcam ? "1" : undefined,
     },
   });
@@ -1304,6 +1309,65 @@ test("blocks Gestures without the selected webcam and keeps Controller available
   await start.click();
   await expect(page.getByText("Gesture control inactive")).toBeVisible();
   await expect(page.getByText("Simulated controller · Simulated robot video and commands")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Emergency Stop", exact: true })).toBeEnabled();
+});
+
+test("reports unavailable local DualShock 4 without gating Gestures", async ({ page }) => {
+  await startBackend({ localController: true });
+  await selectTarget(page, sourceImage(), "Controller readiness");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  await page.getByRole("radio", { name: "PS4 controller" }).check();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  const start = page.getByRole("button", { name: "Start Search" });
+  await expect(page.getByText("Selected USB DualShock 4 · Simulated robot video, commands, matching and gestures")).toBeVisible();
+  await expect(page.getByText("Connect the configured DualShock 4 by USB and check that Windows recognizes it.")).toBeVisible();
+  await expect(start).toBeDisabled();
+  await page.getByRole("link", { name: "View Devices" }).click();
+  await expect(page.getByRole("heading", { name: "Selected-mode input" }).locator(".."))
+    .toContainText(/PS4 DualShock 4\s*Unavailable/);
+  await page.getByRole("link", { name: "Return to Search Setup" }).click();
+  await page.getByRole("radio", { name: "Gestures" }).check();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  await expect(start).toBeEnabled();
+  await start.click();
+  await expect(page.getByText("Simulated gestures · Simulated robot video and commands")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Emergency Stop", exact: true })).toBeEnabled();
+});
+
+test("shows selected DualShock 4 input and emergency recovery in a connected workspace", async ({ page }) => {
+  const controllerSamples = join(parent, "controller.txt");
+  function sample(...buttons: number[]) {
+    const next = `${controllerSamples}.next`;
+    writeFileSync(next, [1, ...buttons].join(" "));
+    renameSync(next, controllerSamples);
+  }
+  sample();
+  await startBackend({ controllerSamples });
+  await selectTarget(page, sourceImage(), "Selected controller replay");
+  await setTargetCoordinates(page);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  await page.getByRole("radio", { name: "PS4 controller" }).check();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  await page.getByRole("button", { name: "Start Search" }).click();
+  const input = page.getByRole("region", { name: "Controller feedback" });
+  await expect(page.getByText("Selected USB DualShock 4 · Simulated robot video and commands")).toBeVisible();
+  await expect(page.getByText("Gesture control inactive")).toBeVisible();
+  await expect(input).toContainText("Selected USB DualShock 4 ready");
+  await expect(input).toContainText("Motion permission · Arming");
+  sample(11);
+  await expect(input).toContainText("Motion permission · Armed");
+  sample();
+  await expect(input).toContainText("Motion permission · Arming");
+  sample(12);
+  await expect(input).toContainText("Motion permission · Armed");
+  sample(12, 1);
+  await expect(input).toContainText("Motion permission · Disarmed");
+  await expect(input).toContainText("Selected USB DualShock 4 ready");
+  await expect(page.getByText("Committed session · Paused")).toBeVisible();
+  await expect(page.getByText(/Recovery required before Resume/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Emergency Stop", exact: true })).toBeEnabled();
 });
 

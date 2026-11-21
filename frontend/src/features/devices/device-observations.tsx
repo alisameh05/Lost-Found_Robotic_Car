@@ -13,7 +13,7 @@ export const paths = {
   RobotVideo: { label: "Robot camera", icon: Video, check: "Check that the camera stream is reachable on local Wi-Fi and is providing fresh frames." },
   DisplayedRobotVideo: { label: "Displayed robot video", icon: Monitor, check: "In the search workspace, check that fresh robot frames are actually visible. A frozen picture cannot satisfy this requirement." },
   Webcam: { label: "Laptop webcam", icon: Webcam, check: "Check Windows camera access and close other software using the laptop webcam." },
-  Controller: { label: "PS4 DualShock 4", icon: Gamepad2, check: "Check power, the USB or Bluetooth connection, and that Windows recognizes the configured controller. Release the D-pad while reconnecting." },
+  Controller: { label: "PS4 DualShock 4", icon: Gamepad2, check: "Check the configured connection and confirm that Windows recognizes the selected controller. Release the D-pad while reconnecting." },
   AI: { label: "Local matching service", icon: ScanSearch, check: "Wait for the local matching service to initialize. If it remains unavailable, check the local service and model installation." },
   Workspace: { label: "Search workspace", icon: PanelsTopLeft, check: "Return to the search workspace and keep it usable, visible and focused." },
   QualificationProfile: { label: "Qualification profile", icon: ShieldCheck, check: "Check that the active profile is compatible with this app and the configured device paths." },

@@ -5,7 +5,7 @@ import sqlite3
 from collections import Counter, deque
 from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
-from contextlib import closing, contextmanager
+from contextlib import closing, contextmanager, nullcontext
 from dataclasses import replace
 from io import BytesIO
 from pathlib import Path
@@ -29,6 +29,7 @@ from backend.app import realtime, sessions
 from backend.app import simulation as fixture
 from backend.app.config import Config
 from backend.app.control import Revocation
+from backend.app.controller import Controller, Poll
 from backend.app.main import create_app
 from backend.app.motion import (
     Command,
@@ -55,6 +56,7 @@ from backend.app.simulation import (
 )
 from backend.app.storage import RecordsStorage
 from backend.app.webcam import Webcam
+from backend.tests.test_controller import SERIAL, device, fresh_reports
 from backend.tests.test_registration import submit
 from backend.tests.test_session_history import captured_png, insert_match
 
@@ -316,9 +318,10 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
             inference: Inference | None = None, blocked_connection: int = 1,
             checkpoint: Callable[[str], None] | None = None, wall: Callable[[], int] | None = None,
             local_vision: bool = False, webcam_factory: Callable[[QualificationProfile, Clock], Webcam] | None = None,
-            local_gestures: bool = False) -> Iterator[Loopback]:
+            local_gestures: bool = False, controller_poll: Poll | None = None) -> Iterator[Loopback]:
     clock = Clock()
-    simulation = load_simulation("local-gestures-v1" if local_gestures else "fixture-v1")
+    selected = "local-controller-v1" if controller_poll else "local-gestures-v1" if local_gestures else "fixture-v1"
+    simulation = load_simulation(selected)
     assert simulation
     observations = Observations(simulation)
 
@@ -340,11 +343,12 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
-        config = Config(root, backend_port=port, simulation_profile="local-yoloe-v1" if local_vision
-                        else "local-gestures-v1" if local_gestures else None)
+        config = Config(root, backend_port=port, simulation_profile="local-yoloe-v1" if local_vision else selected)
         app = create_app(config, storage=storage,
                          simulation=Simulation(profile, observations, command, inference),
                          webcam=webcam_factory(profile, clock) if webcam_factory else None,
+                         controller=Controller(SERIAL, profile.bound("input_sample_deadline_ms") / 1000,
+                                               lambda: nullcontext(controller_poll), clock) if controller_poll else None,
                          on_channel_invalidated=lambda client, channel: invalidations.append((client, channel)),
                          **({"on_control_revoked": revocations.append} if revocations is not None else {}))
         delayed = PauseDelivery(app, blocked_connection) if blocked else None
@@ -1617,6 +1621,163 @@ def test_neutral_fresh_hold_and_release_drive_the_same_sink(tmp_path: Path, mode
             current = laf.http.get(API + "/snapshot", headers=headers).json()
             assert current["active_session"] == driver.session and current["failures"] == []
             assert current["runtime"]["control_generation"] > lease_at_start
+
+
+@pytest.mark.parametrize("loss", ["unplug", "stalled poll", "frozen reports", "browser focus"])
+def test_selected_dualshock_uses_shared_motion_and_recovery(tmp_path: Path, loss: str) -> None:
+    devices = [device(1, 14), device(2, 11, serial="01-23-45-67-89-ab")]
+    stall, entered, release = Event(), Event(), Event()
+    freeze = Event()
+    captured = ()
+
+    def poll():
+        nonlocal captured
+        if not freeze.is_set():
+            captured = fresh_reports(devices)
+        if stall.is_set():
+            entered.set()
+            assert release.wait(5)
+        return captured
+
+    with service(tmp_path, controller_poll=poll) as laf, driving_search(laf) as (headers, driver):
+        try:
+            assert status(laf.http.get(API + "/snapshot", headers=headers).json(), "Webcam") == "Unavailable"
+            sleep(0.15)
+            assert laf.command.output is None
+            for button, direction in ((11, "forward"), (12, "backward"), (13, "left"), (14, "right")):
+                devices[0] = device(1)
+                wait_for(laf.http, "/snapshot", headers, lambda s: s["runtime"]["motion_permission"] == "Arming")
+                devices[0] = device(1, button)
+                wait_output(laf, direction)
+                devices[0] = device(1, 11, 14)
+                assert_stopped(laf, "InputInvalid")
+                devices[0] = device(1, button)
+                sleep(0.08)
+                assert laf.command.output is None
+
+            devices[0] = device(1)
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["runtime"]["motion_permission"] == "Arming")
+            devices[0] = device(1, 13)
+            wait_output(laf, "left")
+            devices[0] = device(1)
+            assert_stopped(laf, "InputReleased")
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["runtime"]["motion_permission"] == "Arming")
+            devices[0] = device(1, 11)
+            wait_output(laf, "forward")
+
+            if loss == "unplug":
+                devices.pop(0)
+            elif loss == "stalled poll":
+                stall.set()
+                assert entered.wait(2)
+            elif loss == "frozen reports":
+                freeze.set()
+            else:
+                driver.flags = {"workspace_focused": False}
+            cause = "WorkspaceUnfocused" if loss == "browser focus" else "InputUnavailable"
+            assert_stopped(laf, cause)
+            snapshot = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+            assert status(snapshot, "Controller") == ("Ready" if loss == "browser focus" else "Unavailable")
+            assert snapshot["runtime"]["motion_permission"] == "Disarmed"
+            assert snapshot["failures"][0]["cause"] == cause
+            if loss == "unplug":
+                devices.insert(0, device(3, 11))
+            stall.clear()
+            freeze.clear()
+            release.set()
+            wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "Controller") == "Ready")
+            assert laf.command.output is None
+            with recover_workspace(laf, snapshot["active_session"]) as (new_headers, recovered):
+                restored = wait_for(laf.http, "/snapshot", new_headers, lambda s: s["failures"][0]["restored"])
+                acknowledge = search_action(laf, new_headers, recovered, "acknowledge", restored["active_session"]["revision"],
+                                            failure_ids=[restored["failures"][0]["failure_id"]])
+                assert acknowledge.status_code == 200, acknowledge.text
+                ready = wait_for(laf.http, "/snapshot", new_headers, lambda s: s["readiness"]["can_resume"])
+                assert laf.command.output is None
+                resume = search_action(laf, new_headers, recovered, "resume", ready["active_session"]["revision"])
+                assert resume.status_code == 200, resume.text
+                sleep(0.15)
+                assert laf.command.output is None
+                devices[0] = device(3 if loss == "unplug" else 1)
+                wait_for(laf.http, "/snapshot", new_headers, lambda s: s["runtime"]["motion_permission"] == "Arming")
+                devices[0] = device(3 if loss == "unplug" else 1, 11)
+                wait_output(laf, "forward")
+        finally:
+            release.set()
+
+
+@pytest.mark.parametrize("busy", ["inference", "writer", "paused"])
+def test_selected_dualshock_circle_stops_without_waiting_for_other_work(tmp_path: Path, busy: str) -> None:
+    devices = [device(1)]
+    blocked, entered, release = Event(), Event(), Event()
+
+    def hold() -> None:
+        if blocked.is_set():
+            entered.set()
+            assert release.wait(5)
+
+    def inference(_: InferenceSample) -> bool:
+        hold()
+        return True
+
+    def checkpoint(point: str) -> None:
+        if point == "before_commit":
+            hold()
+
+    with service(tmp_path, controller_poll=lambda: fresh_reports(devices),
+                 inference=inference if busy == "inference" else None,
+                 checkpoint=checkpoint if busy == "writer" else None) as laf, driving_search(laf) as (headers, driver):
+        try:
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["runtime"]["motion_permission"] == "Arming")
+            devices[0] = device(1, 11)
+            wait_output(laf, "forward")
+            active = driver.session
+            if busy == "paused":
+                paused = search_action(laf, headers, driver, "pause", active["revision"])
+                assert paused.status_code == 200, paused.text
+                wait_output(laf, None)
+            else:
+                blocked.set()
+                if busy == "writer":
+                    assert submit(laf.http, headers, wait=False).status_code == 202
+                assert entered.wait(2)
+            devices[0] = device(1, 11, 1)
+            if busy != "paused":
+                assert_stopped(laf, "EmergencyStop")
+            stopped = wait_for(laf.http, "/snapshot", headers, lambda s: any(
+                failure["cause"] == "EmergencyStop" for failure in s["failures"]))
+            assert stopped["runtime"]["effective_session_state"] == "Paused"
+            assert stopped["runtime"]["motion_permission"] == "Disarmed"
+            assert not release.is_set()
+            blocked.clear()
+            release.set()
+            saved = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused"
+                             and any(entry["cause"] == "RecoveryRequired" for entry in s["active_session"]["pause_causes"]))
+            assert len([entry for entry in saved["failures"] if entry["cause"] == "EmergencyStop"]) == 1
+            assert not next(entry for entry in saved["failures"] if entry["cause"] == "EmergencyStop")["restored"]
+            with recover_workspace(laf, saved["active_session"]) as (recovered, _):
+                assert not laf.http.get(API + "/snapshot", headers=recovered).json()["readiness"]["can_resume"]
+                devices[0] = device(1, 11)
+                assert not wait_for(laf.http, "/snapshot", recovered, lambda s: any(
+                    entry["cause"] == "EmergencyStop" and entry["restored"] for entry in s["failures"]
+                ))["readiness"]["can_resume"]
+                assert laf.command.output is None
+        finally:
+            release.set()
+
+
+def test_local_dualshock_cannot_drive_or_pause_gestures(tmp_path: Path) -> None:
+    devices = [device(1)]
+    with service(tmp_path, controller_poll=lambda: fresh_reports(devices)) as laf, driving_search(laf, "Gestures") as (headers, _):
+        wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "Controller") == "Ready")
+        arm(laf, headers, "Gestures")
+        devices[0] = device(1, 1, 14)
+        sleep(0.10)
+        assert laf.command.output == "forward"
+        devices.clear()
+        snapshot = wait_for(laf.http, "/snapshot", headers, lambda s: status(s, "Controller") == "Unavailable")
+        assert snapshot["active_session"]["state"] == "Searching" and snapshot["failures"] == []
+        assert laf.command.output == "forward"
 
 
 @pytest.mark.parametrize(("fault", "cause"), [
