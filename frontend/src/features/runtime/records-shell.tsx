@@ -3,12 +3,15 @@
 import { useCallback, type ReactNode } from "react";
 import { RuntimeFrame } from "./runtime-shell";
 import { Notice } from "@/components/ui/feedback";
+import { PHASE_06_PROFILE } from "@/lib/config";
 import { createHttpTransport } from "@/lib/http-transport";
 import { RuntimeProvider, useRuntimeView } from "./runtime-provider";
 
 function RecordsFrame({ children }: { children: ReactNode }) {
   const { connected, loading, health, failedRead, profile } = useRuntimeView();
-  const connectedLabel = profile ? "Backend simulation" : "Records connected · Search unavailable";
+  const connectedLabel = profile?.evidence_kind === "Device" ? "Device mode"
+    : profile?.profile_id === PHASE_06_PROFILE ? "Fixture mode · Backend simulation"
+    : profile ? "Backend simulation" : "Records connected · Search unavailable";
   const status = connected ? connectedLabel
     : health?.initialization === "Starting" || loading ? "Connecting to local records" : "Local records unavailable";
   return <RuntimeFrame fixtureEnabled={false} modeLabel={status}>

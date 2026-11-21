@@ -1,0 +1,11 @@
+{
+  "version": 1,
+  "kind": "Device",
+  "hc05_uno": null,
+  "esp32_cam": null,
+  "hcsr04": null,
+  "windows_profile_sha256": null,
+  "protected_network_sha256": null,
+  "webcam": null,
+  "controller": null
+}

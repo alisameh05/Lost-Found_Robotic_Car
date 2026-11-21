@@ -26,6 +26,7 @@ async function startBackend(options: {
   localController?: boolean;
   controllerSamples?: string;
   phase06?: "gestures" | "controller" | "native-landmarker" | "production";
+  device?: boolean;
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.phase06 && options.phase06 !== "production" ? ["backend.tests.phase06_replay", parent, options.phase06]
@@ -43,6 +44,7 @@ async function startBackend(options: {
     cwd: repo, windowsHide: true, env: {
       ...process.env, LOCALAPPDATA: parent, LAF_DATA_ROOT: join(parent, "records"),
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
+      LAF_BACKEND_MODE: options.device ? "device" : undefined,
       LAF_SIMULATION_PROFILE: options.phase06 ? "phase-06-v1" : options.yoloe ? "local-yoloe-v1"
         : options.gestures ? "local-gestures-v1"
           : options.localController || options.controllerSamples ? "local-controller-v1"
@@ -189,6 +191,56 @@ test("opens connected empty records and editable settings with one page identity
   expect(requests.every((value) => /^(GET|OPTIONS) \/api\/v1\/(bootstrap|snapshot|health|objects|settings)$/.test(value))).toBe(true);
   expect(sockets).toEqual([]);
 });
+
+for (const configured of [false, true]) {
+  test("opens disarmed Device diagnostics " + (configured ? "with a validated profile" : "without a profile"), async ({ page }) => {
+    if (configured) {
+      execFileSync(python, ["-c", [
+        "import sys",
+        "from pathlib import Path",
+        "from backend.tests.device_documents import device_documents, write_device_documents",
+        "write_device_documents(Path(sys.argv[1]), *device_documents())",
+      ].join("\n"), join(parent, "records")], { cwd: repo, windowsHide: true });
+    }
+    // A stale fixture selection must not start preview or simulated commands in Device mode.
+    await startBackend({ device: true, simulation: true });
+    await loopbackOnly(page);
+    await seedLibrary([["test-device-target", "Device test target", "Lost", Date.now() - 1_000]]);
+    await page.goto("/objects/test-device-target/search");
+    const readiness = page.getByRole("region", { name: "Connection readiness" });
+    const webcam = readiness.getByRole("listitem").filter({ hasText: "Laptop webcam" });
+    await expect(webcam).toContainText("Required");
+    await expect(webcam).toContainText("Unavailable");
+    await expect(readiness.getByRole("listitem").filter({ hasText: "PS4 DualShock 4" })).toContainText("Inactive");
+    await expect(readiness.getByRole("listitem").filter({ hasText: "Qualification profile" }))
+      .toContainText(configured ? "Ready" : "Unavailable");
+    await expect(readiness.getByRole("listitem").filter({ hasText: "Robot command connection" }))
+      .toContainText(configured ? "Unavailable · Unsupported protocol" : "Unavailable");
+    if (configured) {
+      await expect(page.getByText("Device mode", { exact: true })).toBeVisible();
+      await expect(page.getByRole("region", { name: "Robot preview" })).toContainText("Not live");
+    }
+    await expect(page.getByText(/Backend simulation|Fixture mode/)).toHaveCount(0);
+    const start = page.getByRole("button", { name: "Start Search" });
+    await expect(start).toBeDisabled();
+    await page.getByRole("radio", { name: "PS4 controller" }).check();
+    await expect(readiness.getByRole("listitem").filter({ hasText: "Laptop webcam" })).toContainText("Inactive");
+    await expect(readiness.getByRole("listitem").filter({ hasText: "PS4 DualShock 4" })).toContainText("Required");
+    await expect(start).toBeDisabled();
+    await page.getByRole("link", { name: "View Devices" }).click();
+    await expect(page.getByRole("heading", { name: "Required for Controller (PS4)" })).toBeVisible();
+    const camera = page.locator("summary").filter({ hasText: "Robot camera" });
+    await expect(camera).toContainText("Unavailable");
+    await camera.click();
+    await expect(page.getByText("Check the selected ESP32-CAM configuration, firmware and protected local Wi-Fi connection.")).toBeVisible();
+    await expect(page.getByText("Proximity feedback is for the operator’s awareness only.")).toBeVisible();
+    await page.getByRole("button", { name: "Emergency Stop" }).click();
+    await expect(page.getByText("Motion permission revoked", { exact: true })).toBeVisible();
+    await page.getByRole("link", { name: "Return to Search Setup" }).click();
+    await expect(page.getByRole("radio", { name: "PS4 controller" })).toBeChecked();
+    await expect(page.getByRole("heading", { name: "Device test target" })).toBeVisible();
+  });
+}
 
 type PreviewProbe = { events?: WebSocket; initialSnapshot?: string; repeatFrames: boolean };
 type PreviewWindow = Window & { previewProbe: PreviewProbe };

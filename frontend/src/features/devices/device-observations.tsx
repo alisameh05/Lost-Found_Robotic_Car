@@ -9,14 +9,14 @@ import styles from "./devices.module.css";
 export const paths = {
   Backend: { label: "Backend service", icon: Server, check: "Check the local application service and wait for startup to finish." },
   Storage: { label: "Managed storage", icon: Database, check: "Wait for storage reconciliation. If it fails, restore storage access and check readiness again." },
-  Command: { label: "Robot command connection", icon: Bluetooth, check: "Check that the command device is powered, its configured connection is available, and no other app is using it." },
-  RobotVideo: { label: "Robot camera", icon: Video, check: "Check that the camera stream is reachable on local Wi-Fi and is providing fresh frames." },
+  Command: { label: "Robot command connection", icon: Bluetooth, check: "Check the selected HC-05 and Uno configuration, firmware and command protocol." },
+  RobotVideo: { label: "Robot camera", icon: Video, check: "Check the selected ESP32-CAM configuration, firmware and protected local Wi-Fi connection." },
   DisplayedRobotVideo: { label: "Displayed robot video", icon: Monitor, check: "In the search workspace, check that fresh robot frames are actually visible. A frozen picture cannot satisfy this requirement." },
   Webcam: { label: "Laptop webcam", icon: Webcam, check: "Check Windows camera access and close other software using the laptop webcam." },
   Controller: { label: "PS4 DualShock 4", icon: Gamepad2, check: "Check the configured connection and confirm that Windows recognizes the selected controller. Release the D-pad while reconnecting." },
   AI: { label: "Local matching service", icon: ScanSearch, check: "Wait for the local matching service to initialize. If it remains unavailable, check the local service and model installation." },
   Workspace: { label: "Search workspace", icon: PanelsTopLeft, check: "Return to the search workspace and keep it usable, visible and focused." },
-  QualificationProfile: { label: "Qualification profile", icon: ShieldCheck, check: "Check that the active profile is compatible with this app and the configured device paths." },
+  QualificationProfile: { label: "Qualification profile", icon: ShieldCheck, check: "Check the qualification profile, evidence and interface manifests, then restart the disarmed backend." },
 } satisfies Record<ComponentName, { label: string; icon: typeof Server; check: string }>;
 
 const causes: Partial<Record<ErrorCode, string>> = {

@@ -1,6 +1,6 @@
 import asyncio
 import sqlite3
-from collections.abc import AsyncIterator, Awaitable, Callable
+from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
 
 from fastapi import FastAPI, Request, WebSocket
@@ -10,6 +10,7 @@ from PIL import Image
 from .config import Config
 from .control import LeaseFailure, LeaseRejected, Revocation, parse_lease
 from .controller import Controller, open_windows_controller
+from .device_startup import DeviceProbe, RobotPath, load_device_startup
 from .http import (
     API_PREFIX,
     CLIENT_ROUTES,
@@ -102,10 +103,16 @@ def create_app(
     config: Config, *, held_owner: bool = False, storage: RecordsStorage | None = None,
     simulation: Simulation | None = None, on_channel_invalidated: Callable[[str, Channel], None] = _ignore_invalidation,
     on_control_revoked: Callable[[Revocation], None] = _ignore_revocation, webcam: Webcam | None = None,
-    controller: Controller | None = None,
+    controller: Controller | None = None, device_probes: Mapping[RobotPath, DeviceProbe] | None = None,
 ) -> FastAPI:
     unavailable_code = "NOT_READY"
-    if simulation is None:
+    device = None
+    if config.backend_mode == "device":
+        # Device mode takes precedence over any stale fixture environment settings or injection.
+        simulation = None
+        device = load_device_startup(config.data_root, device_probes or {})
+        unavailable_code = device.profile_cause
+    elif simulation is None:
         try:
             simulation = load_simulation(config.simulation_profile, config.recorded_robot_jpeg)
         except IncompatibleProfile:
@@ -114,13 +121,30 @@ def create_app(
             # Records/diagnostics remain available if fixture evidence could not be validated.
             pass
 
+    profile = device.profile if device else simulation.profile if simulation else None
+
     @asynccontextmanager
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owner: AbstractContextManager[None] = nullcontext() if held_owner else own_data_root(config.data_root)
         with owner:
             runtime = RecordsRuntime(storage or RecordsStorage(config.data_root))
             app.state.runtime = runtime
-            realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked)
+            realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked,
+                                               device=device)
+            if device and profile:
+                if config.yoloe_assets is not None:
+                    realtime.configure_local_vision(config.yoloe_assets, config.data_root / "vision", runtime.match_prompt)
+                webcam_identity, controller_identity = device.webcam_identity, device.controller_identity
+                if webcam_identity is not None:
+                    realtime.webcam = webcam or Webcam(
+                        profile, lambda: open_windows_camera(webcam_identity),
+                        lambda: open_hand_landmarker(config.gesture_assets), encode_preview,
+                    )
+                if controller_identity is not None:
+                    realtime.controller = controller or Controller(
+                        controller_identity, profile.bound("input_sample_deadline_ms") / 1000,
+                        lambda: open_windows_controller(controller_identity),
+                    )
             if simulation and config.simulation_profile in (LOCAL_VISION_PROFILE_NAME, PHASE_06_PROFILE_NAME):
                 realtime.configure_local_vision(config.yoloe_assets, config.data_root / "vision", runtime.match_prompt)
             if simulation and config.simulation_profile in (LOCAL_GESTURES_PROFILE_NAME, PHASE_06_PROFILE_NAME):
@@ -134,11 +158,12 @@ def create_app(
                     lambda: open_windows_controller(config.controller_serial),
                 )
             startup = asyncio.create_task(runtime.initialize())
-            tasks: tuple[asyncio.Task[None], ...] = (
-                asyncio.create_task(realtime.capture()), asyncio.create_task(realtime.maintain_projection()),
-                asyncio.create_task(realtime.maintain_control()),
-                asyncio.create_task(runtime.maintain_safety_storage(realtime)),
-            ) if simulation else ()
+            tasks: tuple[asyncio.Task[None], ...] = (asyncio.create_task(realtime.maintain_projection()),) if profile else ()
+            if simulation:
+                tasks += (
+                    asyncio.create_task(realtime.capture()), asyncio.create_task(realtime.maintain_control()),
+                    asyncio.create_task(runtime.maintain_safety_storage(realtime)),
+                )
             if realtime.local_vision:
                 tasks += (asyncio.create_task(realtime.maintain_local_vision()),
                           asyncio.create_task(realtime.maintain_continuity()))
@@ -172,7 +197,7 @@ def create_app(
         lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False,
     )
 
-    app.state.socket_message_limit = simulation.profile.bound("max_client_message_bytes") if simulation else 4096
+    app.state.socket_message_limit = profile.bound("max_client_message_bytes") if profile else 4096
 
     @app.middleware("http")
     async def protect(request: Request, next_route: Callable[[Request], Awaitable[Response]]) -> Response:

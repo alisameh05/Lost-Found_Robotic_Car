@@ -156,7 +156,7 @@ export function openWorkspace({
 }) {
   const robot = document.createElement("canvas");
   robot.setAttribute("role", "img");
-  const { integrated, localGestures } = localSearchPaths(profile.profile_id);
+  const { integrated, localGestures } = localSearchPaths(profile);
   robot.setAttribute("aria-label", integrated ? "Recorded robot camera view"
     : connectedBackend ? "Simulated robot camera view" : "Fixture robot camera view");
   const webcam = document.createElement("canvas");

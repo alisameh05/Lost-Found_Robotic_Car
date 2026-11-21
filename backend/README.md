@@ -42,6 +42,7 @@ Open [http://127.0.0.1:3000](http://127.0.0.1:3000). Dashboard and Objects show 
 | `LAF_BACKEND_PORT` | `8000` | Both terminals. Browse to the frontend port. |
 | `LAF_DATA_ROOT` | `%LOCALAPPDATA%\LostAndFound` | Backend terminal. Use an absolute application directory under `LOCALAPPDATA`. |
 | `LAF_MODE` | Disconnected | Frontend terminal. Use `records` for the local backend or `fixture` for the browser-only sample application. |
+| `LAF_BACKEND_MODE` | Unset | Backend terminal. Use `device` for the [disarmed Device workspace](PHASE_07_DEVICE_STARTUP.md) or `fixture` with an explicitly selected simulation profile. |
 | `LAF_SIMULATION_PROFILE` | Unset | Backend terminal. Set `phase-06-v1` for [offline matching with both local input paths](PHASE_06.md), `fixture-v1` for simulated motion, or `fixture-review-v1` for a deterministic candidate. The individual [matching](VISION.md), [webcam](GESTURES.md), and [controller](CONTROLLER.md) profiles remain available for adapter checks. |
 | `LAF_CONTROLLER_SERIAL` | Unset | Backend terminal. Set the selected unit's SDL serial for `local-controller-v1`. |
 

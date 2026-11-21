@@ -23,6 +23,7 @@ class Config:
     webcam_device_path: str | None = None
     gesture_assets: Path | None = None
     controller_serial: str | None = None
+    backend_mode: str | None = None
 
     @property
     def host(self) -> str:
@@ -56,10 +57,13 @@ class Config:
         backend = read_port("LAF_BACKEND_PORT", 8000)
         if frontend == backend:
             raise ValueError("LAF_FRONTEND_PORT and LAF_BACKEND_PORT must be different.")
+        mode = os.environ.get("LAF_BACKEND_MODE")
+        if mode not in (None, "fixture", "device"):
+            raise ValueError("LAF_BACKEND_MODE must be fixture or device.")
         assets = os.environ.get("LAF_YOLOE_ASSETS")
         robot = os.environ.get("LAF_RECORDED_ROBOT_JPEG")
         gesture_assets = os.environ.get("LAF_GESTURE_ASSETS")
         return cls(root, frontend, backend, os.environ.get("LAF_SIMULATION_PROFILE"),
                    Path(assets).absolute() if assets else None, Path(robot).absolute() if robot else None,
                    os.environ.get("LAF_WEBCAM_DEVICE_PATH"), Path(gesture_assets).absolute() if gesture_assets else None,
-                   os.environ.get("LAF_CONTROLLER_SERIAL"))
+                   os.environ.get("LAF_CONTROLLER_SERIAL"), mode)
