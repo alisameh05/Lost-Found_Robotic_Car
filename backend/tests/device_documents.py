@@ -61,13 +61,14 @@ def device_documents() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], 
     }
     profile = {"profile_id": "test-device-v1", "protocol_version": 1, "evidence_kind": "Device", **BOUNDS}
     evidence = {"version": 1, "kind": "Measured", "profile_id": profile["profile_id"],
-                "measurements": {key: {"value": value, "artifact_sha256": digest} for key, value in BOUNDS.items()},
-                "stop_budget": {"software_ms": 400, "mechanical_margin_ms": 100, "artifact_sha256": digest}}
+                "measurements": {key: {"value": value} for key, value in BOUNDS.items()},
+                "stop_budget": {"software_ms": 400, "mechanical_margin_ms": 100}}
     return profile, interfaces, evidence, artifact
 
 
 def write_device_documents(
     root: Path, profile: dict[str, Any], interfaces: dict[str, Any], evidence: dict[str, Any], artifact: bytes,
+    *, measurement_overrides: dict[str, object] | None = None,
 ) -> Path:
     folder = root / "device"
     artifacts = folder / "artifacts"
@@ -75,7 +76,23 @@ def write_device_documents(
     (artifacts / sha256(artifact).hexdigest()).write_bytes(artifact)
     interfaces_data = json.dumps(interfaces).encode()
     interfaces_hash = sha256(interfaces_data).hexdigest()
-    evidence_data = json.dumps({"interfaces_sha256": interfaces_hash, **evidence}).encode()
+    measurement = json.dumps({
+        "version": 1, "kind": "DeviceMeasurement", "profile_id": profile["profile_id"],
+        "interfaces_sha256": interfaces_hash, "procedure_id": "synthetic-test-procedure",
+        "result_sha256": sha256(artifact).hexdigest(),
+        "bounds": {key: entry["value"] for key, entry in evidence["measurements"].items()},
+        "stop_allowance": {key: evidence["stop_budget"][key] for key in ("software_ms", "mechanical_margin_ms")},
+        **(measurement_overrides or {}),
+    }).encode()
+    measurement_hash = sha256(measurement).hexdigest()
+    (artifacts / measurement_hash).write_bytes(measurement)
+    evidence_data = json.dumps({
+        "interfaces_sha256": interfaces_hash,
+        **evidence,
+        "measurements": {key: {**entry, "artifact_sha256": measurement_hash}
+                         for key, entry in evidence["measurements"].items()},
+        "stop_budget": {**evidence["stop_budget"], "artifact_sha256": measurement_hash},
+    }).encode()
     (folder / "interfaces.json").write_bytes(interfaces_data)
     (folder / "evidence.json").write_bytes(evidence_data)
     (folder / "profile.json").write_text(json.dumps({

@@ -131,39 +131,34 @@ def create_app(
             app.state.runtime = runtime
             realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked,
                                                device=device)
-            if device and profile:
-                if config.yoloe_assets is not None:
+            if profile:
+                fixture = config.simulation_profile if simulation else None
+                webcam_identity = device.webcam_identity if device else config.webcam_device_path
+                controller_identity = device.controller_identity if device else config.controller_serial
+                if (device and config.yoloe_assets is not None) or fixture in (LOCAL_VISION_PROFILE_NAME, PHASE_06_PROFILE_NAME):
                     realtime.configure_local_vision(config.yoloe_assets, config.data_root / "vision", runtime.match_prompt)
-                webcam_identity, controller_identity = device.webcam_identity, device.controller_identity
-                if webcam_identity is not None:
+                if (device and webcam_identity is not None) or fixture in (LOCAL_GESTURES_PROFILE_NAME, PHASE_06_PROFILE_NAME):
                     realtime.webcam = webcam or Webcam(
                         profile, lambda: open_windows_camera(webcam_identity),
                         lambda: open_hand_landmarker(config.gesture_assets), encode_preview,
                     )
-                if controller_identity is not None:
-                    realtime.controller = controller or Controller(
-                        controller_identity, profile.bound("input_sample_deadline_ms") / 1000,
-                        lambda: open_windows_controller(controller_identity),
+                if (device and controller_identity is not None) or fixture in (LOCAL_CONTROLLER_PROFILE_NAME, PHASE_06_PROFILE_NAME):
+                    deadline = (
+                        simulation.controller_deadline_seconds if simulation else profile.bound("input_sample_deadline_ms") / 1000
                     )
-            if simulation and config.simulation_profile in (LOCAL_VISION_PROFILE_NAME, PHASE_06_PROFILE_NAME):
-                realtime.configure_local_vision(config.yoloe_assets, config.data_root / "vision", runtime.match_prompt)
-            if simulation and config.simulation_profile in (LOCAL_GESTURES_PROFILE_NAME, PHASE_06_PROFILE_NAME):
-                realtime.webcam = webcam or Webcam(
-                    simulation.profile, lambda: open_windows_camera(config.webcam_device_path),
-                    lambda: open_hand_landmarker(config.gesture_assets), encode_preview,
-                )
-            if simulation and config.simulation_profile in (LOCAL_CONTROLLER_PROFILE_NAME, PHASE_06_PROFILE_NAME):
-                realtime.controller = controller or Controller(
-                    config.controller_serial, simulation.controller_deadline_seconds,
-                    lambda: open_windows_controller(config.controller_serial),
-                )
+                    realtime.controller = controller or Controller(
+                        controller_identity, deadline, lambda: open_windows_controller(controller_identity),
+                    )
             startup = asyncio.create_task(runtime.initialize())
-            tasks: tuple[asyncio.Task[None], ...] = (asyncio.create_task(realtime.maintain_projection()),) if profile else ()
+            tasks: tuple[asyncio.Task[None], ...] = ()
             if simulation:
-                tasks += (
-                    asyncio.create_task(realtime.capture()), asyncio.create_task(realtime.maintain_control()),
+                tasks = (
+                    asyncio.create_task(realtime.capture()), asyncio.create_task(realtime.maintain_projection()),
+                    asyncio.create_task(realtime.maintain_control()),
                     asyncio.create_task(runtime.maintain_safety_storage(realtime)),
                 )
+            elif profile:
+                tasks = (asyncio.create_task(realtime.maintain_projection()),)
             if realtime.local_vision:
                 tasks += (asyncio.create_task(realtime.maintain_local_vision()),
                           asyncio.create_task(realtime.maintain_continuity()))

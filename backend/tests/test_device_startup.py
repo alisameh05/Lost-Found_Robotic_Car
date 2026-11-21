@@ -54,6 +54,7 @@ def component(view: dict, name: str) -> dict:
     ("unsupported_selection", "PROTOCOL_UNSUPPORTED", 0),
     ("wrong_baud", "NOT_READY", 0),
     ("matching_peer", "NOT_READY", 1),
+    ("invalid_camera_network", "NOT_READY", 1),
 ])
 def test_device_connection_diagnostics_are_independent_and_disarmed(
     tmp_path: Path, case: str, expected: str, probe_count: int,
@@ -66,6 +67,8 @@ def test_device_connection_diagnostics_are_independent_and_disarmed(
         selection["protocol_version"] = 2
     elif case == "wrong_baud":
         selection["serial_baud"] = 115200
+    elif case == "invalid_camera_network":
+        interfaces["protected_network_sha256"] = "invalid-digest"
     interfaces["controller"] = {"identity": SERIAL, "profile_sha256": sha256(artifact).hexdigest()}
     write_device_documents(tmp_path, profile, interfaces, evidence, artifact)
     observed: list[str] = []
@@ -96,7 +99,8 @@ def test_device_connection_diagnostics_are_independent_and_disarmed(
             assert component(data, "QualificationProfile")["status"] == "Ready"
             assert component(data, "Storage")["status"] == "Ready"
             assert component(data, "Command")["cause_codes"] == [expected]
-            assert component(data, "RobotVideo")["cause_codes"] == ["PROTOCOL_UNSUPPORTED"]
+            camera_cause = "NOT_READY" if case == "invalid_camera_network" else "PROTOCOL_UNSUPPORTED"
+            assert component(data, "RobotVideo")["cause_codes"] == [camera_cause]
             assert component(data, "Webcam")["cause_codes"] == ["NOT_READY"]
             assert component(data, "Controller")["status"] == "Ready"
             assert data["readiness"]["can_start"] == {"Gestures": False, "Controller": False}
@@ -116,7 +120,8 @@ def test_device_connection_diagnostics_are_independent_and_disarmed(
     ("heartbeat", "NOT_READY"), ("display_age", "NOT_READY"), ("capture_clock", "NOT_READY"),
     ("camera_rtt", "NOT_READY"), ("renewal_ack", "NOT_READY"), ("expiry", "NOT_READY"),
     ("proximity", "NOT_READY"), ("no_margin", "NOT_READY"), ("wrong_value", "NOT_READY"),
-    ("fixture_evidence", "NOT_READY"), ("changed_evidence", "NOT_READY"),
+    ("fixture_evidence", "NOT_READY"), ("changed_evidence", "NOT_READY"), ("fixture_measurement", "NOT_READY"),
+    ("other_interfaces", "NOT_READY"), ("unsupported_measurement", "NOT_READY"),
 ])
 def test_invalid_device_profile_never_reaches_adapter_boundary(tmp_path: Path, case: str, cause: str) -> None:
     profile, interfaces, evidence, artifact = device_documents()
@@ -142,7 +147,13 @@ def test_invalid_device_profile_never_reaches_adapter_boundary(tmp_path: Path, c
         evidence["measurements"]["serial_baud"]["value"] = 4
     elif case == "fixture_evidence":
         evidence["kind"] = "Fixture"
-    folder = write_device_documents(tmp_path, profile, interfaces, evidence, artifact)
+    measurement_overrides = {
+        "fixture_measurement": {"kind": "Fixture"},
+        "other_interfaces": {"interfaces_sha256": "9" * 64},
+        "unsupported_measurement": {"bounds": {"serial_baud": 1}},
+    }.get(case)
+    folder = write_device_documents(tmp_path, profile, interfaces, evidence, artifact,
+                                    measurement_overrides=measurement_overrides)
     if case == "changed_evidence":
         (folder / "artifacts" / sha256(artifact).hexdigest()).write_bytes(b"changed artifact")
 

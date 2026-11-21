@@ -1,18 +1,18 @@
 """Private, boot-scoped configuration for the selected Device workspace."""
 
 import json
+import re
 from collections.abc import Callable, Mapping
 from dataclasses import dataclass, field
 from hashlib import sha256
 from ipaddress import IPv4Address, IPv4Network
 from pathlib import Path
 from types import MappingProxyType
-from typing import Annotated, Literal, Self
+from typing import Annotated, Literal, NoReturn, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
 from .controller import serial_key
-from .http import HttpError, json_fields, reject_nonfinite
 from .simulation import IncompatibleProfile, QualificationProfile
 
 DOCUMENT_LIMIT = 256 * 1024
@@ -85,13 +85,13 @@ class InterfaceManifest(ManifestModel):
     version: Literal[1]
     kind: Literal["Device"]
     # Validate each optional selection separately so one missing link does not mask other observations.
-    hc05_uno: object
-    esp32_cam: object
-    hcsr04: object
-    windows_profile_sha256: Digest | None
-    protected_network_sha256: Digest | None
-    webcam: object
-    controller: object
+    hc05_uno: object = None
+    esp32_cam: object = None
+    hcsr04: object = None
+    windows_profile_sha256: object = None
+    protected_network_sha256: object = None
+    webcam: object = None
+    controller: object = None
 
 
 class Measurement(ManifestModel):
@@ -99,10 +99,24 @@ class Measurement(ManifestModel):
     artifact_sha256: Digest
 
 
-class StopBudget(ManifestModel):
+class StopAllowance(ManifestModel):
     software_ms: Positive
     mechanical_margin_ms: Positive
+
+
+class StopBudget(StopAllowance):
     artifact_sha256: Digest
+
+
+class MeasurementArtifact(ManifestModel):
+    version: Literal[1]
+    kind: Literal["DeviceMeasurement"]
+    profile_id: Name
+    interfaces_sha256: Digest
+    procedure_id: Name
+    result_sha256: Digest
+    bounds: dict[str, Positive]
+    stop_allowance: StopAllowance | None = None
 
 
 class EvidenceManifest(ManifestModel):
@@ -150,17 +164,35 @@ def read_local_file(root: Path, path: Path) -> bytes:
 
 
 def decode(data: bytes) -> object:
+    def unique_fields(pairs: list[tuple[str, object]]) -> dict[str, object]:
+        fields = dict(pairs)
+        if len(fields) != len(pairs):
+            raise ValueError("Device configuration contains a duplicate key.")
+        return fields
+
+    def reject_nonfinite(_: str) -> NoReturn:
+        raise ValueError("Device configuration contains a non-finite number.")
+
     try:
-        return json.loads(data.decode("utf-8"), object_pairs_hook=json_fields, parse_constant=reject_nonfinite)
-    except (HttpError, RecursionError) as exc:
-        raise ValueError("Invalid device configuration JSON.") from exc
+        return json.loads(data.decode("utf-8"), object_pairs_hook=unique_fields, parse_constant=reject_nonfinite)
+    except RecursionError as exc:
+        raise ValueError("Device configuration is nested too deeply.") from exc
+
+
+def artifact_digest(value: object) -> str | None:
+    return value if isinstance(value, str) and re.fullmatch(r"[a-f0-9]{64}", value) else None
+
+
+def read_artifact(root: Path, digest: str) -> bytes:
+    data = read_local_file(root, Path("device", "artifacts", digest))
+    if sha256(data).hexdigest() != digest:
+        raise ValueError("A device evidence artifact does not match its reference.")
+    return data
 
 
 def verify_artifacts(root: Path, references: set[str]) -> None:
     for digest in references:
-        data = read_local_file(root, Path("device", "artifacts", digest))
-        if sha256(data).hexdigest() != digest:
-            raise ValueError("A device evidence artifact does not match its reference.")
+        read_artifact(root, digest)
 
 
 def validate_evidence(root: Path, profile: QualificationProfile, evidence: EvidenceManifest) -> None:
@@ -185,7 +217,23 @@ def validate_evidence(root: Path, profile: QualificationProfile, evidence: Evide
         and stop.software_ms + stop.mechanical_margin_ms <= 500
     ):
         raise ValueError("Measured Device timing exceeds the qualified bounds.")
-    verify_artifacts(root, {entry.artifact_sha256 for entry in evidence.measurements.values()} | {stop.artifact_sha256})
+    references = {entry.artifact_sha256 for entry in evidence.measurements.values()} | {stop.artifact_sha256}
+    artifacts = {digest: MeasurementArtifact.model_validate(decode(read_artifact(root, digest)))
+                 for digest in references}
+    if any(
+        (artifact.profile_id, artifact.interfaces_sha256) != (evidence.profile_id, evidence.interfaces_sha256)
+        for artifact in artifacts.values()
+    ) or any(
+        artifacts[entry.artifact_sha256].bounds.get(name) != entry.value
+        for name, entry in evidence.measurements.items()
+    ):
+        raise ValueError("A measurement artifact does not support the selected profile and bound.")
+    allowance = artifacts[stop.artifact_sha256].stop_allowance
+    if allowance is None or (allowance.software_ms, allowance.mechanical_margin_ms) != (
+        stop.software_ms, stop.mechanical_margin_ms,
+    ):
+        raise ValueError("A measurement artifact must support the selected stop allocation.")
+    verify_artifacts(root, {artifact.result_sha256 for artifact in artifacts.values()})
 
 
 def endpoint_cause(
@@ -259,14 +307,15 @@ def load_device_startup(root: Path, probes: Mapping[RobotPath, DeviceProbe]) -> 
         ("RobotVideo", CameraInterface, interfaces.esp32_cam),
         ("Proximity", ProximityInterface, interfaces.hcsr04),
     )
+    windows = artifact_digest(interfaces.windows_profile_sha256)
+    network = artifact_digest(interfaces.protected_network_sha256)
     causes: dict[str, Cause] = {}
     for name, model, selection in selections:
         try:
             causes[name] = endpoint_cause(root, profile, model.model_validate(selection), probes.get(name),
-                                         interfaces.protected_network_sha256)
+                                         network)
         except (OSError, RuntimeError, ValueError):
             causes[name] = "NOT_READY"
     return DeviceStartup(profile, causes=MappingProxyType(causes),
-                         webcam_identity=local_identity(root, interfaces.webcam, interfaces.windows_profile_sha256),
-                         controller_identity=local_identity(root, interfaces.controller,
-                                                            interfaces.windows_profile_sha256, controller=True))
+                         webcam_identity=local_identity(root, interfaces.webcam, windows),
+                         controller_identity=local_identity(root, interfaces.controller, windows, controller=True))

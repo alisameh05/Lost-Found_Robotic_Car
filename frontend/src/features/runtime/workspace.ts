@@ -157,11 +157,12 @@ export function openWorkspace({
   const robot = document.createElement("canvas");
   robot.setAttribute("role", "img");
   const { integrated, localGestures } = localSearchPaths(profile);
-  robot.setAttribute("aria-label", integrated ? "Recorded robot camera view"
+  const deviceMode = profile.evidence_kind === "Device";
+  robot.setAttribute("aria-label", deviceMode ? "Robot camera view" : integrated ? "Recorded robot camera view"
     : connectedBackend ? "Simulated robot camera view" : "Fixture robot camera view");
   const webcam = document.createElement("canvas");
   webcam.setAttribute("role", "img");
-  webcam.setAttribute("aria-label", localGestures
+  webcam.setAttribute("aria-label", localGestures || deviceMode
     ? "Mirrored webcam preview and recognition" : "Fixture laptop webcam view");
   let view: WorkspaceView = { eventsLive: false, previewLive: false, webcamLive: false, controlling: false, usable: false, acquiring: false };
   let state: Snapshot | undefined;

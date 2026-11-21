@@ -10,7 +10,7 @@ export const paths = {
   Backend: { label: "Backend service", icon: Server, check: "Check the local application service and wait for startup to finish." },
   Storage: { label: "Managed storage", icon: Database, check: "Wait for storage reconciliation. If it fails, restore storage access and check readiness again." },
   Command: { label: "Robot command connection", icon: Bluetooth, check: "Check the selected HC-05 and Uno configuration, firmware and command protocol." },
-  RobotVideo: { label: "Robot camera", icon: Video, check: "Check the selected ESP32-CAM configuration, firmware and protected local Wi-Fi connection." },
+  RobotVideo: { label: "Robot camera", icon: Video, check: "Check that the camera stream is reachable on protected local Wi-Fi. Verify the selected ESP32-CAM configuration and firmware." },
   DisplayedRobotVideo: { label: "Displayed robot video", icon: Monitor, check: "In the search workspace, check that fresh robot frames are actually visible. A frozen picture cannot satisfy this requirement." },
   Webcam: { label: "Laptop webcam", icon: Webcam, check: "Check Windows camera access and close other software using the laptop webcam." },
   Controller: { label: "PS4 DualShock 4", icon: Gamepad2, check: "Check the configured connection and confirm that Windows recognizes the selected controller. Release the D-pad while reconnecting." },
