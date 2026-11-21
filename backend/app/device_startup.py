@@ -14,6 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 from .controller import serial_key
 from .simulation import IncompatibleProfile, QualificationProfile
+from .uno_wire import MAX_FRAME, VERSION
 
 DOCUMENT_LIMIT = 256 * 1024
 RFC1918 = tuple(IPv4Network(block) for block in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
@@ -53,6 +54,26 @@ class CommandInterface(Interface):
     flow_control: Literal["none", "rts_cts", "xon_xoff", "dsr_dtr"]
     uno: Build
     logical_output_sha256: Digest
+    build_artifact_sha256: Digest | None = None
+
+
+class CommandBuild(Build):
+    version: Literal[1]
+    kind: Literal["Device"]
+    build_id: Digest
+    logical_output_sha256: Digest
+    reset_evidence_sha256: Digest
+    serial_baud: Positive
+    packet_ms: Annotated[int, Field(ge=1, le=500)]
+    challenge_lifetime_ms: Annotated[int, Field(ge=1, le=500)]
+    firmware_expiry_ms: Annotated[int, Field(ge=1, le=500)]
+    hardware_watchdog_ms: Literal[15, 30, 60, 120, 250, 500]
+
+
+@dataclass(frozen=True)
+class SelectedCommand:
+    interface: CommandInterface
+    build_id: bytes
 
 
 class CameraInterface(Interface):
@@ -150,6 +171,7 @@ class DeviceStartup:
     causes: Mapping[str, Cause] = field(default_factory=lambda: MappingProxyType({}))
     webcam_identity: str | None = None
     controller_identity: str | None = None
+    command: SelectedCommand | None = None
 
 
 def read_local_file(root: Path, path: Path) -> bytes:
@@ -270,6 +292,33 @@ def endpoint_cause(
     return "NOT_READY"
 
 
+def command_selection(root: Path, profile: QualificationProfile, selection: CommandInterface) -> SelectedCommand:
+    reference = selection.build_artifact_sha256
+    if reference is None:
+        raise ValueError("No selected Uno build artifact")
+    if (selection.protocol_version != VERSION or selection.uno.target != "arduino:avr:uno"
+            or (selection.data_bits, selection.parity, selection.stop_bits_x2, selection.flow_control)
+            != (8, "none", 2, "none")
+            or profile.bound("serial_max_packet_bytes") != MAX_FRAME):
+        raise IncompatibleProfile("Unsupported Uno command profile")
+    build = CommandBuild.model_validate(decode(read_artifact(root, reference)))
+    verify_artifacts(root, {selection.contract_sha256, selection.logical_output_sha256, build.reset_evidence_sha256})
+    wire_ms = (MAX_FRAME * 10_000 + build.serial_baud - 1) // build.serial_baud
+    if (selection.uno.model_dump() != build.model_dump(include=set(Build.model_fields))
+            or selection.logical_output_sha256 != build.logical_output_sha256
+            or selection.serial_baud != build.serial_baud or not 1200 <= build.serial_baud <= 230400
+            or profile.bound("serial_baud") != build.serial_baud
+            or profile.bound("challenge_lifetime_ms") != build.challenge_lifetime_ms
+            or profile.bound("firmware_expiry_ms") != build.firmware_expiry_ms
+            or build.hardware_watchdog_ms > build.firmware_expiry_ms
+            or profile.bound("command_renewal_interval_ms") + profile.bound("command_ack_deadline_ms")
+            + wire_ms >= min(build.challenge_lifetime_ms, build.firmware_expiry_ms)
+            or not (270_000 + build.serial_baud - 1) // build.serial_baud < build.packet_ms
+            < min(build.challenge_lifetime_ms, build.firmware_expiry_ms)):
+        raise ValueError("Uno build does not match the measured selection")
+    return SelectedCommand(selection, bytes.fromhex(build.build_id))
+
+
 def local_identity(root: Path, value: object, windows: str | None, *, controller: bool = False) -> str | None:
     if windows is None:
         return None
@@ -310,12 +359,20 @@ def load_device_startup(root: Path, probes: Mapping[RobotPath, DeviceProbe]) -> 
     windows = artifact_digest(interfaces.windows_profile_sha256)
     network = artifact_digest(interfaces.protected_network_sha256)
     causes: dict[str, Cause] = {}
+    command = None
     for name, model, selection in selections:
         try:
-            causes[name] = endpoint_cause(root, profile, model.model_validate(selection), probes.get(name),
-                                         network)
+            selected = model.model_validate(selection)
+            causes[name] = endpoint_cause(root, profile, selected, probes.get(name), network)
+            if isinstance(selected, CommandInterface) and selected.build_artifact_sha256 is not None:
+                command = command_selection(root, profile, selected)
+                # A selected build still needs a current correlated acknowledgment.
+                causes[name] = "NOT_READY"
+        except IncompatibleProfile:
+            causes[name] = "PROTOCOL_UNSUPPORTED"
         except (OSError, RuntimeError, ValueError):
             causes[name] = "NOT_READY"
     return DeviceStartup(profile, causes=MappingProxyType(causes),
                          webcam_identity=local_identity(root, interfaces.webcam, windows),
-                         controller_identity=local_identity(root, interfaces.controller, windows, controller=True))
+                         controller_identity=local_identity(root, interfaces.controller, windows, controller=True),
+                         command=command)

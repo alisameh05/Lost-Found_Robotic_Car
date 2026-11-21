@@ -37,6 +37,7 @@ from .registration_input import NAME_LIMIT, normalize_name, parse_registration
 from .retention_input import parse_retention
 from .runtime import PageError, RecordsRuntime
 from .search_input import parse_emergency, parse_search
+from .serial_link import OpenTransport, SerialCommandLink, open_selected
 from .simulation import (
     LOCAL_CONTROLLER_PROFILE_NAME,
     LOCAL_GESTURES_PROFILE_NAME,
@@ -104,6 +105,7 @@ def create_app(
     simulation: Simulation | None = None, on_channel_invalidated: Callable[[str, Channel], None] = _ignore_invalidation,
     on_control_revoked: Callable[[Revocation], None] = _ignore_revocation, webcam: Webcam | None = None,
     controller: Controller | None = None, device_probes: Mapping[RobotPath, DeviceProbe] | None = None,
+    command_transport: OpenTransport | None = None,
 ) -> FastAPI:
     unavailable_code = "NOT_READY"
     device = None
@@ -129,8 +131,17 @@ def create_app(
         with owner:
             runtime = RecordsRuntime(storage or RecordsStorage(config.data_root))
             app.state.runtime = runtime
+            command = None
+            if device and device.command and profile:
+                selected = device.command
+                ack_deadline = profile.bound("command_ack_deadline_ms") / 1000
+                command = SerialCommandLink(
+                    profile, selected.build_id, command_transport or (
+                        lambda: open_selected(selected.interface, ack_deadline)
+                    ), runtime.storage.monotonic,
+                )
             realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked,
-                                               device=device)
+                                               device=device, command=command)
             if profile:
                 fixture = config.simulation_profile if simulation else None
                 webcam_identity = device.webcam_identity if device else config.webcam_device_path
@@ -158,7 +169,11 @@ def create_app(
                     asyncio.create_task(runtime.maintain_safety_storage(realtime)),
                 )
             elif profile:
-                tasks = (asyncio.create_task(realtime.maintain_projection()),)
+                tasks = (asyncio.create_task(realtime.maintain_projection()),
+                         asyncio.create_task(realtime.maintain_control()),
+                         asyncio.create_task(runtime.maintain_safety_storage(realtime)))
+            if command:
+                command.start()
             if realtime.local_vision:
                 tasks += (asyncio.create_task(realtime.maintain_local_vision()),
                           asyncio.create_task(realtime.maintain_continuity()))
@@ -179,6 +194,8 @@ def create_app(
                     for task in tasks:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
+                    if command:
+                        await asyncio.to_thread(command.close)
                     if realtime.webcam:
                         await asyncio.to_thread(realtime.webcam.close)
                     if realtime.controller:

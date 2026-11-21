@@ -16,7 +16,7 @@ from jsonschema import Draft202012Validator  # type: ignore[import-untyped]
 from PIL import Image
 
 from .http import BODY_LIMIT, HttpError, json_fields, reject_nonfinite
-from .motion import CommandSink, InputSample, InputScope, controller_intent, gesture_intent
+from .motion import CommandSink, InputSample, InputScope, LiveCommandSink, controller_intent, gesture_intent
 from .registration_input import SAFE_INTEGER
 
 FIXTURES = Path(__file__).with_name("preview_fixture")
@@ -322,7 +322,7 @@ class FixtureInference:
 class Simulation:
     profile: QualificationProfile
     adapter: PreviewAdapter
-    command_sink: CommandSink | None = None
+    command_sink: CommandSink | LiveCommandSink | None = None
     inference: Inference | None = None
     controller_deadline_ms: int | None = None
 

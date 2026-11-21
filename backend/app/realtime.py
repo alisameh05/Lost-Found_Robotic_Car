@@ -41,7 +41,7 @@ from .controller import POLL_SECONDS as CONTROLLER_POLL_SECONDS
 from .controller import Controller
 from .device_startup import DeviceStartup
 from .http import DOMAIN_ID, HEADER_LIMIT, HttpError, authorize_address, header, json_fields, read_json
-from .motion import FixtureCommandSink, InputSample, InputScope, Motion
+from .motion import FixtureCommandSink, InputSample, InputScope, LiveCommandSink, Motion
 from .registration_input import SAFE_INTEGER, canonical_json
 from .simulation import (
     SOURCES,
@@ -196,6 +196,7 @@ class Realtime:
         on_control_revoked: Callable[[Revocation], None],
         on_failure_changed: Callable[[Projection], None],
         on_controller_emergency: Callable[[], None], *, device: DeviceStartup | None = None,
+        command: LiveCommandSink | None = None,
     ):
         self.simulation = simulation
         self.device = device
@@ -265,6 +266,7 @@ class Realtime:
         self._published_permission = "Disarmed"
         self._circle_held = False
         self._controller_sample_at = -math.inf
+        self._command_cause: str | None = "NOT_READY"
         if simulation:
             self._proximity = ProximityAdvisory(simulation.profile)
             if simulation.command_sink is None:
@@ -273,6 +275,8 @@ class Realtime:
             sink = simulation.command_sink or self._fixture_sink
             assert sink is not None
             self._motion = Motion(sink, simulation.profile)
+        elif command and device and device.profile:
+            self._motion = Motion(command, device.profile)
 
     @property
     def profile(self) -> QualificationProfile | None:
@@ -512,6 +516,15 @@ class Realtime:
         while not self._closed:
             now = self.monotonic()
             self._evaluate_motion(now)
+            if self._motion and self._motion.live:
+                cause = self.component_cause("Command")
+                if cause != self._command_cause:
+                    if cause and self._command_cause is None:
+                        self._path_lost("Command")
+                    self._command_cause = cause
+                    if self._projection is not None:
+                        self._publish_snapshot()
+                self._restore_failures()
             robot = self._frames.get("robot")
             if robot and "robot" in self._live_sources and robot.age(now) >= profile.bound("capture_age_limit_ms"):
                 self._observe_source("robot", None, None, now, profile)
@@ -560,7 +573,15 @@ class Realtime:
             authorized = (scope == self._motion_scope() if scope else self._resume_viable)
             if authorized:
                 if failed is None and scope is not None:
-                    failed = self._motion.tick(scope, now, self.monotonic)
+                    until = math.inf
+                    if self._motion.live:
+                        profile, lease, robot = self.profile, self._lease, self._frames.get("robot")
+                        assert profile and lease and robot
+                        until = min(
+                            lease.display_deadline, lease.heartbeat_deadline, self._input_deadlines.get(selected, now),
+                            now + (profile.bound("capture_age_limit_ms") - robot.age(now)) / 1000,
+                        )
+                    failed = self._motion.tick(scope, now, self.monotonic, until)
                 if failed:
                     self._revoke(failed)
         self._publish_permission()
@@ -706,6 +727,10 @@ class Realtime:
             return self.unavailable_code if name == "QualificationProfile" else "NOT_READY"
         if name == "QualificationProfile":
             return None
+        if name == "Command" and self._motion and self._motion.live:
+            cause = self._motion.live.cause
+            if cause or self.device:
+                return cause
         if self.device and name in ("Command", "RobotVideo"):
             return self.device.causes.get(name, "NOT_READY")
         now = self.monotonic()
@@ -1165,7 +1190,9 @@ class Realtime:
                     else:
                         self._input_deadlines.pop(name, None)
                 self._set_readiness({
-                    "Command": observation.command,
+                    "Command": observation.command and (
+                        not self._motion or not self._motion.live or self._motion.command_ready()
+                    ),
                     "AI": self._vision_cause is None if self.local_vision else observation.inference,
                     "Controller": (self._readiness.get("Controller", False) if self.controller else
                                    observation.controller and now < self._input_deadlines.get("Controller", now)),
