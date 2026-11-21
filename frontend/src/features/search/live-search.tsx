@@ -13,7 +13,7 @@ import { devicePaths } from "@/features/devices";
 import { objectHref, RecordAbsent, RecordReadFailure, RecordTime, ReferenceImage, sessionHref } from "@/features/objects";
 import { recordAbsence, searchActionKey, unresolved, useRefreshRuntime, useRuntime, useRuntimeRead, useRuntimeView } from "@/features/runtime";
 import type { Snapshot } from "@/generated/api-v1";
-import { LOCAL_CONTROLLER_PROFILE, LOCAL_GESTURES_PROFILE, LOCAL_YOLOE_PROFILE } from "@/lib/config";
+import { localSearchPaths } from "@/lib/config";
 import { pendingReview } from "@/lib/match-evidence";
 import { gestureFeedback } from "@/lib/gesture-input";
 import { ActionFeedback } from "./action-feedback";
@@ -156,8 +156,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   if (!session || !object) return null;
   const mode = session.control_mode;
   const gestures = mode === "Gestures";
-  const localGestures = profile?.profile_id === LOCAL_GESTURES_PROFILE;
-  const localController = profile?.profile_id === LOCAL_CONTROLLER_PROFILE;
+  const { integrated, localMatching, localGestures, localController } = localSearchPaths(profile?.profile_id);
   const gestureInactive = !gestures && (localGestures || localController);
   const webcamLive = !!workspace?.webcamLive && !gestureInactive;
   const recognitionReady = connected && readiness.components.some(
@@ -183,7 +182,6 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     : recordsMode ? connectedInput : gestures ? gestureFeedback(sample) : sample === "invalid" ? "Conflicting D-pad input"
     : sample && sample !== "neutral" ? `Held ${sample}` : "No direction held";
   const searching = state === "Searching";
-  const localMatching = profile?.profile_id === LOCAL_YOLOE_PROFILE;
   const matching = searching && connected && readiness.components.some(({ component, status }) => component === "AI" && status === "Ready");
   const matchingLabel = localMatching
     ? matching ? "Offline YOLOE matching active" : "Offline YOLOE matching suspended"
@@ -225,7 +223,9 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   }
 
   return <div className={styles.page}>
-    <PageHeader title="Live Search Workspace" description={localGestures
+    <PageHeader title="Live Search Workspace" description={integrated
+      ? `${gestures ? "Local webcam gestures" : "Selected USB DualShock 4"} · Recorded robot video and simulated commands`
+      : localGestures
       ? `${gestures ? "Local webcam gestures" : "Simulated controller"} · Simulated robot video and commands`
         : localController
         ? `${gestures ? "Simulated gestures" : "Selected USB DualShock 4"} · Simulated robot video and commands`

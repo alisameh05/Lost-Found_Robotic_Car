@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "kind": "Fixture",
+  "robot_video": "An explicitly selected, bounded local JPEG sampled with new monotonic acquisition IDs",
+  "commands": "Simulated logical command journal and watchdog",
+  "proximity": "Deterministic simulation",
+  "matching": "Pinned Windows CUDA YOLOE and rejection continuity, documented in backend/VISION.md",
+  "webcam": "Selected DirectShow camera and local MediaPipe CPU, documented in backend/GESTURES.md",
+  "controller": "Selected USB DualShock 4 with Windows HID and SDL identity checks, documented in backend/CONTROLLER.md"
+}

@@ -1,4 +1,4 @@
-param([switch]$Offline)
+param([switch]$Offline, [switch]$Application)
 $ErrorActionPreference = 'Stop'
 Push-Location (Join-Path $PSScriptRoot '../..')
 try {
@@ -10,19 +10,25 @@ try {
         uv python install 3.11.14 --install-dir $pythonRoot
         if ($LASTEXITCODE) { throw 'Python setup failed.' }
     }
-    uv venv .local-runtime/venv --python $python --no-managed-python --offline --allow-existing
-    if ($LASTEXITCODE) { throw 'Virtual environment setup failed.' }
     $runtimePython = '.local-runtime/venv/Scripts/python.exe'
+    if (-not (Test-Path -LiteralPath $runtimePython)) {
+        uv venv .local-runtime/venv --python $python --no-managed-python --offline
+        if ($LASTEXITCODE) { throw 'Virtual environment setup failed.' }
+    }
+    & $runtimePython -c 'import sys; sys.exit(0 if sys.version_info[:3] == (3, 11, 14) else 1)'
+    if ($LASTEXITCODE) { throw 'The local runtime must use CPython 3.11.14.' }
     & $runtimePython -m ensurepip
     if ($LASTEXITCODE) { throw 'Installer setup failed.' }
+    $locks = @('-r', 'experiments/vision/requirements.lock')
+    if ($Application) { $locks += @('-r', 'backend/requirements.lock') }
     if (-not $Offline) {
         & $runtimePython -m pip download --no-deps --require-hashes --only-binary=:all: `
-            -r experiments/vision/requirements.lock --dest .local-runtime/wheels `
+            @locks --dest .local-runtime/wheels `
             --extra-index-url https://download.pytorch.org/whl/cu124
         if ($LASTEXITCODE) { throw 'Wheel download failed.' }
     }
     & $runtimePython -m pip install --no-index --find-links .local-runtime/wheels `
-        --require-hashes -r experiments/vision/requirements.lock
+        --require-hashes @locks
     if ($LASTEXITCODE) { throw 'Pinned installation failed.' }
     # Both upstream packages declare cv2 providers. Install the pinned contrib
     # build last so optional modules do not depend on wheel installation order.
@@ -36,6 +42,9 @@ try {
     if (-not $Offline) {
         & $runtimePython -m experiments.vision.setup_assets .local-runtime/assets
         if ($LASTEXITCODE) { throw 'Asset setup failed.' }
+    } elseif ($Application) {
+        & $runtimePython -m experiments.vision.setup_assets .local-runtime/assets --verify
+        if ($LASTEXITCODE) { throw 'Offline asset verification failed.' }
     }
 } finally {
     Pop-Location

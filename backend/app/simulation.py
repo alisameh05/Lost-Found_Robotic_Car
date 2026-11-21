@@ -27,6 +27,7 @@ PROFILE_FIELDS = Path(__file__).resolve().parents[1] / "contracts" / "v1" / "sch
 Source = Literal["robot", "webcam"]
 LOCAL_GESTURES_PROFILE_NAME = "local-gestures-v1"
 LOCAL_CONTROLLER_PROFILE_NAME = "local-controller-v1"
+PHASE_06_PROFILE_NAME = "phase-06-v1"
 SOURCES: tuple[Source, ...] = ("robot", "webcam")
 ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
 
@@ -235,7 +236,7 @@ def read_sample(jpeg: bytes, profile: QualificationProfile, expected: tuple[int,
 
 
 class StaticScene:
-    def __init__(self, robot: Sample, webcam: Sample, *, review: bool = False):
+    def __init__(self, robot: Sample | None, webcam: Sample | None = None, *, review: bool = False):
         self._samples = (robot, webcam)
         self._epochs = (token_urlsafe(18), token_urlsafe(18))
         self._sequence = 0
@@ -247,23 +248,26 @@ class StaticScene:
         self._sequence += 1
         robot, webcam = (
             Capture(epoch, epoch, self._sequence, int(now * 1_000_000), now, 1, sample.width, sample.height,
-                    sample.jpeg)
+                    sample.jpeg) if sample is not None else None
             for epoch, sample in zip(self._epochs, self._samples, strict=True)
         )
         if scope and scope.session != self._session:
             self._session, self._scope_started = scope.session, now
         elapsed = now - self._scope_started
-        if scope and self._review:
+        if scope and self._review and robot is not None:
             presence = FixturePresence(scope, robot.stream_epoch, robot.clock_epoch, robot.sequence,
                                        "fixture-wallet", not 12.0 <= elapsed % 24.0 < 18.0)
             robot = replace(robot, presence=presence)
         held = 1.2 <= elapsed < 4.2
+        proximity = ProximitySample(self._epochs[0], self._sequence, now, 120 if held else 300) if scope else None
+        if webcam is None:
+            return Observation(robot, None, command=True, controller=False, inference=False, proximity=proximity)
         return Observation(
             robot, webcam, command=True, controller=True, inference=True,
             controller_sample_at=now, gesture_sample_at=now,
             controller_input=InputSample(scope, now, controller_intent(("forward",) if held else ())) if scope else None,
             gesture_input=InputSample(scope, now, gesture_intent(1 if held else 0)) if scope else None,
-            proximity=ProximitySample(self._epochs[0], self._sequence, now, 120 if held else 300) if scope else None,
+            proximity=proximity,
         )
 
 
@@ -318,19 +322,30 @@ class Simulation:
     adapter: PreviewAdapter
     command_sink: CommandSink | None = None
     inference: Inference | None = None
+    controller_deadline_ms: int | None = None
+
+    @property
+    def controller_deadline_seconds(self) -> float:
+        return (self.controller_deadline_ms or self.profile.bound("input_sample_deadline_ms")) / 1000
 
 
 def load_simulation(selection: str | None, recorded_robot_jpeg: Path | None = None) -> Simulation | None:
     if selection is None:
         return None
     local_profiles = (LOCAL_VISION_PROFILE_NAME, LOCAL_GESTURES_PROFILE_NAME, LOCAL_CONTROLLER_PROFILE_NAME)
-    if selection not in (PROFILE_NAME, REVIEW_PROFILE_NAME, *local_profiles):
+    if selection not in (PROFILE_NAME, REVIEW_PROFILE_NAME, PHASE_06_PROFILE_NAME, *local_profiles):
         raise IncompatibleProfile("The simulation profile is incompatible.")
-    manifests = tuple((FIXTURES / name).read_text(encoding="utf-8").encode("utf-8") for name in ("evidence.json", "interfaces.json"))
+    integrated = selection == PHASE_06_PROFILE_NAME
+    folder = FIXTURES / "phase06" if integrated else FIXTURES
+    manifests = tuple((folder / name).read_text(encoding="utf-8").encode("utf-8")
+                      for name in ("evidence.json", "interfaces.json"))
     evidence, interfaces = manifests
     try:
-        document = json.loads((FIXTURES / "profile.json").read_text(encoding="utf-8"),
+        document = json.loads((folder / "profile.json").read_text(encoding="utf-8"),
                               object_pairs_hook=json_fields, parse_constant=reject_nonfinite)
+        device_protocol = (
+            json.loads(interfaces, object_pairs_hook=json_fields, parse_constant=reject_nonfinite) if integrated else None
+        )
     except HttpError as exc:
         raise ValueError("The simulation profile contains invalid JSON.") from exc
     if selection in local_profiles and isinstance(document, dict):
@@ -340,6 +355,28 @@ def load_simulation(selection: str | None, recorded_robot_jpeg: Path | None = No
             # Allow two acquisitions plus a recognition exchange before declaring loss.
             document["input_sample_deadline_ms"] = 240
     profile = QualificationProfile.validate(document, evidence, interfaces)
+    if integrated:
+        if profile.values["profile_id"] != PHASE_06_PROFILE_NAME:
+            raise IncompatibleProfile("The Phase 06 profile ID is incompatible.")
+        if not isinstance(device_protocol, dict):
+            raise ValueError("The Phase 06 device interface manifest is invalid.")
+        if type(device_protocol.get("version")) is not int or device_protocol["version"] != 1:
+            raise IncompatibleProfile("The Phase 06 device interface version is incompatible.")
+        controller_deadline = device_protocol.get("controller_sample_deadline_ms")
+        if type(controller_deadline) is not int or not 0 < controller_deadline <= profile.bound("input_sample_deadline_ms"):
+            raise ValueError("The Phase 06 controller deadline is invalid.")
+        robot = None
+        if recorded_robot_jpeg is not None:
+            try:
+                limit = profile.bound("max_frame_bytes") - profile.bound("max_header_bytes") - 4
+                with recorded_robot_jpeg.open("rb") as stream:
+                    jpeg = stream.read(limit + 1)
+                if len(jpeg) <= limit:
+                    robot = read_sample(jpeg, profile)
+            except (OSError, ValueError, Image.DecompressionBombError):
+                # Keep this profile active so readiness identifies the missing recording.
+                pass
+        return Simulation(profile, StaticScene(robot), controller_deadline_ms=controller_deadline)
     hashes = json.loads(evidence)["frames"]
     samples = []
     for source in SOURCES:

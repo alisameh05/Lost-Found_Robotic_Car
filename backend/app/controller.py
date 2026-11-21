@@ -83,6 +83,10 @@ class Controller:
         self._interruption: InputSample | None = None
         self._worker = Thread(target=self._run, name="controller-poll", daemon=True)
 
+    @property
+    def sample_deadline(self) -> float:
+        return self._deadline
+
     def start(self) -> None:
         self._worker.start()
 

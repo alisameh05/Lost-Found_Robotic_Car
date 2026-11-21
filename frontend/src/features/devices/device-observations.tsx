@@ -27,6 +27,16 @@ const causes: Partial<Record<ErrorCode, string>> = {
   CLIENT_INVALID: "The application connection could not be verified.",
 };
 const tones = { Ready: "success", Initializing: "warning", Unavailable: "danger" } as const;
+const recordedSearchChecks: Partial<Record<ComponentName, string>> = {
+  Command: "Check the simulated command sink and local backend diagnostics.",
+  RobotVideo: "Check that the configured robot recording is valid and readable, then restart the disarmed backend.",
+  Webcam: "Check the selected Windows webcam, camera access, and the local Hand Landmarker installation.",
+  Controller: "Connect the configured DualShock 4 by USB and check that Windows recognizes it.",
+};
+
+export function pathCheck(component: ComponentName, integrated = false) {
+  return (integrated && recordedSearchChecks[component]) || paths[component].check;
+}
 
 export function localMatchingBlocker(observation: Component) {
   if (observation.status === "Initializing") return "Offline YOLOE is initializing.";
@@ -35,9 +45,13 @@ export function localMatchingBlocker(observation: Component) {
   return "Offline YOLOE is unavailable. Check the backend diagnostics.";
 }
 
-export function PathRow({ observation, localMatching }: { observation: Component; localMatching?: boolean }) {
+export function PathRow({ observation, localMatching, integrated }: {
+  observation: Component;
+  localMatching?: boolean;
+  integrated?: boolean;
+}) {
   const { component, status, cause_codes } = observation;
-  const { label, icon: Icon, check } = paths[component];
+  const { label, icon: Icon } = paths[component];
   const explanations = new Set(cause_codes.map((code) => causes[code]).filter(Boolean));
   return (
     <li>
@@ -50,7 +64,7 @@ export function PathRow({ observation, localMatching }: { observation: Component
           {localMatching && component === "AI" && status !== "Ready"
             ? <p>{localMatchingBlocker(observation)}</p>
             : [...explanations].map((explanation) => <p key={explanation}>{explanation}</p>)}
-          <p>{check}</p>
+          <p>{pathCheck(component, integrated)}</p>
         </div>
       </details>
     </li>

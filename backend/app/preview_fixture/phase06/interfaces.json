@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "kind": "Fixture",
+  "transport": "API v1 event and binary frame envelopes",
+  "matching": "T5 visual prompt and continuity v1, T6 bounded private worker IPC v1",
+  "webcam": "T4 v1, 640 x 480 DirectShow BGR, MediaPipe Hand Landmarker",
+  "controller": "T4 v1, Pygame 2.6.1 and SDL 2.28.4, USB HID reports with fresh device tick",
+  "controller_sample_deadline_ms": 180,
+  "command": "Simulated logical commands, renewed through the independent command watchdog"
+}

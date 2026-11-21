@@ -1,4 +1,4 @@
-"""Deliberate network setup only. The probe never imports this module."""
+"""Provision or verify the hash-pinned local vision assets."""
 
 import argparse
 import hashlib
@@ -7,14 +7,24 @@ import urllib.request
 from pathlib import Path
 
 
-def download(destination: Path) -> None:
+def verify(path: Path, expected: str) -> bool:
+    if not path.is_file():
+        return False
+    with path.open("rb") as source:
+        return hashlib.file_digest(source, "sha256").hexdigest() == expected
+
+
+def prepare(destination: Path, *, offline: bool = False) -> None:
     manifest = json.loads(Path(__file__).with_name("assets.json").read_text())
-    destination.mkdir(parents=True, exist_ok=True)
+    if not offline:
+        destination.mkdir(parents=True, exist_ok=True)
     for name, entry in manifest.items():
         path = destination / name
-        if path.exists() and hashlib.sha256(path.read_bytes()).hexdigest() == entry["sha256"]:
+        if verify(path, entry["sha256"]):
             print(f"{name}: already verified")
             continue
+        if offline:
+            raise ValueError(f"Missing or incompatible offline asset: {name}")
         # A mismatched response is never installed at the trusted model path.
         with urllib.request.urlopen(entry["url"], timeout=180) as response:
             data = response.read()
@@ -27,4 +37,6 @@ def download(destination: Path) -> None:
 if __name__ == "__main__":
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("destination", type=Path)
-    download(parser.parse_args().destination)
+    parser.add_argument("--verify", action="store_true", help="Verify installed assets without downloading.")
+    args = parser.parse_args()
+    prepare(args.destination, offline=args.verify)
