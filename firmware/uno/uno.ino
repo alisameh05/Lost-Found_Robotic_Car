@@ -3,6 +3,7 @@
 #include <avr/wdt.h>
 
 #include "command.h"
+#include "command_port.h"
 #include "selected_build.h"
 
 namespace {
@@ -67,10 +68,6 @@ void initializeOutput() {}
 void logicalOutput(uint8_t) {}
 #endif
 
-void writeReply(const uint8_t *data, size_t size) {
-    if (Serial.availableForWrite() >= static_cast<int>(size)) Serial.write(data, size);
-}
-
 uno::Peer *peer = nullptr;
 }
 
@@ -78,8 +75,8 @@ void setup() {
     initializeOutput();
     logicalOutput(0);
     const uint32_t boot = nextBoot();
-    Serial.begin(Baud, SERIAL_8N1);
-    static uno::Peer command(boot, Timings, BuildId, logicalOutput, writeReply);
+    uno::port::begin();
+    static uno::Peer command(boot, Timings, BuildId, logicalOutput, uno::port::reply);
     peer = &command;
     wdt_enable(HardwareWatchdog);
 }
@@ -88,7 +85,13 @@ void loop() {
     wdt_reset();
     peer->tick(millis());
     // Limit work even when the receive buffer is constantly full.
-    for (uint8_t read = 0; read < 8 && Serial.available(); ++read) {
-        peer->receive(static_cast<uint8_t>(Serial.read()), millis());
+    for (uint8_t read = 0; read < 8; ++read) {
+        const int byte = uno::port::read();
+        if (byte == uno::port::Empty) break;
+        if (byte == uno::port::Fault) {
+            peer->transportFault();
+            break;
+        }
+        peer->receive(static_cast<uint8_t>(byte), millis());
     }
 }

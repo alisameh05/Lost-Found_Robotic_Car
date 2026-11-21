@@ -10,7 +10,11 @@ REPLY = 0x80
 ARMED = 1
 MAX_COUNTER = 0xFFFFFFFF
 HEADER = Struct("<BBIIIIIBB")
-MAX_FRAME = HEADER.size + 32 + 2 + 2
+REQUEST_FRAME = HEADER.size + 2 + 2
+MAX_FRAME = REQUEST_FRAME + 32
+# Overflow the Uno's request parser before supplying a delimiter. A bare
+# delimiter could complete a request whose entire body already arrived.
+DISCARD_PARTIAL = bytes([0xFF]) * REQUEST_FRAME + b"\0"
 
 
 class WireError(ValueError):

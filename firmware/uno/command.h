@@ -22,6 +22,7 @@ public:
     Peer(uint32_t boot, Timing timing, const uint8_t *build, Output output, ReplyWriter write);
     void tick(uint32_t now);
     void receive(uint8_t byte, uint32_t now);
+    void transportFault();
 
 private:
     void disable();

@@ -1261,12 +1261,19 @@ def recover_workspace(laf: Loopback, session: dict) -> Iterator[tuple[dict, Work
 def test_manual_resume_requires_fresh_neutral_and_keeps_the_saved_search(tmp_path: Path) -> None:
     with service(tmp_path) as laf, driving_search(laf, "Gestures") as (headers, driver):
         arm(laf, headers, "Gestures")
-        pause = search_action(laf, headers, driver, "pause", 1)
+        pause_id = str(uuid4())
+        pause = search_action(laf, headers, driver, "pause", 1, action_id=pause_id)
+        if pause.status_code == 202:
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+            pause = search_action(laf, headers, driver, "pause", 1, action_id=pause_id)
         assert pause.status_code == 200, pause.text
         wait_output(laf, None)
         wait_for(laf.http, "/snapshot", headers, lambda state: state["readiness"]["can_resume"])
         action_id = str(uuid4())
         response = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
+        if response.status_code == 202:
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["revision"] == 3)
+            response = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
         assert response.status_code == 200, response.text
         resumed = {**driver.session, "state": "Searching", "revision": 3, "pause_causes": []}
         assert response.json()["result"]["session"] == resumed

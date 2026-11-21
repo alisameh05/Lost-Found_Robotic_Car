@@ -26,7 +26,19 @@ from backend.app.main import create_app
 from backend.app.motion import DIRECTIONS
 from backend.app.serial_link import SerialCommandLink
 from backend.app.simulation import load_simulation
-from backend.app.uno_wire import ARM, DRIVE, HELLO, MAX_FRAME, REPLY, STOP, Packet, decode, encode
+from backend.app.uno_wire import (
+    ARM,
+    DISCARD_PARTIAL,
+    DRIVE,
+    HELLO,
+    MAX_FRAME,
+    REPLY,
+    STATUS,
+    STOP,
+    Packet,
+    decode,
+    encode,
+)
 from backend.tests.device_documents import device_documents, write_device_documents
 from backend.tests.test_device_startup import component
 from backend.tests.test_realtime import (
@@ -95,7 +107,7 @@ class NativePeer:
         with self.lock:
             if not self.connected:
                 raise OSError("fixture link unplugged")
-            packet = decode(data.lstrip(b"\0"))
+            packet = decode(data.removeprefix(DISCARD_PARTIAL))
             self.trace.append((self.clock(), packet))
             _, reply = self.step(data)
             if packet.op == DRIVE and self.fault:
@@ -112,6 +124,9 @@ class NativePeer:
                     reply = b""
                 else:
                     reply = b""
+                self.fault = None
+            elif (packet.op, self.fault) in ((STATUS, "idle_missing"), (STOP, "stop_missing")):
+                reply = b""
                 self.fault = None
             self.rx.extend(reply)
             return len(data)
@@ -217,13 +232,15 @@ def test_uno_expiry_survives_monotonic_clock_wrap(uno_peer_exe: Path) -> None:
 
 def test_stop_preempts_partial_wire_and_invalidates_an_armed_generation(uno_peer_exe: Path) -> None:
     with native_peer(uno_peer_exe) as peer:
-        armed(peer)
-        queued = encode(Packet(DRIVE, 1, 1, 3, 3, direction=2))
-        assert peer.step(queued[:8], now=10) == (1, b"")
-        stop = encode(Packet(STOP, 1, 1, 4, 3))
-        output, reply = peer.step(b"\0" + stop, now=11)
-        assert output == 0 and decode(reply) == Packet(STOP | REPLY, 1, 1, 4, 3, 4)
-        assert peer.step(queued, now=12) == (0, b"")
+        _, hello = exchange(peer, Packet(HELLO, sequence=9), 0)
+        _, arm = exchange(peer, Packet(ARM, hello.boot, 1, 1, hello.next_challenge), 1)
+        queued = encode(Packet(DRIVE, 1, 1, 2, arm.next_challenge, direction=2))
+        assert peer.step(queued[:-1], now=2) == (0, b"")
+        assert peer.step(DISCARD_PARTIAL, now=3) == (0, b"")
+        stop = encode(Packet(STOP, 1, 1, 3, arm.next_challenge))
+        output, reply = peer.step(stop, now=4)
+        assert output == 0 and decode(reply) == Packet(STOP | REPLY, 1, 1, 3, 2, 3)
+        assert peer.step(queued, now=5) == (0, b"")
 
 
 def wait_until(predicate, timeout=3):
@@ -329,6 +346,8 @@ def test_serial_failure_drops_authority_and_reconnects_disarmed(uno_peer_exe: Pa
             # Successful diagnostic traffic cannot restore the previous generation.
             wait_until(lambda: sum(packet.op == HELLO for _, packet in peer.trace) >= 2)
             assert not link.probe()
+            link.revoke(1, "InputReleased")
+            assert not link.probe(), "healthy release cannot clear a serial fault"
             link.revoke(1, "CommandUnavailable")
             wait_until(link.probe)
             assert peer.output == 0
@@ -336,18 +355,24 @@ def test_serial_failure_drops_authority_and_reconnects_disarmed(uno_peer_exe: Pa
             link.close()
 
 
-@pytest.mark.parametrize("condition", ["matched", "wrong_build", "changed_artifact", "fixture_artifact"])
+@pytest.mark.parametrize("condition", [
+    "matched", "wrong_build", "changed_artifact", "fixture_artifact", "same_pin", "usb_identity",
+])
 def test_selected_command_is_independent_of_device_camera(
     tmp_path: Path, uno_peer_exe: Path, condition: str,
 ) -> None:
     profile, interfaces, evidence, recorded_result = device_documents()
     profile["serial_max_packet_bytes"] = evidence["measurements"]["serial_max_packet_bytes"]["value"] = MAX_FRAME
     selected = interfaces["hc05_uno"]
+    profile["serial_baud"] = evidence["measurements"]["serial_baud"]["value"] = selected["serial_baud"] = 38400
     selected["uno"]["target"] = "arduino:avr:uno"
+    if condition == "usb_identity":
+        selected["identity"] = "USB VID:PID=1A86:7523"
     build = json.dumps({
         **selected["uno"], "version": 1, "kind": "DisabledFixture" if condition == "fixture_artifact" else "Device",
         "build_id": (bytes(32) if condition == "wrong_build" else BUILD).hex(),
         "logical_output_sha256": selected["logical_output_sha256"], "serial_baud": profile["serial_baud"],
+        "serial_rx_pin": 2, "serial_tx_pin": 2 if condition == "same_pin" else 3,
         "packet_ms": 25, "challenge_lifetime_ms": profile["challenge_lifetime_ms"],
         "firmware_expiry_ms": profile["firmware_expiry_ms"],
         "hardware_watchdog_ms": 120, "reset_evidence_sha256": selected["logical_output_sha256"],
@@ -358,7 +383,7 @@ def test_selected_command_is_independent_of_device_camera(
     with native_peer(uno_peer_exe, challenge=80, expiry=140) as peer:
         app = create_app(Config(tmp_path, backend_mode="device"), command_transport=lambda: nullcontext(peer))
         expected = [] if condition == "matched" else [
-            "PROTOCOL_UNSUPPORTED" if condition == "wrong_build" else "NOT_READY",
+            "PROTOCOL_UNSUPPORTED" if condition in ("wrong_build", "usb_identity") else "NOT_READY",
         ]
         with TestClient(app, base_url=BASE) as client:
             headers = auth(client.get(API + "/bootstrap", headers=ORIGIN).json())
@@ -368,10 +393,84 @@ def test_selected_command_is_independent_of_device_camera(
             status = client.get(API + "/snapshot", headers=headers).json()
             assert status["runtime"]["motion_permission"] == "Disarmed"
             assert peer.output == 0
-            if condition in ("changed_artifact", "fixture_artifact"):
+            if condition in ("changed_artifact", "fixture_artifact", "same_pin", "usb_identity"):
                 assert not peer.trace
             elif condition == "matched":
                 assert any(packet.op == HELLO for _, packet in peer.trace)
+
+
+def test_serial_shutdown_waits_for_late_open_without_transmitting(uno_peer_exe: Path) -> None:
+    fixture = load_simulation("fixture-v1")
+    assert fixture
+    entered, release, closed = Event(), Event(), Event()
+    with native_peer(uno_peer_exe) as peer:
+        @contextmanager
+        def slow_open():
+            entered.set()
+            assert release.wait(3)
+            try:
+                yield peer
+            finally:
+                closed.set()
+
+        link = SerialCommandLink(fixture.profile, BUILD, slow_open)
+        link.start()
+        closer = Thread(target=link.close, daemon=True)
+        assert entered.wait(2)
+        closer.start()
+        try:
+            closer.join(0.75)
+            assert closer.is_alive() and not closed.is_set()
+        finally:
+            release.set()
+            closer.join(3)
+        assert closed.is_set() and not closer.is_alive()
+        assert not peer.trace
+
+
+def test_neutral_search_pauses_on_lost_status_ack_and_recovers_diagnostics(
+    tmp_path: Path, uno_peer_exe: Path,
+) -> None:
+    fixture = load_simulation("fixture-v1")
+    assert fixture
+    with native_peer(uno_peer_exe) as peer:
+        link = SerialCommandLink(fixture.profile, BUILD, peer.open)
+        link.start()
+        try:
+            with service(tmp_path, live_command=link) as laf, driving_search(laf) as (headers, _):
+                assert peer.output == 0
+                peer.fault = "idle_missing"
+                snapshot = wait_for(laf.http, "/snapshot", headers, lambda s: (
+                    s["active_session"]["state"] == "Paused"
+                    and any(f["cause"] == "CommandUnavailable" and f["restored"] for f in s["failures"])
+                ))
+                assert snapshot["runtime"]["motion_permission"] == "Disarmed"
+                assert not any(packet.op == DRIVE for _, packet in peer.trace)
+        finally:
+            link.close()
+
+
+@pytest.mark.parametrize("fault", ["idle_missing", "stop_missing"])
+def test_reconnect_keeps_unobserved_disarmed_command_fault(uno_peer_exe: Path, fault: str) -> None:
+    fixture = load_simulation("fixture-v1")
+    assert fixture
+    with native_peer(uno_peer_exe) as peer:
+        link = SerialCommandLink(fixture.profile, BUILD, peer.open)
+        link.start()
+        try:
+            wait_until(link.probe)
+            if fault == "stop_missing":
+                wait_until(lambda: link.pulse(1, "forward", monotonic() + 0.24) is None and link.output == "forward")
+            peer.fault = fault
+            if fault == "stop_missing":
+                link.revoke(1, "InputReleased")
+            wait_until(lambda: sum(packet.op == HELLO for _, packet in peer.trace) >= 2)
+            assert link.latched_failure == "CommandUnavailable" and not link.probe()
+            assert peer.output == 0
+            link.revoke(1, "CommandUnavailable")
+            wait_until(link.probe)
+        finally:
+            link.close()
 
 
 class SocketTransport:
@@ -457,6 +556,10 @@ def test_killed_backend_leaves_one_queued_frame_then_firmware_expires(
                     del pending[:index + 1]
                     if len(frame) == 1:
                         continue
+                    if frame == DISCARD_PARTIAL:
+                        with peer.lock:
+                            assert peer.step(frame)[0] == 0
+                        continue
                     command = decode(frame)
                     if command.op == DRIVE and peer.output == 1 and not queued.is_set():
                         deferred.append(frame)
@@ -491,7 +594,7 @@ def test_killed_backend_leaves_one_queued_frame_then_firmware_expires(
                     assert backend.exitcode
                     wait_until(lambda: any(at >= killed and p.op == DRIVE for at, p in peer.trace))
                     wait_until(lambda: peer.output == 0)
-                    delivered, command = next((at, p) for at, p in peer.trace if at >= killed and p.op == DRIVE)
+                    [(delivered, command)] = [(at, p) for at, p in peer.trace if at >= killed and p.op == DRIVE]
                     disabled, _ = peer.outputs[-1]
                     assert 0.215 <= disabled - delivered <= 0.27
                     assert not any(p.op == STOP for _, p in peer.trace)

@@ -515,16 +515,19 @@ class Realtime:
                        profile.bound("heartbeat_deadline_ms") / 2, profile.bound("display_deadline_ms") / 2) / 1000
         while not self._closed:
             now = self.monotonic()
-            self._evaluate_motion(now)
             if self._motion and self._motion.live:
+                fault = self._motion.live.latched_failure
+                if fault:
+                    self._path_lost("Command", fault)
                 cause = self.component_cause("Command")
                 if cause != self._command_cause:
-                    if cause and self._command_cause is None:
-                        self._path_lost("Command")
+                    if cause and self._command_cause is None and not fault:
+                        self._path_lost("Command", self._motion.live.failure)
                     self._command_cause = cause
                     if self._projection is not None:
                         self._publish_snapshot()
                 self._restore_failures()
+            self._evaluate_motion(now)
             robot = self._frames.get("robot")
             if robot and "robot" in self._live_sources and robot.age(now) >= profile.bound("capture_age_limit_ms"):
                 self._observe_source("robot", None, None, now, profile)
@@ -567,7 +570,10 @@ class Realtime:
             selected = self._selected_input()
             assert selected is not None
             required = ("RobotVideo", "Command", selected, "AI", "Storage")
-            failed = next((PATH_FAILURES[name] for name in required if self.component_cause(name)), None)
+            failed_path = next((name for name in required if self.component_cause(name)), None)
+            failed = PATH_FAILURES[failed_path] if failed_path else None
+            if failed_path == "Command" and self._motion.live:
+                failed = self._motion.live.failure
             now = self.monotonic()
             self._expire_lease(now)
             authorized = (scope == self._motion_scope() if scope else self._resume_viable)
@@ -1603,12 +1609,15 @@ class Realtime:
         if self._proximity and self._projection is not None and before != self._proximity.payload:
             self._publish("proximity_warning_changed", {"proximity": self._proximity.payload})
 
-    def _path_lost(self, name: str) -> None:
-        cause = PATH_FAILURES[name]
+    def _path_lost(self, name: str, cause: str | None = None) -> None:
+        cause = cause or PATH_FAILURES[name]
         if self._lease and (self.safety_session is not None or name in ("Command", "AI", "Storage")):
             self._revoke(cause)
-        elif self.safety_session is not None:
-            self.record_failure(cause, self.safety_session)
+        else:
+            if self.safety_session is not None:
+                self.record_failure(cause, self.safety_session)
+            if name == "Command" and self._motion and self._motion.live:
+                self._motion.stop(cause)
 
     def _set_readiness(self, observations: dict[str, bool]) -> None:
         if observations == self._readiness:

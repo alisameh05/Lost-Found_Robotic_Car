@@ -9,15 +9,17 @@ from threading import Event, Lock, Thread
 from time import monotonic
 from typing import TYPE_CHECKING, Protocol, cast
 
-from .motion import DIRECTIONS, Direction
+from .motion import COMMAND_FAILURES, DIRECTIONS, Direction
 from .uno_wire import (
     ARM,
     ARMED,
+    DISCARD_PARTIAL,
     DRIVE,
     HELLO,
     MAX_COUNTER,
     MAX_FRAME,
     REPLY,
+    REQUEST_FRAME,
     STATUS,
     STOP,
     Packet,
@@ -88,12 +90,10 @@ class CommandSession:
     def _exchange(self, packet: Packet, deadline: float) -> Packet:
         signal, clock = self.link._wake, self.link._clock
         resync = packet.op in (HELLO, STOP)
-        wire = (b"\0" if resync else b"") + encode(packet)
-        sent = clock()
-        if sent >= deadline or (not resync and sent >= self.challenge_until):
-            raise WireError("Command deadline reached before write")
-        if packet.op != STOP and self.link._stopping():
-            raise Preempted
+        wire = (DISCARD_PARTIAL if resync else b"") + encode(packet)
+        sent = self.link._commit_write(
+            packet.op, deadline if resync else min(deadline, self.challenge_until),
+        )
         if self.port.write(wire) != len(wire):
             raise OSError("Incomplete command write")
         while clock() < deadline:
@@ -125,7 +125,7 @@ class CommandSession:
 
     def hello(self) -> None:
         request = Packet(HELLO, sequence=1 + randbelow(MAX_COUNTER))
-        reply = self._exchange(request, self.link._clock() + self.link._ack)
+        reply = self._exchange(request, self.link._clock() + self.link._hello_ack)
         if reply.build != self.link._build:
             raise WireVersionError("Unexpected Uno build")
         if not reply.boot or reply.flags or reply.direction or reply.challenge == MAX_COUNTER:
@@ -166,7 +166,7 @@ class CommandSession:
         # Even an uncorrelated STOP disables any compatible boot before it can acknowledge.
         packet = Packet(STOP, self.boot, self.floor, min(MAX_COUNTER, self.sequence + 1), self.challenge)
         try:
-            self.port.write(b"\0" + encode(packet))
+            self.port.write(DISCARD_PARTIAL + encode(packet))
         except (OSError, ValueError):
             pass
 
@@ -180,6 +180,9 @@ class SerialCommandLink:
         self._open = open_port
         self._build = build
         self._ack = profile.bound("command_ack_deadline_ms") / 1000
+        # A disarmed HELLO includes a longer build reply and the resync prefix.
+        hello_bits = (REQUEST_FRAME + len(DISCARD_PARTIAL) + MAX_FRAME) * 10
+        self._hello_ack = self._ack + hello_bits / profile.bound("serial_baud")
         self._interval = profile.bound("command_renewal_interval_ms") / 1000
         self._challenge = profile.bound("challenge_lifetime_ms") / 1000
         self._expiry = profile.bound("firmware_expiry_ms") / 1000
@@ -187,8 +190,9 @@ class SerialCommandLink:
         self._wake, self._closed = Event(), Event()
         self._worker = Thread(target=self._run, daemon=True, name="hc05-command")
         self._pending: Renewal | None = None
-        self._active = self._in_flight = self._stop_requested = self._latched_fault = False
-        self._ready_until = self._submit_after = 0.0
+        self._active = self._in_flight = self._stop_requested = False
+        self._latched_fault: str | None = None
+        self._ready_until = self._lease_until = self._submit_after = 0.0
         self._cause = "NOT_READY"
         self._output: Direction | None = None
 
@@ -198,7 +202,9 @@ class SerialCommandLink:
     def close(self) -> None:
         self._closed.set()
         self._wake.set()
-        self._worker.join(self._ack * 2 + 0.5)
+        # A Windows driver may still be opening the port. Retain process-level
+        # device ownership until this worker has closed its handle.
+        self._worker.join()
 
     @property
     def cause(self) -> str | None:
@@ -213,6 +219,21 @@ class SerialCommandLink:
             return self._output if (self._clock() < self._ready_until and not self._latched_fault
                                     and not self._closed.is_set()) else None
 
+    @property
+    def failure(self) -> str:
+        with self._lock:
+            return self._fault_reason(self._clock())
+
+    @property
+    def latched_failure(self) -> str | None:
+        with self._lock:
+            return self._latched_fault
+
+    def _fault_reason(self, now: float) -> str:
+        if self._latched_fault:
+            return self._latched_fault
+        return "CommandExpired" if self._lease_until and now >= self._lease_until else "CommandUnavailable"
+
     def probe(self) -> bool:
         return self.cause is None
 
@@ -220,7 +241,7 @@ class SerialCommandLink:
         with self._lock:
             now = self._clock()
             if now >= self._ready_until or self._latched_fault or self._closed.is_set():
-                return "CommandUnavailable"
+                return self._fault_reason(now)
             if now < deadline and now >= self._submit_after and not (self._in_flight or self._stop_requested):
                 self._active = True
                 self._pending = Renewal(generation, direction, deadline)
@@ -229,8 +250,14 @@ class SerialCommandLink:
 
     def revoke(self, generation: int, cause: str) -> None:
         with self._lock:
+            now = self._clock()
+            if cause in COMMAND_FAILURES:
+                self._latched_fault = None
+            elif self._active and now >= self._ready_until:
+                self._latched_fault = self._fault_reason(now)
             self._stop_requested |= self._active
-            self._active = self._latched_fault = False
+            self._active = False
+            self._lease_until = 0.0
             self._pending = self._output = None
             self._wake.set()
 
@@ -238,23 +265,35 @@ class SerialCommandLink:
         with self._lock:
             return self._stop_requested or self._closed.is_set()
 
+    def _commit_write(self, op: int, deadline: float) -> float:
+        """Commit the single outstanding write against revoke, without holding the lock across I/O."""
+        with self._lock:
+            if op != STOP and (self._stop_requested or self._closed.is_set()):
+                raise Preempted
+            now = self._clock()
+            if now >= deadline:
+                raise WireError("Command deadline reached before write")
+            return now
+
     def _ready(
         self, challenge_until: float, direction: Direction | None = None, sent: float | None = None,
     ) -> None:
         with self._lock:
             self._ready_until = min(challenge_until, self._clock() + self._interval + self._ack)
-            if sent is not None:
-                self._ready_until = min(self._ready_until, sent + self._expiry)
             self._cause = "NOT_READY"
             if not self._stop_requested:
+                self._lease_until = 0.0 if sent is None else sent + self._expiry
+                if self._lease_until:
+                    self._ready_until = min(self._ready_until, self._lease_until)
                 self._output = direction
 
     def _failed(self, cause: str) -> None:
         with self._lock:
-            self._latched_fault |= self._active
+            if self._ready_until:
+                self._latched_fault = self._fault_reason(self._clock())
             self._active = self._in_flight = self._stop_requested = False
             self._pending = self._output = None
-            self._ready_until = 0.0
+            self._ready_until = self._lease_until = 0.0
             self._cause = cause
 
     def _serve(self, session: CommandSession) -> None:
@@ -301,6 +340,8 @@ class SerialCommandLink:
         while not self._closed.is_set():
             try:
                 with self._open() as port:
+                    if self._closed.is_set():
+                        return
                     session = CommandSession(self, port)
                     try:
                         self._serve(session)

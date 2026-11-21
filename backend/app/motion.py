@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 Direction = Literal["forward", "backward", "left", "right"]
 Intent = Literal[Direction, "neutral", "settling", "invalid", "emergency"]
 DIRECTIONS = get_args(Direction)
+COMMAND_FAILURES = ("CommandUnavailable", "CommandExpired")
 
 
 @dataclass(frozen=True)
@@ -86,6 +87,10 @@ class CommandSink(CommandOutput, Protocol):
 class LiveCommandSink(CommandOutput, Protocol):
     @property
     def cause(self) -> str | None: ...
+    @property
+    def failure(self) -> str: ...
+    @property
+    def latched_failure(self) -> str | None: ...
     def pulse(self, generation: int, direction: Direction, deadline: float) -> str | None: ...
 
 
@@ -225,7 +230,7 @@ class Motion:
         self._neutral = False
         self._direction = None
         self._renew_at = None
-        if was_held:
+        if was_held or (self.live and cause in COMMAND_FAILURES):
             try:
                 self.sink.revoke(self._generation, cause)
             except OSError:
@@ -267,6 +272,8 @@ class Motion:
     def loss(self, now: float) -> str | None:
         if self._direction is None:
             return None
+        if self.live and not self.live.probe():
+            return self.live.failure
         if self._renew_at is not None and self._logical_output() != self._direction:
             return "CommandExpired"
         return "InputUnavailable" if now - self._sample_at >= self._limit else None

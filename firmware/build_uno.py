@@ -14,13 +14,15 @@ TARGET = "arduino:avr:uno"
 CLI = "1.6.0"
 CORE = "1.8.8"
 GCC = "7.3.0-atmel3.6.1-arduino7"
-AVR_PWM = {3, 5, 6, 9, 10, 11}
+MOTOR_PWM = {5, 6, 9, 10}
+HC05_BAUD = {9600, 19200, 38400}
 AVR_WATCHDOG_MS = {15, 30, 60, 120, 250, 500}
 SERIAL_FIELDS = ("serial_baud", "packet_ms", "challenge_lifetime_ms", "firmware_expiry_ms", "hardware_watchdog_ms")
 COMMON = {"version", "profile_id", "kind", *SERIAL_FIELDS}
 DEVICE = {"enable_pins", "enable_active_high", "direction_pins", "direction_levels", "duty",
           "reset_enable_levels", "reset_evidence_sha256"}
-SKETCH = ("uno.ino", "command.h", "command.cpp")
+PIN_FIELDS = {"serial_rx_pin", "serial_tx_pin"}
+SKETCH = ("uno.ino", "command.h", "command.cpp", "command_port.h", "command_port.cpp")
 
 
 def int_in(value, low, high):
@@ -28,10 +30,11 @@ def int_in(value, low, high):
 
 
 def load_mapping(data):
+    if not isinstance(data, dict):
+        raise ValueError("The logical mapping must be an object")
     kind = data.get("kind")
-    if kind not in ("Device", "DisabledFixture") or data.keys() != (
-        COMMON | DEVICE if kind == "Device" else COMMON
-    ):
+    allowed = COMMON | DEVICE | PIN_FIELDS if kind == "Device" else COMMON | (PIN_FIELDS & data.keys())
+    if kind not in ("Device", "DisabledFixture") or data.keys() != allowed:
         raise ValueError("Supply an explicit v1 Device or DisabledFixture logical mapping")
     if type(data["version"]) is not int or data["version"] != 1 or not re.fullmatch(
         r"[a-zA-Z0-9_-]{1,64}", data["profile_id"],
@@ -44,12 +47,16 @@ def load_mapping(data):
             or not (270_000 + data["serial_baud"] - 1) // data["serial_baud"]
             < data["packet_ms"] < min(data["challenge_lifetime_ms"], data["firmware_expiry_ms"])):
         raise ValueError("Invalid serial framing or timer configuration")
+    if kind == "Device" or PIN_FIELDS & data.keys():
+        rx, tx = data.get("serial_rx_pin"), data.get("serial_tx_pin")
+        if not int_in(rx, 2, 3) or not int_in(tx, 2, 3) or rx == tx or data["serial_baud"] not in HC05_BAUD:
+            raise ValueError("The HC-05 requires distinct Uno D2/D3 UART pins and a supported line rate")
     if kind == "Device":
         enables, directions = data["enable_pins"], data["direction_pins"]
-        if (len(enables) != 2 or not all(int_in(pin, 2, 19) and pin in AVR_PWM for pin in enables)
-                or len(directions) != 4 or not all(int_in(pin, 2, 19) for pin in directions)
+        if (len(enables) != 2 or not all(int_in(pin, 4, 19) and pin in MOTOR_PWM for pin in enables)
+                or len(directions) != 4 or not all(int_in(pin, 4, 19) for pin in directions)
                 or len(set(enables + directions)) != 6):
-            raise ValueError("Provide six distinct Uno motor pins outside the serial bus")
+            raise ValueError("Use six distinct motor pins outside D0–D3 and PWM enables on D5/D6/D9/D10")
         polarities = data["enable_active_high"]
         if (len(polarities) != 2 or not all(type(value) is bool for value in polarities)
                 or data["reset_enable_levels"] != [int(not value) for value in polarities]
@@ -71,6 +78,7 @@ def initializer(values):
 def header(mapping, build_id):
     lines = [
         f'#define LAF_DEVICE_OUTPUT {int(mapping["kind"] == "Device")}',
+        f'#define LAF_HC05_PINS {int("serial_rx_pin" in mapping)}',
         f'constexpr unsigned long Baud = {mapping["serial_baud"]}UL;',
         "constexpr uno::Timing Timings = " + initializer([
             mapping["packet_ms"], mapping["challenge_lifetime_ms"], mapping["firmware_expiry_ms"],
@@ -78,6 +86,9 @@ def header(mapping, build_id):
         "constexpr uint8_t BuildId[32] = " + initializer(list(build_id)) + ";",
         f'constexpr uint8_t HardwareWatchdog = WDTO_{mapping["hardware_watchdog_ms"]}MS;',
     ]
+    if "serial_rx_pin" in mapping:
+        lines.extend((f'constexpr uint8_t RxPin = {mapping["serial_rx_pin"]};',
+                      f'constexpr uint8_t TxPin = {mapping["serial_tx_pin"]};'))
     if mapping["kind"] == "Device":
         for name, extent, key in (
             ("EnablePins", "[2]", "enable_pins"),
@@ -147,6 +158,8 @@ def main():
     }
     if mapping["kind"] == "Device":
         artifact["reset_evidence_sha256"] = mapping["reset_evidence_sha256"]
+    if "serial_rx_pin" in mapping:
+        artifact.update({key: mapping[key] for key in sorted(PIN_FIELDS)})
     args.output.joinpath("build.json").write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
     print(f"Uno firmware SHA-256 {firmware}")
 

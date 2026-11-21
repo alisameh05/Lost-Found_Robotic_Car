@@ -65,13 +65,17 @@ void Peer::disable() {
     output_(0);
 }
 
+void Peer::transportFault() {
+    length_ = 0;
+    discarding_ = true;
+    disable();
+}
+
 void Peer::tick(uint32_t now) {
     if (armed_ && now - lease_at_ >= timing_.expiry_ms) disable();
     if (challenge_ && now - challenge_at_ >= timing_.challenge_ms) challenge_ = false;
     if (length_ && now - packet_at_ >= timing_.packet_ms) {
-        length_ = 0;
-        discarding_ = true;
-        disable();
+        transportFault();
     }
 }
 
@@ -84,9 +88,7 @@ void Peer::receive(uint8_t byte, uint32_t now) {
     } else if (!discarding_) {
         if (!length_) packet_at_ = now;
         if (length_ >= Request + 1) {
-            length_ = 0;
-            discarding_ = true;
-            disable();
+            transportFault();
         } else {
             frame_[length_++] = byte;
         }

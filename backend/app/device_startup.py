@@ -14,7 +14,7 @@ from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_vali
 
 from .controller import serial_key
 from .simulation import IncompatibleProfile, QualificationProfile
-from .uno_wire import MAX_FRAME, VERSION
+from .uno_wire import DISCARD_PARTIAL, MAX_FRAME, REQUEST_FRAME, VERSION
 
 DOCUMENT_LIMIT = 256 * 1024
 RFC1918 = tuple(IPv4Network(block) for block in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
@@ -63,7 +63,9 @@ class CommandBuild(Build):
     build_id: Digest
     logical_output_sha256: Digest
     reset_evidence_sha256: Digest
-    serial_baud: Positive
+    serial_baud: Literal[9600, 19200, 38400]
+    serial_rx_pin: Literal[2, 3]
+    serial_tx_pin: Literal[2, 3]
     packet_ms: Annotated[int, Field(ge=1, le=500)]
     challenge_lifetime_ms: Annotated[int, Field(ge=1, le=500)]
     firmware_expiry_ms: Annotated[int, Field(ge=1, le=500)]
@@ -297,6 +299,7 @@ def command_selection(root: Path, profile: QualificationProfile, selection: Comm
     if reference is None:
         raise ValueError("No selected Uno build artifact")
     if (selection.protocol_version != VERSION or selection.uno.target != "arduino:avr:uno"
+            or not selection.identity.upper().startswith("BTHENUM\\")
             or (selection.data_bits, selection.parity, selection.stop_bits_x2, selection.flow_control)
             != (8, "none", 2, "none")
             or profile.bound("serial_max_packet_bytes") != MAX_FRAME):
@@ -304,15 +307,19 @@ def command_selection(root: Path, profile: QualificationProfile, selection: Comm
     build = CommandBuild.model_validate(decode(read_artifact(root, reference)))
     verify_artifacts(root, {selection.contract_sha256, selection.logical_output_sha256, build.reset_evidence_sha256})
     wire_ms = (MAX_FRAME * 10_000 + build.serial_baud - 1) // build.serial_baud
+    stop_bits = (len(DISCARD_PARTIAL) + 2 * REQUEST_FRAME) * 10
+    ack = profile.bound("command_ack_deadline_ms")
     if (selection.uno.model_dump() != build.model_dump(include=set(Build.model_fields))
             or selection.logical_output_sha256 != build.logical_output_sha256
-            or selection.serial_baud != build.serial_baud or not 1200 <= build.serial_baud <= 230400
+            or selection.serial_baud != build.serial_baud
+            or build.serial_rx_pin == build.serial_tx_pin
             or profile.bound("serial_baud") != build.serial_baud
             or profile.bound("challenge_lifetime_ms") != build.challenge_lifetime_ms
             or profile.bound("firmware_expiry_ms") != build.firmware_expiry_ms
             or build.hardware_watchdog_ms > build.firmware_expiry_ms
-            or profile.bound("command_renewal_interval_ms") + profile.bound("command_ack_deadline_ms")
-            + wire_ms >= min(build.challenge_lifetime_ms, build.firmware_expiry_ms)
+            or ack * build.serial_baud <= stop_bits * 1000
+            or profile.bound("command_renewal_interval_ms") + ack + wire_ms
+            >= min(build.challenge_lifetime_ms, build.firmware_expiry_ms)
             or not (270_000 + build.serial_baud - 1) // build.serial_baud < build.packet_ms
             < min(build.challenge_lifetime_ms, build.firmware_expiry_ms)):
         raise ValueError("Uno build does not match the measured selection")
@@ -363,11 +370,12 @@ def load_device_startup(root: Path, probes: Mapping[RobotPath, DeviceProbe]) -> 
     for name, model, selection in selections:
         try:
             selected = model.model_validate(selection)
-            causes[name] = endpoint_cause(root, profile, selected, probes.get(name), network)
             if isinstance(selected, CommandInterface) and selected.build_artifact_sha256 is not None:
                 command = command_selection(root, profile, selected)
                 # A selected build still needs a current correlated acknowledgment.
                 causes[name] = "NOT_READY"
+            else:
+                causes[name] = endpoint_cause(root, profile, selected, probes.get(name), network)
         except IncompatibleProfile:
             causes[name] = "PROTOCOL_UNSUPPORTED"
         except (OSError, RuntimeError, ValueError):
