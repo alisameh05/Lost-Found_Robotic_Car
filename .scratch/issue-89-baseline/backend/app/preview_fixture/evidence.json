@@ -1,0 +1,9 @@
+{
+  "version": 1,
+  "kind": "Fixture",
+  "description": "Static scenes from the browser fixture vectors, re-acquired with the backend monotonic clock. No device measurements.",
+  "frames": {
+    "robot": "4a3db03879907a192c95cf7843d1bbe0a776781c9678d6e85980d3683e03b93a",
+    "webcam": "93a95747f61040d42efb45c2f54ca014ef35467593267cea92e33a7900c73299"
+  }
+}

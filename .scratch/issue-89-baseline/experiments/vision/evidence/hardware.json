@@ -1,0 +1,17 @@
+{
+  "existingPython": [
+    "3.13.7 (tags/v3.13.7:bcee1c3, Aug 14 2025, 14:15:11) [MSC v.1944 64 bit (AMD64)]",
+    "3.50.4"
+  ],
+  "cpu": {
+    "Name": "13th Gen Intel(R) Core(TM) i7-13620H"
+  },
+  "measuredAtUtc": "2026-11-17T20:56:00.6957452Z",
+  "operatingSystem": {
+    "Caption": "Microsoft Windows 11 Pro",
+    "Version": "10.0.26300",
+    "BuildNumber": "26300",
+    "TotalVisibleMemorySize": 13615160,
+    "FreePhysicalMemory": 1752348
+  }
+}

@@ -1,0 +1,115 @@
+import { expect, test } from "@playwright/test";
+
+test("resets the fixture transport and projects its snapshot and health into the dashboard", async ({ page }) => {
+  await page.goto("http://127.0.0.1:3100/");
+  const scenario = page.getByLabel("Fixture scenario");
+  const status = page.getByRole("region", { name: "Active search", exact: true });
+  await scenario.selectOption("initializing");
+  await expect(page.getByRole("region", { name: "Device readiness" }).getByText("Initializing services", { exact: true })).toBeVisible();
+  await scenario.selectOption("searching");
+  await expect(status.getByText("Searching", { exact: true })).toBeVisible();
+  await scenario.selectOption("paused");
+  await expect(status.getByText("Paused", { exact: true })).toBeVisible();
+  await scenario.selectOption("pause-saving");
+  await expect(status.getByText("Paused", { exact: true })).toBeVisible();
+  await expect(status.getByText(/Save pending/)).toBeVisible();
+  await scenario.selectOption("failed");
+  await expect(page.getByRole("region", { name: "Search status" }).getByRole("status")).toContainText("Search status unavailable");
+  await scenario.selectOption("controller-ready");
+  await expect(page.getByText("Gestures requirements unavailable")).toBeVisible();
+  await scenario.selectOption("ended");
+  await expect(page.getByText("No active search", { exact: true })).toBeVisible();
+  await page.reload();
+  await expect(scenario).toHaveValue("idle");
+  await expect(page.getByText("No active search", { exact: true })).toBeVisible();
+});
+
+test("releases protected sample images on replacement, expiry, reset and navigation", async ({ page }) => {
+  await page.addInitScript(() => {
+    const create = URL.createObjectURL.bind(URL);
+    const revoke = URL.revokeObjectURL.bind(URL);
+    const active = new Set<string>();
+    Object.assign(window, { activeFixtureUrls: active });
+    URL.createObjectURL = (blob) => {
+      const url = create(blob);
+      active.add(url);
+      return url;
+    };
+    URL.revokeObjectURL = (url) => {
+      active.delete(url);
+      revoke(url);
+    };
+  });
+  const activeUrls = () => page.evaluate(() => [...(window as Window & { activeFixtureUrls?: Set<string> }).activeFixtureUrls!]);
+  await page.goto("http://127.0.0.1:3100/");
+  await page.getByRole("button", { name: "Inspect sample media" }).click();
+  const media = page.getByLabel("Sample media", { exact: true });
+  await expect(page.getByText("Sample image · Not live")).toBeVisible();
+  const image = page.getByRole("img", { name: "Synthetic fixture image" });
+  await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(640);
+  const original = await image.getAttribute("src");
+  await media.selectOption("sample-confirmed-evidence");
+  await expect(page.getByText("Sample image · Captured evidence")).toBeVisible();
+  await expect.poll(() => image.evaluate((node: HTMLImageElement) => node.naturalWidth)).toBe(32);
+  expect(await activeUrls()).toEqual([await image.getAttribute("src")]);
+  expect(await activeUrls()).not.toContain(original);
+  await media.selectOption("sample-missing-evidence");
+  await expect(page.getByText("Media missing", { exact: true })).toBeVisible();
+  await expect(page.getByText("Sample media is missing.")).toBeVisible();
+  expect(await activeUrls()).toEqual([]);
+  await media.selectOption("sample-headphones-reference");
+  await expect(page.getByText("Media corrupt", { exact: true })).toBeVisible();
+  await expect(page.getByText("Sample media is corrupt.")).toBeVisible();
+  await media.selectOption("sample-wallet-reference");
+  await expect(image).toBeVisible();
+  await page.getByRole("button", { name: "Expire sample media" }).click();
+  await expect(page.getByText("Sample record expired.")).toBeVisible();
+  await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
+  expect(await activeUrls()).toEqual([]);
+  await page.getByRole("button", { name: "Reset scenario" }).click();
+  await page.getByRole("button", { name: "Inspect sample media" }).click();
+  await expect(image).toBeVisible();
+  expect(await activeUrls()).toHaveLength(1);
+  await page.getByRole("link", { name: "Settings" }).click();
+  await expect(page.getByRole("heading", { name: "Settings" })).toBeVisible();
+  expect(await activeUrls()).toEqual([]);
+});
+
+test("disconnected mode hides the harness even when requested", async ({ page }) => {
+  const scripts: Promise<string>[] = [];
+  page.on("response", (response) => {
+    if (response.request().resourceType() === "script") scripts.push(response.text());
+  });
+  await page.goto("http://127.0.0.1:3101/");
+  await expect(page.getByRole("heading", { name: "Dashboard" })).toBeVisible();
+  await expect(page.getByRole("region", { name: "Recent objects" }).getByRole("status")).toContainText("Recent objects unavailable");
+  await expect(page.getByLabel("Fixture scenario")).toHaveCount(0);
+  await expect(page.getByRole("heading", { name: "Sample media preview" })).toHaveCount(0);
+  await expect(page.getByRole("region", { name: "Shared control specimens" })).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Emergency Stop" })).toHaveCount(0);
+  await page.getByRole("link", { name: "Objects / History" }).click();
+  await expect(page.getByRole("heading", { name: "Application data unavailable" })).toBeVisible();
+  const loadedFixtureCode = (await Promise.all(scripts)).some((script) =>
+    /Fixture mutation requests|Synthetic fixture image|sample-wallet-reference/.test(script));
+  expect(loadedFixtureCode).toBe(false);
+});
+
+test("record screens use the selected adapter for empty data and active-session grace", async ({ page }) => {
+  await page.goto("http://127.0.0.1:3100/");
+  const scenario = page.getByLabel("Fixture scenario");
+  await scenario.selectOption("empty");
+  await expect(page.getByText("No active search", { exact: true })).toBeVisible();
+  await page.getByRole("link", { name: "Objects / History" }).click();
+  await expect(page.getByRole("heading", { name: "No objects registered" })).toBeVisible();
+  await expect(page.getByRole("link", { name: "View details for Black wallet" })).toHaveCount(0);
+  await page.getByRole("link", { name: "Dashboard" }).click();
+  await scenario.selectOption("expiry-grace");
+  await page.getByRole("link", { name: "Return to Active Search" }).click();
+  await page.getByRole("link", { name: "View Object Details" }).click();
+  await page.getByRole("button", { name: "Leave Paused" }).click();
+  await expect(page.getByRole("heading", { name: "Sample expired object" })).toBeVisible();
+  await expect(page.getByText("Active-session grace", { exact: true })).toBeVisible();
+  await expect(page.getByRole("img", { name: "Reference for Sample expired object", exact: true })).toBeVisible();
+  await page.goto("http://127.0.0.1:3100/objects/sample-expired");
+  await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
+});

@@ -1,0 +1,38 @@
+{
+  "yoloe-26n-seg.pt": {
+    "url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yoloe-26n-seg.pt",
+    "sha256": "1741c1f8da3cea47e2c01829c334a50dc0b9bbd05e685b90a3ce84fae32c8c1b",
+    "bytes": 11710443,
+    "notice": "AGPL-3.0; Ultralytics model terms"
+  },
+  "yoloe-26s-seg.pt": {
+    "url": "https://github.com/ultralytics/assets/releases/download/v8.4.0/yoloe-26s-seg.pt",
+    "sha256": "48f24206bc8680d60cbbfa296b0140da849669b9515058b72f5a945142df0654",
+    "bytes": 31072171,
+    "notice": "AGPL-3.0; Ultralytics model terms"
+  },
+  "hand_landmarker.task": {
+    "url": "https://storage.googleapis.com/mediapipe-models/hand_landmarker/hand_landmarker/float16/1/hand_landmarker.task",
+    "sha256": "fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1",
+    "bytes": 7819105,
+    "notice": "Apache-2.0; Hand Tracking model card"
+  },
+  "bus.jpg": {
+    "url": "https://raw.githubusercontent.com/ultralytics/ultralytics/v8.4.23/ultralytics/assets/bus.jpg",
+    "sha256": "c02019c4979c191eb739ddd944445ef408dad5679acab6fd520ef9d434bfbc63",
+    "bytes": 137419,
+    "notice": "Upstream Ultralytics sample; not redistributed"
+  },
+  "zidane.jpg": {
+    "url": "https://raw.githubusercontent.com/ultralytics/ultralytics/v8.4.23/ultralytics/assets/zidane.jpg",
+    "sha256": "16d73869e3267a7d4ed00de8e860833bd1657c1b252e94c0c348277adc7b6edb",
+    "bytes": 50427,
+    "notice": "Upstream Ultralytics sample; not redistributed"
+  },
+  "right_hands.jpg": {
+    "url": "https://storage.googleapis.com/mediapipe-assets/right_hands.jpg",
+    "sha256": "4b5134daa4cb60465535239535f9f74c2842aba3aa5fd30bf04ef5678f93d87f",
+    "bytes": 54887,
+    "notice": "Upstream MediaPipe test image; not redistributed"
+  }
+}

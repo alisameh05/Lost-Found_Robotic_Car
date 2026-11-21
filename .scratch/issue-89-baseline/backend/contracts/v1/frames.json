@@ -1,0 +1,34 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "title": "Lost and Found frame metadata v1",
+  "$ref": "./schemas.json#/$defs/FrameMetadata",
+  "x-laf-websocket": {
+    "paths": [
+      "/video/robot",
+      "/video/webcam"
+    ],
+    "protocol": "laf.v1",
+    "ticket_offer_prefix": "laf.ticket.",
+    "binary_envelope": [
+      {
+        "name": "metadata_length",
+        "encoding": "uint32",
+        "byte_order": "big-endian",
+        "bytes": 4
+      },
+      {
+        "name": "metadata",
+        "encoding": "UTF-8 JSON",
+        "length_from": "metadata_length"
+      },
+      {
+        "name": "image",
+        "encoding": "JPEG",
+        "length_from": "remaining_message_bytes"
+      }
+    ],
+    "bounds": {
+      "$ref": "./schemas.json#/$defs/FrontendProfile"
+    }
+  }
+}
