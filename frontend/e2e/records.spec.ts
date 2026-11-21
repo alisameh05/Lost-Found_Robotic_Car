@@ -1,10 +1,10 @@
-import { expect, test, type Page } from "@playwright/test";
+import { expect, test, type Page, type TestInfo } from "@playwright/test";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { existsSync, linkSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
+import { appendFileSync, existsSync, linkSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { Match, SessionAction } from "../src/generated/api-v1";
+import type { FrameMetadata, Match, MatchPage, SessionAction } from "../src/generated/api-v1";
 
 const frontend = "http://127.0.0.1:3103";
 const backend = "http://127.0.0.1:8110/api/v1";
@@ -13,6 +13,7 @@ const localPython = join(repo, ".local-runtime", "records", "Scripts", "python.e
 const python = process.env.LAF_TEST_PYTHON ?? (existsSync(localPython) ? localPython : "python");
 let parent: string;
 let backendProcess: ChildProcess | undefined;
+let backendLog: string;
 
 test.use({ baseURL: frontend });
 
@@ -24,8 +25,10 @@ async function startBackend(options: {
   gestures?: { assets?: string; devicePath?: string };
   localController?: boolean;
   controllerSamples?: string;
+  phase06?: "gestures" | "controller" | "native-landmarker" | "production";
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
+    : options.phase06 && options.phase06 !== "production" ? ["backend.tests.phase06_replay", parent, options.phase06]
     : options.controllerSamples ? ["backend.tests.crash_registration", "controller", options.controllerSamples]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
     : options.registrationGate ? ["backend.tests.crash_registration", "journaled", options.registrationGate]
@@ -40,7 +43,7 @@ async function startBackend(options: {
     cwd: repo, windowsHide: true, env: {
       ...process.env, LOCALAPPDATA: parent, LAF_DATA_ROOT: join(parent, "records"),
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
-      LAF_SIMULATION_PROFILE: options.yoloe ? "local-yoloe-v1"
+      LAF_SIMULATION_PROFILE: options.phase06 ? "phase-06-v1" : options.yoloe ? "local-yoloe-v1"
         : options.gestures ? "local-gestures-v1"
           : options.localController || options.controllerSamples ? "local-controller-v1"
           : options.reviewSimulation ? "fixture-review-v1" : options.simulation ? "fixture-v1" : undefined,
@@ -51,12 +54,12 @@ async function startBackend(options: {
     },
   });
   backendProcess = child;
-  let message = "";
-  child.stderr?.on("data", (chunk) => { message += String(chunk); });
+  backendLog = "";
+  child.stderr?.on("data", (chunk) => { backendLog += String(chunk); });
   child.stdout?.resume();
-  child.on("error", (error) => { message += error.message; });
+  child.on("error", (error) => { backendLog += error.message; });
   await expect.poll(async () => {
-    if (child.exitCode !== null || message.includes("ENOENT")) throw new Error(message);
+    if (child.exitCode !== null || backendLog.includes("ENOENT")) throw new Error(backendLog);
     try {
       const response = await fetch(`${backend}/bootstrap`, {
         headers: { Origin: frontend }, signal: AbortSignal.timeout(850),
@@ -147,7 +150,16 @@ function objectRows(page: Page) {
 }
 
 test.beforeEach(() => { parent = mkdtempSync(join(tmpdir(), "laf-records-browser-")); });
-test.afterEach(async () => {
+test.afterEach(async ({ page }, info) => {
+  if (info.title.startsWith("Phase 06") && info.status !== info.expectedStatus) {
+    const trace = join(parent, "trace.jsonl");
+    if (existsSync(trace)) {
+      await info.attach("failure-replay-trace", { path: trace, contentType: "application/x-ndjson" });
+    }
+    if (backendLog) await info.attach("failure-backend-stderr", { body: backendLog, contentType: "text/plain" });
+    const text = await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
+    if (text) await info.attach("failure-page-text", { body: text, contentType: "text/plain" });
+  }
   await stopBackend();
   await rm(parent, { recursive: true, force: true, maxRetries: 3 });
 });
@@ -1426,6 +1438,18 @@ test("shows unavailable offline assets in Search Setup and Devices", async ({ pa
   await expect(page.getByText(diagnostic, { exact: true })).toBeVisible();
 });
 
+test("Phase 06 reports an unavailable recording without losing local records", async ({ page }) => {
+  await startBackend({ phase06: "production" });
+  await page.goto("/devices");
+  await expect(page.getByText("Offline YOLOE and local input devices · Recorded robot video and simulated commands")).toBeVisible();
+  const camera = page.locator("summary").filter({ hasText: "Robot camera" });
+  await expect(camera).toContainText("Unavailable");
+  await camera.click();
+  await expect(camera.locator("..")).toContainText("Check that the configured robot recording is valid and readable");
+  await page.getByRole("link", { name: "Objects / History" }).click();
+  await expect(page.getByRole("link", { name: "Register Object", exact: true }).first()).toBeVisible();
+});
+
 test("reviews and confirms an offline YOLOE match from a recorded robot frame", async ({ page }, info) => {
   const selection = process.env.LAF_TEST_YOLOE_ASSETS;
   test.skip(!selection, "Requires the pinned Windows CUDA environment and local probe assets");
@@ -1496,6 +1520,447 @@ test("reviews and confirms an offline YOLOE match from a recorded robot frame", 
   await page.reload();
   await expect(page.getByRole("heading", { name: "Match confirmed and saved" })).toBeVisible();
   await expect(page.getByRole("img", { name: "Captured evidence", exact: true })).toBeVisible();
+});
+
+type Phase06State = {
+  scene: string | null;
+  sequence?: number;
+  frames?: string[];
+  buttons?: number[] | null;
+  mask?: number | null;
+  worker_stalled?: "exchange" | "reply" | false;
+  writer_stalled?: boolean;
+  evidence_stalled?: boolean;
+};
+type ReplayTrace = {
+  kind: string; at: number; event?: string; output?: string | null; cause?: string;
+  scene?: string; frame?: number; frame_id?: string; stream?: string; match?: boolean;
+  box?: [number, number, number, number] | null;
+  reentered?: boolean;
+};
+
+function phase06Trace(): ReplayTrace[] {
+  const path = join(parent, "trace.jsonl");
+  if (!existsSync(path)) return [];
+  const lines = readFileSync(path, "utf8").split("\n");
+  return lines.slice(0, -1).map((line) => JSON.parse(line) as ReplayTrace);
+}
+
+async function openPhase06(page: Page, assets: string, mode: "gestures" | "controller" | "native-landmarker") {
+  const positive = join(parent, "positive.jpg");
+  execFileSync(python, ["-c", [
+    "import sys", "from pathlib import Path", "from PIL import Image",
+    "source, directory = map(Path, sys.argv[1:])",
+    "recorded = Image.open(source).convert('RGB')",
+    "recorded.thumbnail((640, 480))",
+    "recorded.save(directory / 'positive.jpg', quality=88)",
+    "Image.new('RGB', recorded.size, (45, 45, 45)).save(directory / 'negative.jpg', quality=88)",
+    "target = recorded.crop((360, 0, 584, 360))",
+    "clear = recorded.copy()",
+    "clear.paste((45, 45, 45), (360, 0, 584, 360))",
+    "clear.save(directory / 'clear.jpg', quality=88)",
+    "for offset in (32, 64, 96, 128, 160, 208):",
+    "    scene = clear.copy()",
+    "    scene.paste(target, (360 + offset, 0))",
+    "    scene.save(directory / f'shift{offset}.jpg', quality=88)",
+  ].join("\n"), join(assets, "zidane.jpg"), parent], { windowsHide: true });
+  const state: Phase06State = { scene: "negative", mask: 0, buttons: [] };
+  function replay(change: Partial<Phase06State> = {}) {
+    Object.assign(state, change);
+    appendFileSync(join(parent, "state.jsonl"), JSON.stringify(state) + "\n");
+  }
+  replay();
+  await loopbackOnly(page);
+  await observePreviewFrames(page);
+  await page.addInitScript(() => {
+    const draw = CanvasRenderingContext2D.prototype.drawImage;
+    let frames = 0;
+    CanvasRenderingContext2D.prototype.drawImage = function (...args: unknown[]) {
+      Reflect.apply(draw, this, args);
+      if (this.canvas.getAttribute("aria-label") === "Recorded robot camera view") frames++;
+    };
+    Object.defineProperty(window, "phase06DrawCount", { get: () => frames });
+  });
+  const matches: Match[] = [];
+  const frames = new Map<string, FrameMetadata>();
+  page.on("websocket", (socket) => {
+    if (socket.url().endsWith("/events")) {
+      socket.on("framereceived", ({ payload }) => {
+        if (typeof payload !== "string") return;
+        const event = JSON.parse(payload);
+        if (event.type === "candidate_pending") matches.push(event.payload.match);
+      });
+    } else if (socket.url().endsWith("/video/robot")) {
+      socket.on("framereceived", ({ payload }) => {
+        if (typeof payload === "string" || payload.length < 4) return;
+        const size = payload.readUInt32BE(0);
+        const metadata = JSON.parse(payload.subarray(4, 4 + size).toString("utf8")) as FrameMetadata;
+        frames.set(metadata.frame_id, metadata);
+      });
+    }
+  });
+  await startBackend({ phase06: mode, yoloe: { assets, robot: positive }, gestures: { assets } });
+  await selectTarget(page, join(assets, "bus.jpg"), `Integrated ${mode} search`);
+  await setTargetCoordinates(page, ["50", "390", "190", "510"]);
+  await page.getByRole("button", { name: "Register Object" }).click();
+  await page.getByRole("link", { name: "Open Search Setup" }).click();
+  await expect(page.getByText("Offline YOLOE · Recorded robot video and simulated commands")).toBeVisible();
+  const selected = mode === "controller" ? "PS4 controller" : "Gestures";
+  await page.getByRole("radio", { name: selected === "Gestures" ? "PS4 controller" : "Gestures" }).check();
+  const start = page.getByRole("button", { name: "Start Search", exact: true });
+  await expect.poll(() => phase06Trace().some(({ kind }) => kind === "ready"), { timeout: 100_000 }).toBe(true);
+  await expect(page.getByText(selected === "Gestures"
+    ? "Connect the configured DualShock 4 by USB and check that Windows recognizes it."
+    : "Check the selected Windows webcam, camera access, and the local Hand Landmarker installation.",
+  { exact: true })).toBeVisible();
+  await expect(start).toBeDisabled();
+  await page.getByRole("radio", { name: selected }).check();
+  await page.getByRole("button", { name: "Acquire control", exact: true }).click();
+  await expect(start).toBeEnabled({ timeout: 20_000 });
+  await start.click();
+  await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
+  return { replay, matches, frames, positive, session: new URL(page.url()).pathname.replace(/\/live$/, "") };
+}
+
+async function recordPhase06Workload(page: Page, info: TestInfo, duration: number) {
+  const clock = () => page.evaluate(() => ({
+    at: performance.now(),
+    displayed: (window as unknown as { phase06DrawCount: number }).phase06DrawCount,
+  }));
+  const firstDrawing = await clock();
+  const firstSample = phase06Trace().at(-1)?.at ?? 0;
+  await expect.poll(() => page.evaluate(() => performance.now()), { timeout: duration + 4000, intervals: [1000] })
+    .toBeGreaterThanOrEqual(firstDrawing.at + duration);
+  const lastDrawing = await clock();
+  const trace = phase06Trace();
+  const window = trace.filter(({ at }) => at >= firstSample);
+  expect(window.filter(({ kind }) => kind === "inference").length).toBeGreaterThan(10);
+  expect(lastDrawing.displayed - firstDrawing.displayed).toBeGreaterThan(10);
+  const path = join(parent, "combined-workload.json");
+  writeFileSync(path, JSON.stringify({ firstDrawing, lastDrawing, firstSample, lastSample: trace.at(-1)?.at }));
+  await info.attach("combined-workload", { path, contentType: "application/json" });
+}
+
+for (const mode of ["gestures", "controller"] as const) {
+  test(`Phase 06 ${mode} replay runs the integrated saved search offline`, async ({ page }, info) => {
+    const assetPath = process.env.LAF_TEST_PHASE06_ASSETS;
+    test.skip(!assetPath, "Requires the pinned local Windows CUDA and MediaPipe assets");
+    if (!assetPath) return;
+    test.setTimeout(230_000);
+    const assets = resolve(assetPath);
+    const { replay, matches, frames, positive, session } = await openPhase06(page, assets, mode);
+    const button = (name: string) => page.getByRole("button", { name, exact: true });
+    const permission = (value: string) => page.getByText(`Motion permission · ${value}`, { exact: true });
+    const searching = page.getByText("Committed session · Searching", { exact: true });
+    const paused = page.getByText("Committed session · Paused", { exact: true });
+    const robot = page.getByRole("region", { name: "Robot camera" });
+    const review = page.getByRole("region", { name: "Review potential match" });
+    const gestures = mode === "gestures";
+    const neutral = gestures ? { mask: 0 } : { buttons: [] };
+    const held = (index: number) => gestures ? { mask: [1, 3, 7, 15][index] } : { buttons: [11 + index] };
+    const logicalOutput = () => phase06Trace().filter(({ kind }) => kind === "command").at(-1)?.output;
+    const stoppedFor = (cause: string) => phase06Trace().some((row) =>
+      row.kind === "command" && row.event === "stop" && row.cause === cause);
+    const emergencyWhileBlocked = async (barrier: "worker_stalled" | "writer_stalled", offset: number, deadline: number) => {
+      const current = () => phase06Trace().slice(offset);
+      await expect.poll(() => current().some(({ kind }) => kind === barrier)).toBe(true);
+      if (gestures) await button("Emergency Stop").press("Enter");
+      else replay({ buttons: [13, 1] });
+      await expect.poll(() => current().some(({ kind, event, cause }) =>
+        kind === "command" && event === "stop" && cause === "EmergencyStop")).toBe(true);
+      const rows = current();
+      const entered = rows.find(({ kind }) => kind === barrier)!;
+      const stop = rows.find(({ kind, event, cause }) =>
+        kind === "command" && event === "stop" && cause === "EmergencyStop")!;
+      expect(stop.at - entered.at).toBeGreaterThanOrEqual(0);
+      expect(stop.at - entered.at).toBeLessThan(deadline);
+      expect(rows.some(({ kind, at }) => kind === `${barrier}_released` && at <= stop.at)).toBe(false);
+      await expect(permission("Disarmed")).toBeVisible();
+      await expect.poll(logicalOutput).toBe(null);
+    };
+    const hold = async (index: number) => {
+      replay(neutral);
+      await expect(permission("Arming")).toBeVisible();
+      const samples = () => phase06Trace().filter(({ kind }) => kind === (gestures ? "gesture" : "capture")).length;
+      const initial = samples();
+      await expect.poll(samples, { intervals: [80] }).toBeGreaterThanOrEqual(initial + (gestures ? 6 : 2));
+      replay(held(index));
+      await expect.poll(logicalOutput).toBe(["forward", "backward", "left", "right"][index]);
+      await expect(permission("Armed")).toBeVisible();
+    };
+    const recover = async () => {
+      await expect(robot.getByText("Live sample", { exact: true })).toBeVisible();
+      if (await button("Acquire control").isVisible()) await button("Acquire control").click();
+      await expect(button("Acknowledge")).toBeEnabled();
+      await button("Acknowledge").click();
+      await expect(button("Resume")).toBeEnabled();
+      await button("Resume").click();
+      await expect(searching).toBeVisible();
+      await expect(permission("Disarmed")).toBeVisible();
+      expect(logicalOutput()).toBe(null);
+    };
+    try {
+      await expect(robot.getByRole("img", { name: "Recorded robot camera view" })).toBeVisible();
+      await expect(page.getByText(/Offline YOLOE matching active/)).toBeVisible();
+      if (gestures) {
+        await expect(page.getByRole("img", { name: "Mirrored webcam preview and recognition" })).toBeVisible();
+      } else {
+        await expect(page.getByText("Gesture control inactive", { exact: true })).toBeVisible();
+      }
+      await button("Control Help").click();
+
+      if (!gestures) await recordPhase06Workload(page, info, 10_000);
+      await expect(page.getByRole("region", { name: "Control Help" })).toBeVisible();
+      await expect(button("Emergency Stop")).toBeEnabled();
+      await button("Control Help").click();
+
+      for (const index of [0, 1, 2, 3]) {
+        await hold(index);
+        replay(neutral);
+        await expect.poll(logicalOutput).toBe(null);
+      }
+      await hold(0);
+      await button("Pause").click();
+      await expect(paused).toBeVisible();
+      await expect.poll(logicalOutput).toBe(null);
+      await button("Resume").click();
+      await expect(searching).toBeVisible();
+      await expect(permission("Disarmed")).toBeVisible();
+      await hold(0);
+
+      replay(gestures ? { mask: null } : { buttons: null });
+      await expect(paused).toBeVisible();
+      await expect.poll(logicalOutput).toBe(null);
+      await expect(permission("Disarmed")).toBeVisible();
+      replay(held(0));
+      await recover();
+      await hold(1);
+
+      if (gestures) {
+        replay({ scene: null });
+        await expect(paused).toBeVisible();
+        await expect.poll(() => stoppedFor("RobotVideoLost")).toBe(true);
+        replay({ scene: "negative" });
+        await recover();
+        await hold(1);
+      }
+      await page.evaluate(() => { (window as unknown as PreviewWindow).previewProbe.repeatFrames = true; });
+      await expect(robot.getByText("Not live", { exact: true })).toBeVisible();
+      await expect(paused).toBeVisible();
+      await expect.poll(logicalOutput).toBe(null);
+      await page.evaluate(() => { (window as unknown as PreviewWindow).previewProbe.repeatFrames = false; });
+      await recover();
+      await hold(2);
+
+      if (!gestures) {
+        // Block a worker exchange for a known positive frame. The deadline
+        // must revoke permission while the exchange remains blocked.
+        replay({ worker_stalled: "exchange", scene: "positive" });
+        await expect.poll(() => phase06Trace().some(({ kind }) => kind === "worker_stalled")).toBe(true);
+        await expect(paused).toBeVisible();
+        await expect.poll(() => stoppedFor("AIUnavailable")).toBe(true);
+        expect(matches).toHaveLength(0);
+        replay({ worker_stalled: false, scene: "negative" });
+        await expect(page.getByText("Restored · Awaiting acknowledgment")).toBeVisible({ timeout: 100_000 });
+        await recover();
+        await hold(2);
+        await page.evaluate(() => window.dispatchEvent(new Event("blur")));
+        await expect(paused).toBeVisible();
+        await expect.poll(() => stoppedFor("WorkspaceUnfocused")).toBe(true);
+        await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+        await recover();
+        await hold(2);
+      }
+
+      // Hold an ordinary registration writer independently of the active search.
+      const boot = await page.request.get(`${backend}/bootstrap`, { headers: { Origin: frontend } });
+      const { capability, client_id } = await boot.json();
+      const writerOffset = phase06Trace().length;
+      replay({ writer_stalled: true });
+      const writing = page.request.post(`${backend}/objects`, {
+        headers: { Origin: frontend, "X-App-Capability": capability, "X-App-Client-Id": client_id,
+          "X-Action-Created-At-Ms": String(Date.now()) },
+        multipart: {
+          action_id: crypto.randomUUID(), name: "Writer replay", roi: JSON.stringify({ x: 10, y: 20, width: 40, height: 50 }),
+          reference_image: { name: "reference.jpg", mimeType: "image/jpeg", buffer: readFileSync(positive) },
+        },
+      });
+      try {
+        const accepted = await writing;
+        expect(accepted.status(), await accepted.text()).toBe(202);
+        await emergencyWhileBlocked("writer_stalled", writerOffset, 4);
+        if (gestures) await expect(page.getByText("Save pending", { exact: true })).toBeVisible();
+      } finally {
+        replay({ ...held(2), writer_stalled: false });
+      }
+      await expect(paused).toBeVisible();
+      await recover();
+
+      await hold(2);
+      const replyOffset = phase06Trace().length;
+      replay({ worker_stalled: "reply", scene: "positive" });
+      try {
+        await emergencyWhileBlocked("worker_stalled", replyOffset, 2.5);
+      } finally {
+        replay({ ...held(2), scene: "negative", worker_stalled: false });
+      }
+      await expect.poll(() => phase06Trace().slice(replyOffset).some(({ kind }) => kind === "worker_returned")).toBe(true);
+      await expect(paused).toBeVisible();
+      await expect(review).toHaveCount(0);
+      expect(matches).toHaveLength(0);
+      await recover();
+
+      await hold(0);
+      const reviewStarted = performance.now();
+      const candidateOffset = phase06Trace().length;
+      replay({ scene: "positive", evidence_stalled: true });
+      try {
+        await expect.poll(() => phase06Trace().slice(candidateOffset).some(({ kind }) => kind === "evidence_stalled")).toBe(true);
+        await expect.poll(logicalOutput).toBe(null);
+        await expect(review).toHaveCount(0);
+        replay({ scene: "negative" });
+        await expect.poll(() => phase06Trace().slice(candidateOffset).some(({ kind, scene }) =>
+          kind === "capture" && scene === "negative")).toBe(true);
+        await expect.poll(() => robot.locator("canvas").evaluate((canvas: HTMLCanvasElement) => {
+          const pixel = canvas.getContext("2d")!.getImageData(320, 180, 1, 1).data;
+          return Array.from(pixel);
+        })).toEqual([45, 45, 45, 255]);
+      } finally {
+        replay({ evidence_stalled: false });
+      }
+      const evidence = review.getByRole("img", { name: "Captured evidence", exact: true });
+      await expect(evidence).toBeVisible({ timeout: 12_000 });
+      const reviewTiming = join(parent, "candidate-timing.json");
+      writeFileSync(reviewTiming, JSON.stringify({ firstVisibleMs: performance.now() - reviewStarted }));
+      await info.attach("candidate-timing", { path: reviewTiming, contentType: "application/json" });
+      expect(matches).toHaveLength(1);
+      await expect(permission("Disarmed")).toBeVisible();
+      await expect(button("Emergency Stop")).toBeEnabled();
+      const firstMatch = matches[0];
+      const { evidence_media: media, box } = firstMatch;
+      const analyzed = phase06Trace().find(({ kind, frame_id }) => kind === "inference" && frame_id === firstMatch.frame_id);
+      expect(analyzed).toEqual(expect.objectContaining({ stream: firstMatch.stream_epoch, match: true }));
+      expect(analyzed?.box).toBeTruthy();
+      const [left, top, right, bottom] = analyzed!.box!;
+      expect(box).toEqual({
+        x: Math.floor(left), y: Math.floor(top),
+        width: Math.ceil(right) - Math.floor(left), height: Math.ceil(bottom) - Math.floor(top),
+      });
+      await expect.poll(() => frames.has(firstMatch.frame_id)).toBe(true);
+      const metadata = frames.get(firstMatch.frame_id)!;
+      expect(metadata).toMatchObject({ width: media.width, height: media.height, stream_epoch: firstMatch.stream_epoch });
+      // The header derives elapsed age from the Windows monotonic clock,
+      // while both public timestamps sample the wall clock separately.
+      const transportCaptureTime = metadata.received_at_ms - metadata.capture_age_bound_ms;
+      expect(Math.abs(transportCaptureTime - firstMatch.captured_at_ms)).toBeLessThanOrEqual(32);
+      const overlay = await evidence.locator("+ span").evaluate((element) =>
+        ["left", "top", "width", "height"].map((property) =>
+          parseFloat((element as HTMLElement).style.getPropertyValue(property))));
+      for (const [index, value] of [box.x / media.width, box.y / media.height, box.width / media.width, box.height / media.height].entries()) {
+        expect(overlay[index]).toBeCloseTo(100 * value, 3);
+      }
+      const denied = await page.request.get(`${backend}/media/${media.id}`, { headers: { Origin: frontend } });
+      expect(denied.status()).toBe(403);
+      const actual = await evidence.evaluate(async (image: HTMLImageElement) => {
+        const canvas = document.createElement("canvas");
+        canvas.width = image.naturalWidth;
+        canvas.height = image.naturalHeight;
+        const context = canvas.getContext("2d")!;
+        context.drawImage(image, 0, 0);
+        const rgba = context.getImageData(0, 0, canvas.width, canvas.height).data;
+        return Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", rgba)));
+      });
+      const expected = execFileSync(python, ["-c",
+        "import hashlib,json,sys; from PIL import Image; print(json.dumps(list(hashlib.sha256(Image.open(sys.argv[1]).convert('RGBA').tobytes()).digest())))",
+        positive,
+      ], { encoding: "utf8", windowsHide: true });
+      expect(actual).toEqual(JSON.parse(expected));
+      if (gestures) await review.getByRole("button", { name: "Confirm Match", exact: true }).click();
+      else {
+        replay({ scene: "positive" });
+        await review.getByRole("button", { name: "Reject Match", exact: true }).click();
+        await expect(review).toHaveCount(0);
+        await button("Resume").click();
+        await expect(searching).toBeVisible();
+        const inferenceBefore = phase06Trace().filter(({ kind }) => kind === "inference").length;
+        await expect.poll(() => phase06Trace().filter(({ kind }) => kind === "inference").length)
+          .toBeGreaterThanOrEqual(inferenceBefore + 4);
+        expect(matches).toHaveLength(1);
+        await button("Pause").click();
+        await expect(paused).toBeVisible();
+        const shifts = [32, 64, 96, 128, 160, 208].map((offset) => `shift${offset}`);
+        const twice = (frames: string[]) => frames.flatMap((frame) => [frame, frame]);
+        const witnessedReturn = () => phase06Trace().some(({ reentered }) => reentered === true);
+        for (const pass of [1, 2, 3]) {
+          const first = phase06Trace().length;
+          const captures = (scene: string) => phase06Trace().slice(first)
+            .filter((row) => row.kind === "capture" && row.scene === scene).length;
+          replay({ sequence: pass * 2 - 1, frames: twice(["positive", ...shifts]), scene: "clear" });
+          await expect.poll(() => captures("clear")).toBeGreaterThanOrEqual(3);
+          expect(matches).toHaveLength(1);
+          replay({ sequence: pass * 2, frames: twice([...shifts].reverse()), scene: "positive" });
+          await expect.poll(() => captures("positive")).toBeGreaterThanOrEqual(6);
+          // A dropped acquisition can invalidate one crossing. Start a fresh
+          // complete pass while disarmed if the tracker had to stay suppressed.
+          if (witnessedReturn()) break;
+        }
+        expect(witnessedReturn()).toBe(true);
+        expect(matches).toHaveLength(1);
+        await button("Resume").click();
+        await expect(review).toBeVisible({ timeout: 15_000 });
+        expect(matches).toHaveLength(2);
+        expect(matches[1].id).not.toBe(matches[0].id);
+        await review.getByRole("button", { name: "Stop Search", exact: true }).click();
+      }
+      const outcome = page.getByRole("heading", {
+        name: gestures ? "Match confirmed and saved" : "Search ended without confirmation",
+      });
+      await expect(outcome).toBeVisible();
+      await stopBackend();
+      await startBackend({ phase06: "production", yoloe: { assets, robot: positive }, gestures: { assets } });
+      await page.goto(`${session}/result`);
+      await expect(outcome).toBeVisible();
+      await expect(page.getByRole("img", { name: "Captured evidence", exact: true }).first()).toBeVisible();
+      const restarted = await (await page.request.get(`${backend}/bootstrap`, { headers: { Origin: frontend } })).json();
+      expect(restarted.qualification_profile.profile_id).toBe("phase-06-v1");
+      const saved = await page.request.get(`${backend}${session}/matches`, { headers: {
+        Origin: frontend, "X-App-Capability": restarted.capability, "X-App-Client-Id": restarted.client_id,
+      } });
+      expect(saved.ok()).toBe(true);
+      const history = await saved.json() as MatchPage;
+      expect(history.items).toContainEqual(expect.objectContaining({
+        id: firstMatch.id,
+        frame_id: firstMatch.frame_id,
+        captured_at_ms: firstMatch.captured_at_ms,
+        stream_epoch: firstMatch.stream_epoch,
+        box,
+        evidence_media: media,
+        disposition: gestures ? "Confirmed" : "Rejected",
+      }));
+    } finally {
+      await info.attach(`phase06-${mode}-trace`, { path: join(parent, "trace.jsonl"), contentType: "application/x-ndjson" });
+      if (backendLog) await info.attach("backend-stderr", { body: backendLog, contentType: "text/plain" });
+    }
+  });
+}
+
+test("Phase 06 measures the native MediaPipe and CUDA workload with recorded video", async ({ page }, info) => {
+  const assets = process.env.LAF_TEST_PHASE06_ASSETS;
+  test.skip(!assets, "Requires the pinned local Windows CUDA and MediaPipe assets");
+  if (!assets) return;
+  test.setTimeout(150_000);
+  await openPhase06(page, resolve(assets), "native-landmarker");
+  try {
+    await expect(page.getByRole("img", { name: "Mirrored webcam preview and recognition" })).toBeVisible();
+    await recordPhase06Workload(page, info, 10_000);
+    expect(phase06Trace().filter(({ kind }) => kind === "gesture").length).toBeGreaterThan(30);
+    await expect(page.getByText("Committed session · Searching")).toBeVisible();
+    await page.getByRole("button", { name: "Stop Search", exact: true }).click();
+    await expect(page.getByRole("heading", { name: "Search ended without confirmation" })).toBeVisible();
+  } finally {
+    await info.attach("phase06-native-trace", { path: join(parent, "trace.jsonl"), contentType: "application/x-ndjson" });
+    if (backendLog) await info.attach("backend-stderr", { body: backendLog, contentType: "text/plain" });
+  }
 });
 
 for (const action of ["start", "resume"] as const) {

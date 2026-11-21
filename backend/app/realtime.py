@@ -1221,7 +1221,7 @@ class Realtime:
     async def maintain_controller(self) -> None:
         controller = self.controller
         assert controller
-        deadline = self.requires_profile().bound("input_sample_deadline_ms") / 1000
+        deadline = min(controller.sample_deadline, self.requires_profile().bound("input_sample_deadline_ms") / 1000)
         generation = 0
         while not self._closed:
             selected = self._selected_input() == "Controller"

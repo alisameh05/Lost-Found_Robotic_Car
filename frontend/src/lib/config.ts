@@ -1,6 +1,17 @@
 export const LOCAL_YOLOE_PROFILE = "local-yoloe-v1";
 export const LOCAL_GESTURES_PROFILE = "local-gestures-v1";
 export const LOCAL_CONTROLLER_PROFILE = "local-controller-v1";
+export const PHASE_06_PROFILE = "phase-06-v1";
+
+export function localSearchPaths(profileId?: string) {
+  const integrated = profileId === PHASE_06_PROFILE;
+  return {
+    integrated,
+    localMatching: integrated || profileId === LOCAL_YOLOE_PROFILE,
+    localGestures: integrated || profileId === LOCAL_GESTURES_PROFILE,
+    localController: integrated || profileId === LOCAL_CONTROLLER_PROFILE,
+  };
+}
 
 export function isFixtureMode() {
   return process.env.LAF_MODE === "fixture";

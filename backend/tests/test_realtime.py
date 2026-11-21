@@ -7,6 +7,7 @@ from collections.abc import Callable, Iterator
 from concurrent.futures import ThreadPoolExecutor
 from contextlib import closing, contextmanager, nullcontext
 from dataclasses import replace
+from hashlib import sha256
 from io import BytesIO
 from pathlib import Path
 from queue import Empty, Full, Queue
@@ -82,6 +83,74 @@ def test_disabled_or_incompatible_profile_keeps_records(tmp_path: Path, selectio
         assert response.headers["Cache-Control"] == "no-store"
         health = wait_for(client, "/health", headers=headers)
         assert health["backend_boot_id"] == boot["backend_boot_id"]
+        assert client.get(API + "/objects", headers=headers).status_code == 200
+
+
+def test_phase_06_never_substitutes_fixture_input_or_matching(tmp_path: Path) -> None:
+    config = Config(tmp_path, simulation_profile="phase-06-v1", recorded_robot_jpeg=FIXTURES / "robot.jpg")
+    with TestClient(create_app(config), base_url="http://127.0.0.1:8000") as client:
+        boot = client.get(API + "/bootstrap", headers={"Origin": ORIGIN}).json()
+        assert boot["qualification_profile"]["profile_id"] == "phase-06-v1"
+        headers = auth(boot)
+        wait_for(client, "/health", headers)
+        deadline = monotonic() + 3
+        while True:
+            readiness = client.get(API + "/health", headers=headers).json()["readiness"]
+            status = {item["component"]: item["status"] for item in readiness["components"]}
+            if status["RobotVideo"] == "Ready" and status["AI"] == "Unavailable":
+                break
+            assert monotonic() < deadline, status
+            sleep(0.02)
+        assert status["Controller"] == status["Webcam"] == "Unavailable"
+        assert status["Command"] == "Ready"
+
+
+@pytest.mark.parametrize("recording", ["missing", "invalid", "oversized"])
+def test_phase_06_reports_an_unavailable_recording_without_losing_the_profile(tmp_path: Path, recording: str) -> None:
+    invalid = tmp_path / "invalid.jpg"
+    if recording == "oversized":
+        # Valid JPEG with a comment that leaves no room for the frame envelope.
+        jpeg = (FIXTURES / "robot.jpg").read_bytes()
+        padding = 131_000 - len(jpeg) - 2 - 60_002
+        invalid.write_bytes(jpeg[:2] + b"\xff\xfe" + (60_002).to_bytes(2, "big") + bytes(60_000)
+                            + b"\xff\xfe" + padding.to_bytes(2, "big") + bytes(padding - 2) + jpeg[2:])
+        with Image.open(invalid) as image:
+            image.load()
+    elif recording == "invalid":
+        invalid.write_bytes(b"Not a JPEG.")
+    config = Config(tmp_path / "records", simulation_profile="phase-06-v1",
+                    recorded_robot_jpeg=invalid if recording != "missing" else None)
+    with TestClient(create_app(config), base_url="http://127.0.0.1:8000") as client:
+        boot = client.get(API + "/bootstrap", headers={"Origin": ORIGIN}).json()
+        assert boot["qualification_profile"]["profile_id"] == "phase-06-v1"
+        headers = auth(boot)
+        health = wait_for(client, "/health", headers)
+        assert status(health, "RobotVideo") == "Unavailable"
+        assert client.get(API + "/objects", headers=headers).status_code == 200
+
+
+@pytest.mark.parametrize("invalid_interface", ["deadline", "shape"])
+def test_phase_06_rejects_invalid_device_manifest(tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+                                                 invalid_interface: str) -> None:
+    folder = tmp_path / "fixture"
+    copytree(FIXTURES, folder)
+    monkeypatch.setattr(fixture, "FIXTURES", folder)
+    interfaces = folder / "phase06" / "interfaces.json"
+    profile = folder / "phase06" / "profile.json"
+    document = [] if invalid_interface == "shape" else {
+        **json.loads(interfaces.read_bytes()), "controller_sample_deadline_ms": 241,
+    }
+    data = json.dumps(document).encode()
+    interfaces.write_bytes(data)
+    profile.write_text(json.dumps({
+        **json.loads(profile.read_bytes()), "device_protocol_manifest_sha256": sha256(data).hexdigest(),
+    }), encoding="utf-8")
+    config = Config(tmp_path / "records", simulation_profile="phase-06-v1")
+    with TestClient(create_app(config), base_url="http://127.0.0.1:8000") as client:
+        boot = client.get(API + "/bootstrap", headers={"Origin": ORIGIN}).json()
+        assert boot["qualification_profile"] is None
+        headers = auth(boot)
+        wait_for(client, "/health", headers)
         assert client.get(API + "/objects", headers=headers).status_code == 200
 
 

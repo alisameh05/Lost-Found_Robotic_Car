@@ -40,6 +40,7 @@ from .simulation import (
     LOCAL_CONTROLLER_PROFILE_NAME,
     LOCAL_GESTURES_PROFILE_NAME,
     LOCAL_VISION_PROFILE_NAME,
+    PHASE_06_PROFILE_NAME,
     IncompatibleProfile,
     Simulation,
     load_simulation,
@@ -120,16 +121,16 @@ def create_app(
             runtime = RecordsRuntime(storage or RecordsStorage(config.data_root))
             app.state.runtime = runtime
             realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked)
-            if simulation and config.simulation_profile == LOCAL_VISION_PROFILE_NAME:
+            if simulation and config.simulation_profile in (LOCAL_VISION_PROFILE_NAME, PHASE_06_PROFILE_NAME):
                 realtime.configure_local_vision(config.yoloe_assets, config.data_root / "vision", runtime.match_prompt)
-            if simulation and config.simulation_profile == LOCAL_GESTURES_PROFILE_NAME:
+            if simulation and config.simulation_profile in (LOCAL_GESTURES_PROFILE_NAME, PHASE_06_PROFILE_NAME):
                 realtime.webcam = webcam or Webcam(
                     simulation.profile, lambda: open_windows_camera(config.webcam_device_path),
                     lambda: open_hand_landmarker(config.gesture_assets), encode_preview,
                 )
-            if simulation and config.simulation_profile == LOCAL_CONTROLLER_PROFILE_NAME:
+            if simulation and config.simulation_profile in (LOCAL_CONTROLLER_PROFILE_NAME, PHASE_06_PROFILE_NAME):
                 realtime.controller = controller or Controller(
-                    config.controller_serial, simulation.profile.bound("input_sample_deadline_ms") / 1000,
+                    config.controller_serial, simulation.controller_deadline_seconds,
                     lambda: open_windows_controller(config.controller_serial),
                 )
             startup = asyncio.create_task(runtime.initialize())

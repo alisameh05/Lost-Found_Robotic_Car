@@ -9,15 +9,15 @@ import { Button } from "@/components/ui/button";
 import { LoadingState, Notice } from "@/components/ui/feedback";
 import { DeletionNotice, useEligibleSearchSetup, useRefreshRuntime, useRuntime, useRuntimeView } from "@/features/runtime";
 import type { Component, ControlMode, Health } from "@/generated/api-v1";
-import { LOCAL_CONTROLLER_PROFILE, LOCAL_GESTURES_PROFILE, LOCAL_YOLOE_PROFILE } from "@/lib/config";
+import { localSearchPaths } from "@/lib/config";
 import { searchSetupHref, supportHref, type SearchSetupContext } from "@/lib/search-setup-context";
-import { InactiveInput, PathRow, paths, ProximityAdvisory } from "./device-observations";
+import { InactiveInput, PathRow, pathCheck, paths, ProximityAdvisory } from "./device-observations";
 import styles from "./devices.module.css";
 import { describeDeviceReadiness, deviceReadinessView, modeLabels } from "./readiness-summary";
 
 const connectionAndMatchingComponents = new Set<Component["component"]>(["Command", "RobotVideo", "AI"]);
 
-export function ReadinessNotice({ loading, disconnected, health, snapshotFailed, summary, mode, compact = false }: {
+export function ReadinessNotice({ loading, disconnected, health, snapshotFailed, summary, mode, compact = false, integrated }: {
   loading: boolean;
   disconnected?: boolean;
   health?: Health;
@@ -25,6 +25,7 @@ export function ReadinessNotice({ loading, disconnected, health, snapshotFailed,
   summary: ReturnType<typeof describeDeviceReadiness>;
   mode: ControlMode;
   compact?: boolean;
+  integrated?: boolean;
 }) {
   if (loading) return <LoadingState label="Loading device readiness" announce={false} />;
   if (disconnected) return <Notice title="Backend unavailable" tone="danger">Connect the local application to see device observations.</Notice>;
@@ -52,7 +53,7 @@ export function ReadinessNotice({ loading, disconnected, health, snapshotFailed,
   if (summary.status === "Unavailable") {
     const first = summary.unavailable[0];
     const detail = compact ? undefined : <>Check {summary.unavailable.map((component) => paths[component].label).join(", ")}.
-      {" "}{paths[first].check}</>;
+      {" "}{pathCheck(first, integrated)}</>;
     return <Notice title={`${label} requirements unavailable`} tone="danger">{detail}</Notice>;
   }
   if (summary.status === "Initializing") {
@@ -65,16 +66,18 @@ export function ReadinessNotice({ loading, disconnected, health, snapshotFailed,
   </Notice>;
 }
 
-function PathList({ observations, localMatching }: { observations: Component[]; localMatching?: boolean }) {
+function PathList({ observations, localMatching, integrated }: {
+  observations: Component[];
+  localMatching?: boolean;
+  integrated?: boolean;
+}) {
   return <ul className={styles.paths}>{observations.map((observation) =>
-    <PathRow key={observation.component} observation={observation} localMatching={localMatching} />)}</ul>;
+    <PathRow key={observation.component} observation={observation} localMatching={localMatching} integrated={integrated} />)}</ul>;
 }
 
 export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
   const view = useRuntimeView();
-  const localMatching = view.profile?.profile_id === LOCAL_YOLOE_PROFILE;
-  const localGestures = view.profile?.profile_id === LOCAL_GESTURES_PROFILE;
-  const localController = view.profile?.profile_id === LOCAL_CONTROLLER_PROFILE;
+  const { integrated, localMatching, localGestures, localController } = localSearchPaths(view.profile?.profile_id);
   const runtimeState = useRuntime();
   const refresh = useRefreshRuntime();
   const { context, checking } = useEligibleSearchSetup(setup);
@@ -86,7 +89,9 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
 
   return (
     <div className={layout.page}>
-      <PageHeader title="Devices" description={localGestures
+      <PageHeader title="Devices" description={integrated
+        ? "Offline YOLOE and local input devices · Recorded robot video and simulated commands"
+        : localGestures
         ? "Local webcam gestures · Simulated robot video, commands, matching and controller"
         : localController
         ? "Selected USB DualShock 4 · Simulated robot video, commands, matching and gestures"
@@ -124,7 +129,7 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
       <div className={styles.noticeRow}>
         <div role="status">
           <ReadinessNotice loading={view.loading} disconnected={view.disconnected} health={view.health}
-            snapshotFailed={!!view.failedRead} summary={summary} mode={mode} />
+            snapshotFailed={!!view.failedRead} summary={summary} mode={mode} integrated={integrated} />
         </div>
         {canRefresh && (
           <Button onClick={refresh} pending={view.loading}>
@@ -138,7 +143,7 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
         {activeModeUnavailable && readiness && (
           <section aria-labelledby="reported-readiness-title">
             <h2 id="reported-readiness-title">Reported readiness</h2>
-            <PathList observations={readiness.components} localMatching={localMatching} />
+            <PathList observations={readiness.components} localMatching={localMatching} integrated={integrated} />
           </section>
         )}
         {summary.selected && (
@@ -147,12 +152,12 @@ export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
             <div className={styles.groups}>
               <div className={styles.selected}>
                 <h3>Selected-mode input</h3>
-                <PathList observations={[summary.selected]} />
+                <PathList observations={[summary.selected]} integrated={integrated} />
               </div>
               <div>
                 <h3>Shared connections and matching</h3>
                 <PathList observations={summary.shared.filter(({ component }) => connectionAndMatchingComponents.has(component))}
-                  localMatching={localMatching} />
+                  localMatching={localMatching} integrated={integrated} />
               </div>
               <div>
                 <h3>Shared application prerequisites</h3>
