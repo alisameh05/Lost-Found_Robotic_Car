@@ -77,7 +77,7 @@ function PathList({ observations, localMatching, integrated }: {
 
 export function DevicesScreen({ setup }: { setup?: SearchSetupContext }) {
   const view = useRuntimeView();
-  const { integrated, localMatching, localGestures, localController } = localSearchPaths(view.profile?.profile_id);
+  const { integrated, localMatching, localGestures, localController } = localSearchPaths(view.profile);
   const runtimeState = useRuntime();
   const refresh = useRefreshRuntime();
   const { context, checking } = useEligibleSearchSetup(setup);

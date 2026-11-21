@@ -136,7 +136,7 @@ test("rejects invalid enum, types, UUID, safe integers, field nullability, dimen
   expect(validObject({ ...sampleObject, roi: { ...sampleObject.roi, x: sampleObject.reference_media.width } })).toBe(false);
   expect(validSession(sampleSession, foundObject)).toBe(false);
   expect(compatibleProfile({ ...fixtureProfile, heartbeat_deadline_ms: fixtureProfile.heartbeat_interval_ms })).toBe(false);
-  expect(compatibleProfile({ ...fixtureProfile, evidence_kind: "Device" })).toBe(false);
+  expect(compatibleProfile({ ...fixtureProfile, evidence_kind: "Device" })).toBe(true);
   expect(compatibleQualification(qualification)).toBe(true);
   expect(compatibleQualification({ ...qualification, proximity_clear_mm: qualification.proximity_warning_mm })).toBe(false);
 });

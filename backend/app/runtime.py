@@ -9,6 +9,7 @@ from time import monotonic
 from typing import Literal
 
 from .control import Revocation
+from .device_startup import DeviceStartup
 from .http import HttpError
 from .operations import MAX_ORDINARY_PENDING, MAX_TERMINAL, Operation, mutation
 from .realtime import Channel, Realtime
@@ -98,7 +99,7 @@ class RecordsRuntime:
 
     def enable_realtime(self, simulation: Simulation | None, unavailable_code: str,
                         invalidate: Callable[[str, Channel], None],
-                        on_control_revoked: Callable[[Revocation], None]) -> Realtime:
+                        on_control_revoked: Callable[[Revocation], None], *, device: DeviceStartup | None = None) -> Realtime:
         def revoked(revocation: Revocation) -> None:
             if self.sessions:
                 self.sessions.revoked(revocation)
@@ -114,7 +115,7 @@ class RecordsRuntime:
 
         self.realtime = Realtime(simulation, unavailable_code, self.boot_id, self.storage.monotonic,
                                  self.storage.clock, self.touch_client, self.realtime_projection, invalidate,
-                                 self.expire_clients, revoked, failure_changed, emergency)
+                                 self.expire_clients, revoked, failure_changed, emergency, device=device)
         self.sessions = SessionCoordinator(self, self.realtime)
         self.realtime.on_candidate = self.sessions.admit_candidate
         return self.realtime
@@ -547,7 +548,7 @@ class RecordsRuntime:
             await self._retention_task
 
     def readiness(self, storage: Inspection | None) -> dict[str, object]:
-        simulation_fault = self.realtime and self.realtime.profile and self.realtime.component_cause("Storage")
+        simulation_fault = self.realtime and self.realtime.simulation and self.realtime.component_cause("Storage")
         status = "Initializing" if storage is None else "Unavailable" if storage.problem or simulation_fault else "Ready"
         cause = {"Initializing": ["INITIALIZING"], "Unavailable": ["STORAGE_UNAVAILABLE"], "Ready": []}[status]
         return {

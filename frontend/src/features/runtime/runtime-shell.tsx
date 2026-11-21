@@ -23,9 +23,12 @@ export function RuntimeFrame({ children, fixtureEnabled = true, modeLabel }: {
   const session = snapshot?.active_session;
   const active = session?.state === "Searching" || session?.state === "Paused";
   const activeSearchId = recovering ? reconnectingSessionId : active && !failedRead ? session.id : undefined;
-  const offerEmergency = active || !!health?.active_session_state ||
-    (!!connected && (fixtureEnabled || !!snapshot?.qualification_profile) && (/^\/objects\/[^/]+\/search\/?$/.test(pathname ?? "") ||
-      /^\/sessions\/[^/]+\/live\/?$/.test(pathname ?? "")));
+  const setup = /^\/objects\/[^/]+\/search\/?$/.test(pathname ?? "");
+  const live = /^\/sessions\/[^/]+\/live\/?$/.test(pathname ?? "");
+  const offerEmergency = active || !!health?.active_session_state || (!!connected && (
+    setup || (live && (fixtureEnabled || !!snapshot?.qualification_profile)) ||
+    (!fixtureEnabled && pathname === "/devices")
+  ));
 
   return (
     <AppShell fixtureEnabled={fixtureEnabled} modeLabel={modeLabel} activeSearch={activeSearchId && (

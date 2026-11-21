@@ -7,8 +7,7 @@ export { conforms, type Definition } from "./wire-contracts";
 export function compatibleProfile(value: unknown): value is FrontendProfile {
   if (!conforms("FrontendProfile", value)) return false;
   const profile = value as FrontendProfile;
-  return profile.evidence_kind === "Fixture" &&
-    profile.max_header_bytes <= profile.max_frame_bytes - 5 &&
+  return profile.max_header_bytes <= profile.max_frame_bytes - 5 &&
     profile.max_frame_width <= profile.max_frame_pixels && profile.max_frame_height <= profile.max_frame_pixels &&
     profile.max_client_message_bytes <= 65_536 &&
     profile.heartbeat_interval_ms < profile.heartbeat_deadline_ms;

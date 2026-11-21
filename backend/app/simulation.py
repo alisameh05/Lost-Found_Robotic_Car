@@ -50,25 +50,27 @@ class QualificationProfile:
         return int(self.values[key])
 
     @classmethod
-    def validate(cls, document: object, evidence: bytes, interfaces: bytes) -> "QualificationProfile":
+    def validate(
+        cls, document: object, evidence: bytes, interfaces: bytes, *, kind: Literal["Fixture", "Device"] = "Fixture",
+    ) -> "QualificationProfile":
         if isinstance(document, dict) and (
-            document.get("protocol_version") != 1 or document.get("evidence_kind") != "Fixture"
+            document.get("protocol_version") != 1 or document.get("evidence_kind") != kind
         ):
-            raise IncompatibleProfile("The simulation profile is incompatible.")
+            raise IncompatibleProfile("The qualification profile is incompatible.")
         definitions = contract_definitions()
         validator = Draft202012Validator({"$defs": definitions, "$ref": "#/$defs/QualificationProfile"})
         if not isinstance(document, dict) or not validator.is_valid(document):
-            raise ValueError("The simulation profile is invalid.")
+            raise ValueError("The qualification profile is invalid.")
         # JSON Schema accepts integer-valued floats. The wire contract requires actual integers.
         if type(document["protocol_version"]) is not int or any(type(v) not in (int, str) for v in document.values()):
-            raise ValueError("The simulation profile contains an invalid integer.")
+            raise ValueError("The qualification profile contains an invalid integer.")
         if document["evidence_manifest_sha256"] != sha256(evidence).hexdigest() or (
             document["device_protocol_manifest_sha256"] != sha256(interfaces).hexdigest()
         ):
-            raise ValueError("The simulation manifests do not match the profile.")
+            raise ValueError("The qualification manifests do not match the profile.")
         p = document
         if not ID.fullmatch(p["profile_id"]):
-            raise ValueError("The simulation profile ID is invalid.")
+            raise ValueError("The qualification profile ID is invalid.")
         if not (
             max(p["max_frame_width"], p["max_frame_height"]) <= p["max_frame_pixels"]
             and p["max_header_bytes"] + 4 < p["max_frame_bytes"] <= 16 * 1024**2
@@ -82,7 +84,7 @@ class QualificationProfile:
             and p["clock_uncertainty_limit_us"] < p["capture_age_limit_ms"] * 1000
             and p["proximity_warning_mm"] < p["proximity_clear_mm"] <= p["proximity_max_distance_mm"]
         ):
-            raise ValueError("The simulation profile bounds are inconsistent.")
+            raise ValueError("The qualification profile bounds are inconsistent.")
         frontend_schema = definitions["FrontendProfile"]
         assert isinstance(frontend_schema, dict)
         frontend = {name: p[name] for name in frontend_schema["required"]}
@@ -334,7 +336,7 @@ def load_simulation(selection: str | None, recorded_robot_jpeg: Path | None = No
         return None
     local_profiles = (LOCAL_VISION_PROFILE_NAME, LOCAL_GESTURES_PROFILE_NAME, LOCAL_CONTROLLER_PROFILE_NAME)
     if selection not in (PROFILE_NAME, REVIEW_PROFILE_NAME, PHASE_06_PROFILE_NAME, *local_profiles):
-        raise IncompatibleProfile("The simulation profile is incompatible.")
+        raise IncompatibleProfile("The qualification profile is incompatible.")
     integrated = selection == PHASE_06_PROFILE_NAME
     folder = FIXTURES / "phase06" if integrated else FIXTURES
     manifests = tuple((folder / name).read_text(encoding="utf-8").encode("utf-8")
@@ -347,7 +349,7 @@ def load_simulation(selection: str | None, recorded_robot_jpeg: Path | None = No
             json.loads(interfaces, object_pairs_hook=json_fields, parse_constant=reject_nonfinite) if integrated else None
         )
     except HttpError as exc:
-        raise ValueError("The simulation profile contains invalid JSON.") from exc
+        raise ValueError("The qualification profile contains invalid JSON.") from exc
     if selection in local_profiles and isinstance(document, dict):
         document["profile_id"] = selection
         if selection == LOCAL_GESTURES_PROFILE_NAME:

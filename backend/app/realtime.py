@@ -39,6 +39,7 @@ from .control import (
 )
 from .controller import POLL_SECONDS as CONTROLLER_POLL_SECONDS
 from .controller import Controller
+from .device_startup import DeviceStartup
 from .http import DOMAIN_ID, HEADER_LIMIT, HttpError, authorize_address, header, json_fields, read_json
 from .motion import FixtureCommandSink, InputSample, InputScope, Motion
 from .registration_input import SAFE_INTEGER, canonical_json
@@ -194,9 +195,10 @@ class Realtime:
         invalidate: Callable[[str, Channel], None], expire_clients: Callable[[], None],
         on_control_revoked: Callable[[Revocation], None],
         on_failure_changed: Callable[[Projection], None],
-        on_controller_emergency: Callable[[], None],
+        on_controller_emergency: Callable[[], None], *, device: DeviceStartup | None = None,
     ):
         self.simulation = simulation
+        self.device = device
         self.webcam: Webcam | None = None
         self.controller: Controller | None = None
         self.unavailable_code = unavailable_code
@@ -274,12 +276,12 @@ class Realtime:
 
     @property
     def profile(self) -> QualificationProfile | None:
-        return self.simulation.profile if self.simulation else None
+        return self.device.profile if self.device else self.simulation.profile if self.simulation else None
 
     def requires_profile(self) -> QualificationProfile:
         if not self.profile or self._closed:
             code = self.unavailable_code
-            raise HttpError(503, code, "A compatible backend simulation profile is unavailable.")
+            raise HttpError(503, code, "A compatible backend qualification profile is unavailable.")
         return self.profile
 
     def client_is_live(self, client: str) -> bool:
@@ -571,7 +573,7 @@ class Realtime:
                 self._publish("readiness_changed", None)
 
     def _can_acquire(self, client: str | None) -> bool:
-        return bool(client and self.profile and not self._closed and self._generation < SAFE_INTEGER - 1
+        return bool(client and self._motion and self.profile and not self._closed and self._generation < SAFE_INTEGER - 1
                     and (client, "events") in self._connections)
 
     async def change_lease(self, request: LeaseRequest) -> Projection:
@@ -704,6 +706,8 @@ class Realtime:
             return self.unavailable_code if name == "QualificationProfile" else "NOT_READY"
         if name == "QualificationProfile":
             return None
+        if self.device and name in ("Command", "RobotVideo"):
+            return self.device.causes.get(name, "NOT_READY")
         now = self.monotonic()
         if name == "AI" and self.local_vision:
             return self._vision_cause or ("NOT_READY" if now >= self._inference_until else None)
@@ -1036,18 +1040,18 @@ class Realtime:
         owns = lease is not None and lease.client == client
         readiness = cast(Projection, state["readiness"])
         live = {"Workspace": bool(owns and lease and lease.workspace),
-                "DisplayedRobotVideo": bool(owns and lease and lease.displayed),
-                **{name: self.component_cause(name) is None for name in
-                   ("Webcam", "Controller", "RobotVideo", "Command", "AI")}}
-        if not projection["storage_problem"] and self.component_cause("Storage") is not None:
-            live["Storage"] = False
-        components = [
-            (self.component_status(name) if name == "AI" else
-             {"component": name, "status": "Ready" if live[name] else "Unavailable",
-              "cause_codes": [] if live[name] else ["STORAGE_UNAVAILABLE" if name == "Storage" else "NOT_READY"]})
-            if (name := str(component["component"])) in live else component
-            for component in cast(list[Projection], readiness["components"])
-        ]
+                "DisplayedRobotVideo": bool(owns and lease and lease.displayed)}
+        components = []
+        for component in cast(list[Projection], readiness["components"]):
+            name = str(component["component"])
+            if name in live:
+                component = {"component": name, "status": "Ready" if live[name] else "Unavailable",
+                             "cause_codes": [] if live[name] else ["NOT_READY"]}
+            elif name in ("Webcam", "Controller", "RobotVideo", "Command", "AI"):
+                component = self.component_status(name)
+            elif name == "Storage" and self.simulation and self.component_cause(name) is not None:
+                component = self.component_status(name)
+            components.append(component)
         statuses = {component["component"]: component["status"] == "Ready" for component in components}
         shared = owns and all(ready for name, ready in statuses.items() if name not in ("Webcam", "Controller"))
         start = shared and projection["session_id"] is None and bool(projection["eligible_target"])

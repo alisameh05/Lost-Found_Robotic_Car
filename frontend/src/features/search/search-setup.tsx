@@ -18,7 +18,6 @@ import { searchSetupBlockReason, supportHref } from "@/lib/search-setup-context"
 import styles from "./search-setup.module.css";
 import { ActionFeedback } from "./action-feedback";
 import { SearchSaveControls } from "./search-fixture-controls";
-import { SearchUnavailable } from "./search-unavailable";
 
 const modes = [
   { value: "Gestures", label: "Gestures", detail: "Laptop webcam required.", icon: Hand },
@@ -26,11 +25,6 @@ const modes = [
 ] as const;
 
 export function SearchSetupScreen({ objectId, mode = "Gestures" }: { objectId: string; mode?: ControlMode }) {
-  const { recordsMode, profile } = useRuntimeView();
-  return recordsMode && !profile ? <SearchUnavailable title="Search Setup" /> : <SavedSearchSetup objectId={objectId} mode={mode} />;
-}
-
-function SavedSearchSetup({ objectId, mode }: { objectId: string; mode: ControlMode }) {
   const { object, result, absence, retry } = useObjectRecord(objectId);
   return <div className={styles.page}>
     <PageHeader title="Search Setup" description="Review the saved target, choose a control mode, and check readiness." />
@@ -56,8 +50,9 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   const refresh = useRefreshRuntime();
   const router = useRouter();
   const { snapshot, health, workspace, profile, recordsMode } = view;
-  const { integrated, localMatching, localGestures, localController } = localSearchPaths(profile?.profile_id);
-  const showPreview = !recordsMode || (object.status === "Lost" && !object.retention_grace && referenceDisplayed === true);
+  const { integrated, localMatching, localGestures, localController } = localSearchPaths(profile);
+  const deviceMode = profile?.evidence_kind === "Device";
+  const showPreview = !recordsMode || (!!profile && object.status === "Lost" && !object.retention_grace && referenceDisplayed === true);
   const canvas = useRef<HTMLDivElement>(null);
   const requestedStart = useRef(false);
   const releaseForNavigation = recordsMode ? () => { void runtime?.releaseWorkspace(); } : undefined;
@@ -127,7 +122,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
         </Panel>
         {showPreview && <Panel className={styles.card} aria-labelledby="robot-preview-title">
           <div className={styles.row}>
-            <h2 id="robot-preview-title">{recordsMode ? "Simulated robot preview" : "Robot preview"}</h2>
+            <h2 id="robot-preview-title">{recordsMode && !deviceMode ? "Simulated robot preview" : "Robot preview"}</h2>
             <StatusBadge tone={workspace?.previewLive ? "success" : "warning"}>{workspace?.previewLive ? "Live preview" : "Not live"}</StatusBadge>
           </div>
           <div ref={canvas} className={styles.preview} />
@@ -135,7 +130,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
             : localGestures ? "Local webcam gestures · Simulated robot video, commands and matching"
             : localController ? "Selected USB DualShock 4 · Simulated robot video, commands, matching and gestures"
             : localMatching ? "Offline YOLOE · Simulated robot video, commands and input"
-            : recordsMode ? "Backend simulation · Disarmed" : workspace?.controlling ? "This workspace holds control." : "Read-only preview."}</p>
+            : deviceMode ? "Device mode · Disarmed" : recordsMode ? "Backend simulation · Disarmed" : workspace?.controlling ? "This workspace holds control." : "Read-only preview."}</p>
         </Panel>}
       </div>
 
@@ -172,7 +167,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
                   <span><Icon className={inactive ? styles.muted : status === "Ready" ? styles.success : styles.warning}
                     size={16} aria-hidden="true" />{devicePaths[name].label}</span>
                   <span className={styles.muted}>{inactive ? "Inactive" : "Required"}</span>
-                  <span className={status === "Ready" && !inactive ? styles.success : styles.muted}>{status}</span>
+                  <span className={status === "Ready" && !inactive ? styles.success : styles.muted}>{status}{!inactive && observation?.cause_codes.includes("PROTOCOL_UNSUPPORTED") && " · Unsupported protocol"}</span>
                 </li>;
               })}
               <li><span>Proximity sensor</span><span className={styles.muted}>Advisory</span>
@@ -186,7 +181,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
     </div>
     <footer className={styles.footer}>
       <div role="status" className={styles.feedback}>
-        {ready ? <Notice tone="success" title="Ready to start">{recordsMode
+        {ready ? <Notice tone="success" title="Ready to start">{recordsMode && !deviceMode
           ? "Required paths are ready and the displayed robot frame is confirmed. Simulated motion stays disarmed."
           : "Required paths are ready and the robot preview is live."}</Notice>
           : notice ? <Notice tone="warning" title="Start blocked">{notice}</Notice>

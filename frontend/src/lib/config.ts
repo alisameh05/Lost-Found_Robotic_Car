@@ -1,9 +1,12 @@
+import type { FrontendProfile } from "@/generated/api-v1";
+
 export const LOCAL_YOLOE_PROFILE = "local-yoloe-v1";
 export const LOCAL_GESTURES_PROFILE = "local-gestures-v1";
 export const LOCAL_CONTROLLER_PROFILE = "local-controller-v1";
 export const PHASE_06_PROFILE = "phase-06-v1";
 
-export function localSearchPaths(profileId?: string) {
+export function localSearchPaths(profile?: FrontendProfile) {
+  const profileId = profile?.evidence_kind === "Fixture" ? profile.profile_id : undefined;
   const integrated = profileId === PHASE_06_PROFILE;
   return {
     integrated,
