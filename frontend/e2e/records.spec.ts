@@ -1355,9 +1355,9 @@ test("shows selected DualShock 4 input and emergency recovery in a connected wor
   const input = page.getByRole("region", { name: "Controller feedback" });
   await expect(page.getByText("Selected USB DualShock 4 · Simulated robot video and commands")).toBeVisible();
   await expect(page.getByText("Gesture control inactive")).toBeVisible();
+  await expect(input).toContainText("Selected USB DualShock 4 ready");
   await expect(input).toContainText("Motion permission · Arming");
   sample(11);
-  await expect(input).toContainText("D-pad direction accepted");
   await expect(input).toContainText("Motion permission · Armed");
   sample();
   await expect(input).toContainText("Motion permission · Arming");
@@ -1365,6 +1365,7 @@ test("shows selected DualShock 4 input and emergency recovery in a connected wor
   await expect(input).toContainText("Motion permission · Armed");
   sample(12, 1);
   await expect(input).toContainText("Motion permission · Disarmed");
+  await expect(input).toContainText("Selected USB DualShock 4 ready");
   await expect(page.getByText("Committed session · Paused")).toBeVisible();
   await expect(page.getByText(/Recovery required before Resume/)).toBeVisible();
   await expect(page.getByRole("button", { name: "Emergency Stop", exact: true })).toBeEnabled();

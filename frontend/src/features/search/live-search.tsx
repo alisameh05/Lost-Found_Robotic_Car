@@ -174,11 +174,10 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const controllerReady = connected && readiness.components.some(
     ({ component, status }) => component === "Controller" && status === "Ready",
   );
-  const localControllerInput = !controllerReady ? "Selected USB DualShock 4 unavailable"
-    : permission === "Armed" ? "D-pad direction accepted"
-    : permission === "Arming" ? "Neutral accepted · waiting for a fresh hold"
-    : state === "Searching" && owner && ready ? "Release the D-pad to neutral"
-    : "Selected USB DualShock 4 ready";
+  const localControllerInput = controllerReady ? "Selected USB DualShock 4 ready" : "Selected USB DualShock 4 unavailable";
+  const controllerInstruction = state === "Searching" && owner && ready && permission === "Disarmed"
+    ? "Release the D-pad to neutral, then hold a direction."
+    : "Hold a D-pad direction to move. Release to stop.";
   const input = localGestures && gestures ? localGestureInput
     : localController && !gestures ? localControllerInput
     : recordsMode ? connectedInput : gestures ? gestureFeedback(sample) : sample === "invalid" ? "Conflicting D-pad input"
@@ -308,7 +307,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
           <div role="status">
             <p>{input}</p>
             <p>Motion permission · {permission}</p>
-            {localController && !gestures && <p>Release the D-pad to stop. Press Circle for Emergency Stop.</p>}
+            {localController && !gestures && <p>{controllerInstruction} Press Circle for Emergency Stop.</p>}
             {!recordsMode && searching && ready && permission !== "Armed" && <p>{permission === "Arming" ? "Ready for a fresh hold." : "Release to neutral before holding a direction."}</p>}
           </div>
         </Panel>

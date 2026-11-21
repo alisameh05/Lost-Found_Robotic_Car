@@ -16,7 +16,7 @@ $env:LAF_CONTROLLER_SERIAL = '<serial from the selected USB controller>'
 & $visionPython -m backend.app
 ```
 
-The adapter checks Sony VID `054C`, PID `05C4` or `09CC`, a matching serial and the Windows USB HID path. It requires the SDL HIDAPI profile with 16 digital buttons, six axes and no hats. A second unit with another serial cannot take over, and duplicate identities make the path unavailable. Change the selected unit through a disarmed backend restart. Verification currently targets a directly connected USB controller.
+The adapter checks Sony VID `054C`, PID `05C4` or `09CC`, a matching serial and the Windows USB HID path. It requires the SDL HIDAPI profile with 16 digital buttons, six axes and no hats. The adapter checks the serial again using USB feature report `0x12` on each newly opened input handle, since a Windows HID path can be reused. A second unit with another serial cannot take over, and duplicate identities make the path unavailable. Change the selected unit through a disarmed backend restart.
 
 ## Mapping and recovery
 
@@ -26,6 +26,8 @@ The worker updates SDL and drains a bounded batch of USB reports every 15 ms wit
 
 ## Verification
 
-The Windows discovery smoke check loaded Pygame 2.6.1 and SDL 2.28.4 and returned zero qualifying devices. Windows reported virtual gamepad buses. The selected physical unit was unavailable. The mapping above comes from the pinned SDL source. Actual USB identity, button and diagonal observations, native background polling, disconnect and reconnect, and timing from a physical press or removal to logical STOP require a hands-on run.
+The selected controller was discovered on Windows 11 26H2 (build 26300.9974) using Pygame 2.6.1 and SDL 2.28.4. It connected directly over USB as Sony `054C:09CC`, interface `03`, and exposed the expected HIDAPI capabilities. The joystick serial matched the serial read from the raw input handle. SDL assigned instance `0` during discovery and instance `1` when the coordinator opened the unit again in the same process. The serial stays in private local configuration.
+
+The selected controller produced advancing 64-byte USB reports with ID `0x01`. A released D-pad produced hat value `8`. Pressing and releasing Circle set and cleared bit `0x40` in the button byte. Hands-on qualification still needs all four held directions and release, a diagonal, Circle while a direction is held, disconnect and reconnect, and changes in logical permission on focus loss. Timing from an observed report or removal to logical STOP remains to be measured.
 
 The deterministic tests use synthetic USB reports through the device polling boundary and the actual coordinator, protected records service and simulated command device. They cover the four directions, release, conflicts, ambiguous identity, a second device, removal, a stalled poll, replayed report ticks, held input across recovery, browser focus and Circle during Pause, blocked inference and a blocked writer. The timeout bounds the age of a report using the previous poll's monotonic timestamp.

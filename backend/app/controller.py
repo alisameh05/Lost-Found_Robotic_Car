@@ -234,23 +234,33 @@ def open_windows_controller(selected_serial: str | None = None) -> Iterator[Poll
     sdl.SDL_hid_open_path.restype = ctypes.c_void_p
     sdl.SDL_hid_read_timeout.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t, ctypes.c_int]
     sdl.SDL_hid_read_timeout.restype = ctypes.c_int
+    sdl.SDL_hid_get_feature_report.argtypes = [ctypes.c_void_p, ctypes.POINTER(ctypes.c_ubyte), ctypes.c_size_t]
+    sdl.SDL_hid_get_feature_report.restype = ctypes.c_int
     sdl.SDL_hid_close.argtypes = [ctypes.c_void_p]
     sdl.SDL_hid_close.restype = None
     pygame.joystick.init()
-    handles: dict[int, int] = {}
+    handles: dict[int, tuple[str, bytes, int]] = {}
     try:
         sdl.SDL_JoystickEventState(0)  # SDL_IGNORE: poll current state without retaining joystick events.
         joysticks: dict[int, Any] = {}
-        raw_devices: dict[int, tuple[str, bytes]] = {}
         buffer = (ctypes.c_ubyte * (USB_REPORT_SIZE + 1))()
 
-        def read_reports(instance: int, path: bytes, limit: int = MAX_REPORTS) -> tuple[tuple[bytes, ...], bool]:
-            raw = handles.get(instance)
+        def open_verified_handle(serial: str, path: bytes) -> int | None:
+            expected = serial_key(serial)
+            if expected is None:
+                return None
+            raw = cast(int | None, sdl.SDL_hid_open_path(path, 0))
             if raw is None:
-                raw = cast(int | None, sdl.SDL_hid_open_path(path, 0))
-                if raw is None:
-                    return (), False
-                handles[instance] = raw
+                return None
+            # A Windows HID path can be reused. Verify Sony's serial on the actual input handle.
+            feature = (ctypes.c_ubyte * USB_REPORT_SIZE)(0x12)
+            length = sdl.SDL_hid_get_feature_report(raw, feature, len(feature))
+            if length >= 7 and feature[0] == 0x12 and bytes(feature[1:7])[::-1].hex() == expected:
+                return raw
+            sdl.SDL_hid_close(raw)
+            return None
+
+        def read_reports(raw: int, limit: int = MAX_REPORTS) -> tuple[tuple[bytes, ...], bool]:
             reports: list[bytes] = []
             for _ in range(limit):
                 length = sdl.SDL_hid_read_timeout(raw, buffer, len(buffer), 0)
@@ -260,15 +270,11 @@ def open_windows_controller(selected_serial: str | None = None) -> Iterator[Poll
                     break
                 reports.append(bytes(buffer[:length]))
             # A saturated or broken stream can't prove that these are current reports.
-            sdl.SDL_hid_close(handles.pop(instance))
             return tuple(reports), False
 
-        def poll() -> tuple[DeviceState, ...]:
-            # Read pending reports before SDL's independent joystick handle can announce removal.
-            drained = {instance: read_reports(instance, path) for instance, (_, path) in raw_devices.items()}
+        def discover() -> list[tuple[int, str, bytes, bool]]:
             sdl.SDL_JoystickUpdate()
-            devices = []
-            present = set()
+            devices: list[tuple[int, str, bytes, bool]] = []
             for index in range(pygame.joystick.get_count()):
                 if (sdl.SDL_JoystickGetDeviceVendor(index) != SONY or
                         sdl.SDL_JoystickGetDeviceProduct(index) not in DUALSHOCK_4):
@@ -283,41 +289,65 @@ def open_windows_controller(selected_serial: str | None = None) -> Iterator[Poll
                 handle = sdl.SDL_JoystickFromInstanceID(instance)
                 if not handle or not sdl.SDL_JoystickGetAttached(handle):
                     continue
-                present.add(instance)
                 serial = cast(bytes, sdl.SDL_JoystickGetSerial(handle) or b"").decode("ascii", errors="replace")
                 path_bytes = cast(bytes, sdl.SDL_JoystickPath(handle) or b"")
                 path = path_bytes.decode("utf-8", errors="replace")
                 guid = bytes.fromhex(joystick.get_guid())
-                reports = None
+                supported = (len(guid) == 16 and guid[14] == ord("h") and joystick.get_numhats() == 0
+                             and joystick.get_numbuttons() == 16 and joystick.get_numaxes() == 6
+                             and USB_PATH.fullmatch(path) is not None
+                             and (selected is None or serial_key(serial) == selected))
+                devices.append((instance, serial, path_bytes, supported))
+            return devices
+
+        def poll() -> tuple[DeviceState, ...]:
+            # Read already-verified handles before SDL can announce a device removal.
+            drained = {instance: read_reports(raw) for instance, (_, _, raw) in handles.items()}
+            try:
+                found = discover()
+            except (OSError, pygame.error):
+                # The valid prefix can still deliver Circle. Enumeration cannot authorize motion.
+                found = []
+            present = {instance for instance, _, _, _ in found}
+            supported = {(instance, serial, path) for instance, serial, path, valid in found if valid}
+            devices: list[DeviceState] = []
+            for instance, (serial, path_bytes, raw) in tuple(handles.items()):
+                prefix, complete = drained[instance]
+                if (instance, serial, path_bytes) not in supported:
+                    if complete:
+                        # A pending read may have completed during the SDL removal check.
+                        tail, _ = read_reports(raw, MAX_REPORTS - len(prefix))
+                        prefix += tail
+                    if prefix:
+                        path = path_bytes.decode("utf-8", errors="replace")
+                        devices.append(DeviceState(instance, serial, path, prefix, False))
+                    del drained[instance]
+                elif complete:
+                    continue
+                sdl.SDL_hid_close(raw)
+                del handles[instance]
+
+            for instance, serial, path_bytes, valid in found:
+                reports: tuple[bytes, ...] | None = None
                 complete = False
-                if (len(guid) == 16 and guid[14] == ord("h") and joystick.get_numhats() == 0
-                        and joystick.get_numbuttons() == 16 and joystick.get_numaxes() == 6
-                        and USB_PATH.fullmatch(path) and (selected is None or serial_key(serial) == selected)):
-                    if raw_devices.get(instance) == (serial, path_bytes):
+                if valid:
+                    if instance in drained:
                         reports, complete = drained[instance]
-                    elif instance not in raw_devices:
-                        reports, complete = read_reports(instance, path_bytes)
-                        raw_devices[instance] = serial, path_bytes
+                    elif (opened := open_verified_handle(serial, path_bytes)) is not None:
+                        reports, complete = read_reports(opened)
+                        if complete:
+                            handles[instance] = serial, path_bytes, opened
+                        else:
+                            sdl.SDL_hid_close(opened)
+                path = path_bytes.decode("utf-8", errors="replace")
                 devices.append(DeviceState(instance, serial, path, reports, complete))
-            for removed in raw_devices.keys() - present:
-                serial, path_bytes = raw_devices.pop(removed)
-                reports, _ = drained[removed]
-                if removed in handles and len(reports) < MAX_REPORTS:
-                    # The pending raw read may have completed during the SDL removal check.
-                    tail, _ = read_reports(removed, path_bytes, MAX_REPORTS - len(reports))
-                    reports += tail
-                if reports:
-                    path = path_bytes.decode("utf-8", errors="replace")
-                    devices.append(DeviceState(removed, serial, path, reports, False))
-            for removed in handles.keys() - present:
-                sdl.SDL_hid_close(handles.pop(removed))
             for removed in joysticks.keys() - present:
                 joysticks.pop(removed).quit()
             return tuple(devices)
 
         yield poll
     finally:
-        for raw in handles.values():
+        for _, _, raw in handles.values():
             sdl.SDL_hid_close(raw)
         pygame.joystick.quit()
 
