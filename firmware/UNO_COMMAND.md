@@ -6,6 +6,8 @@ The Windows backend owns motion authority. The HC-05 link carries only serial co
 
 Serial uses binary 8N1 and no flow control. Use the baud rate in the selected build and measured profile. Each packet is a COBS-encoded payload and CRC followed by a zero delimiter. Empty delimited spans are ignored. The backend prefixes HELLO and STOP with 28 bytes of 0xff followed by a delimiter. This overflows and clears any abandoned request before a delimiter could complete it. There is one request in flight. The fixed receive bound is 28 bytes including delimiter for a request, and 60 bytes for a reply. Only the HELLO reply uses the longer form. Including the prefix, a HELLO or STOP occupies 57 bytes.
 
+On Windows BLE, use service FFE0 and characteristic FFE1. Send each complete request as one GATT write with response. For HELLO and STOP, send the 29-byte prefix as a separate write before the request under the same deadline. Assemble FFE1 notifications as a bounded serial byte stream. GATT write completion confirms transport only. The Uno acknowledgment supplies protocol correlation and logical state.
+
 | Byte offset | Type | Field |
 | --- | --- | --- |
 | 0 | u8 | Version, 1 |

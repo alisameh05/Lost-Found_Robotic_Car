@@ -7,10 +7,11 @@ from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 from PIL import Image
 
+from .ble_link import open_selected_ble
 from .config import Config
 from .control import LeaseFailure, LeaseRejected, Revocation, parse_lease
 from .controller import Controller, open_windows_controller
-from .device_startup import DeviceProbe, RobotPath, load_device_startup
+from .device_startup import CommandInterface, DeviceProbe, RobotPath, load_device_startup
 from .http import (
     API_PREFIX,
     CLIENT_ROUTES,
@@ -37,7 +38,7 @@ from .registration_input import NAME_LIMIT, normalize_name, parse_registration
 from .retention_input import parse_retention
 from .runtime import PageError, RecordsRuntime
 from .search_input import parse_emergency, parse_search
-from .serial_link import OpenTransport, SerialCommandLink, open_selected
+from .serial_link import OpenTransport, SerialCommandLink, Transport, open_selected
 from .simulation import (
     LOCAL_CONTROLLER_PROFILE_NAME,
     LOCAL_GESTURES_PROFILE_NAME,
@@ -135,9 +136,11 @@ def create_app(
             if device and device.command and profile:
                 selected = device.command
                 ack_deadline = profile.bound("command_ack_deadline_ms") / 1000
+                open_command: Callable[[CommandInterface, float], AbstractContextManager[Transport]]
+                open_command = open_selected_ble if selected.interface.transport == "ble_gatt" else open_selected
                 command = SerialCommandLink(
                     profile, selected.build_id, command_transport or (
-                        lambda: open_selected(selected.interface, ack_deadline)
+                        lambda: open_command(selected.interface, ack_deadline)
                     ), runtime.storage.monotonic,
                 )
             realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked,

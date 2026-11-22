@@ -17,6 +17,7 @@ from .simulation import IncompatibleProfile, QualificationProfile
 from .uno_wire import DISCARD_PARTIAL, MAX_FRAME, REQUEST_FRAME, VERSION
 
 DOCUMENT_LIMIT = 256 * 1024
+WINDOWS_BLE_ID = re.compile(r"BTHLE\\DEV_([0-9A-F]{12})\\[^\\]+", re.IGNORECASE)
 RFC1918 = tuple(IPv4Network(block) for block in ("10.0.0.0/8", "172.16.0.0/12", "192.168.0.0/16"))
 Digest = Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{64}$")]
 Identity = Annotated[str, StringConstraints(pattern=r"^[!-~][ -~]{0,511}$")]
@@ -46,7 +47,9 @@ class Interface(ManifestModel):
 
 
 class CommandInterface(Interface):
-    windows_port: Annotated[str, StringConstraints(pattern=r"^COM[1-9][0-9]{0,3}$")]
+    transport: Literal["serial_com", "ble_gatt"] = "serial_com"
+    windows_port: Annotated[str, StringConstraints(pattern=r"^COM[1-9][0-9]{0,3}$")] | None = None
+    ble_address_type: Literal["public", "random"] | None = None
     serial_baud: Positive
     data_bits: Literal[5, 6, 7, 8]
     parity: Literal["none", "even", "odd", "mark", "space"]
@@ -55,6 +58,16 @@ class CommandInterface(Interface):
     uno: Build
     logical_output_sha256: Digest
     build_artifact_sha256: Digest | None = None
+
+    @model_validator(mode="after")
+    def endpoint(self) -> Self:
+        if self.transport == "ble_gatt":
+            if (self.windows_port is not None or self.ble_address_type is None
+                    or not WINDOWS_BLE_ID.fullmatch(self.identity)):
+                raise ValueError("BLE requires a Windows LE identity and its address type.")
+        elif self.windows_port is None or self.ble_address_type is not None:
+            raise ValueError("Classic serial requires a Windows COM port.")
+        return self
 
 
 class CommandBuild(Build):
@@ -299,7 +312,7 @@ def command_selection(root: Path, profile: QualificationProfile, selection: Comm
     if reference is None:
         raise ValueError("No selected Uno build artifact")
     if (selection.protocol_version != VERSION or selection.uno.target != "arduino:avr:uno"
-            or not selection.identity.upper().startswith("BTHENUM\\")
+            or (selection.transport == "serial_com" and not selection.identity.upper().startswith("BTHENUM\\"))
             or (selection.data_bits, selection.parity, selection.stop_bits_x2, selection.flow_control)
             != (8, "none", 2, "none")
             or profile.bound("serial_max_packet_bytes") != MAX_FRAME):

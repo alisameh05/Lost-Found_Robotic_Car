@@ -49,14 +49,18 @@ def open_selected(selection: "CommandInterface", deadline: float) -> Iterator[Tr
     import serial  # type: ignore[import-untyped]
     from serial.tools import list_ports  # type: ignore[import-untyped]
 
+    address = selection.windows_port
+    if address is None:
+        raise OSError("The selected COM port is missing")
+
     def identity_matches() -> bool:
-        matches = [port.hwid for port in list_ports.comports() if port.device.upper() == selection.windows_port]
+        matches = [port.hwid for port in list_ports.comports() if port.device.upper() == address]
         return matches == [selection.identity]
 
     if not identity_matches():
         raise OSError("The configured HC-05 identity is absent")
     with serial.Serial(
-        selection.windows_port, baudrate=selection.serial_baud, bytesize=8, parity="N",
+        address, baudrate=selection.serial_baud, bytesize=8, parity="N",
         stopbits=1, timeout=0, write_timeout=deadline, rtscts=False, xonxoff=False, dsrdtr=False,
     ) as port:
         if not identity_matches():
@@ -350,6 +354,8 @@ class SerialCommandLink:
                         raise
                     finally:
                         session.best_effort_stop()
-            except (OSError, ValueError, Preempted):
+            except (OSError, ValueError, Preempted) as error:
+                if isinstance(error, WireVersionError):
+                    self._failed("PROTOCOL_UNSUPPORTED")
                 # Retry diagnostics only. Reconnect cannot restore a previous hold.
                 self._closed.wait(0.25)

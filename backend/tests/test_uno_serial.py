@@ -356,7 +356,8 @@ def test_serial_failure_drops_authority_and_reconnects_disarmed(uno_peer_exe: Pa
 
 
 @pytest.mark.parametrize("condition", [
-    "matched", "wrong_build", "changed_artifact", "fixture_artifact", "same_pin", "usb_identity",
+    "matched", "matched_ble", "mixed_endpoint", "wrong_build", "changed_artifact", "fixture_artifact",
+    "same_pin", "usb_identity",
 ])
 def test_selected_command_is_independent_of_device_camera(
     tmp_path: Path, uno_peer_exe: Path, condition: str,
@@ -368,6 +369,10 @@ def test_selected_command_is_independent_of_device_camera(
     selected["uno"]["target"] = "arduino:avr:uno"
     if condition == "usb_identity":
         selected["identity"] = "USB VID:PID=1A86:7523"
+    if condition in ("matched_ble", "mixed_endpoint"):
+        selected.update(transport="ble_gatt", identity=r"BTHLE\DEV_020102030405\7&synthetic", ble_address_type="public")
+        if condition == "matched_ble":
+            del selected["windows_port"]
     build = json.dumps({
         **selected["uno"], "version": 1, "kind": "DisabledFixture" if condition == "fixture_artifact" else "Device",
         "build_id": (bytes(32) if condition == "wrong_build" else BUILD).hex(),
@@ -382,7 +387,7 @@ def test_selected_command_is_independent_of_device_camera(
     (folder / "artifacts" / digest).write_bytes(build if condition != "changed_artifact" else b"changed")
     with native_peer(uno_peer_exe, challenge=80, expiry=140) as peer:
         app = create_app(Config(tmp_path, backend_mode="device"), command_transport=lambda: nullcontext(peer))
-        expected = [] if condition == "matched" else [
+        expected = [] if condition in ("matched", "matched_ble") else [
             "PROTOCOL_UNSUPPORTED" if condition in ("wrong_build", "usb_identity") else "NOT_READY",
         ]
         with TestClient(app, base_url=BASE) as client:
@@ -393,9 +398,9 @@ def test_selected_command_is_independent_of_device_camera(
             status = client.get(API + "/snapshot", headers=headers).json()
             assert status["runtime"]["motion_permission"] == "Disarmed"
             assert peer.output == 0
-            if condition in ("changed_artifact", "fixture_artifact", "same_pin", "usb_identity"):
+            if condition in ("changed_artifact", "fixture_artifact", "mixed_endpoint", "same_pin", "usb_identity"):
                 assert not peer.trace
-            elif condition == "matched":
+            elif condition in ("matched", "matched_ble"):
                 assert any(packet.op == HELLO for _, packet in peer.trace)
 
 

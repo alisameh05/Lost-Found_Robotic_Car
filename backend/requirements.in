@@ -1,3 +1,4 @@
+bleak==3.1.0 ; sys_platform == 'win32'
 fastapi==0.163.2
 uvicorn==0.41.0
 httptools==0.7.1
