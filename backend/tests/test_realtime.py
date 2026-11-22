@@ -38,6 +38,7 @@ from backend.app.motion import (
     FixtureCommandSink,
     InputSample,
     InputScope,
+    LiveCommandSink,
     controller_intent,
     gesture_intent,
 )
@@ -387,7 +388,8 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
             inference: Inference | None = None, blocked_connection: int = 1,
             checkpoint: Callable[[str], None] | None = None, wall: Callable[[], int] | None = None,
             local_vision: bool = False, webcam_factory: Callable[[QualificationProfile, Clock], Webcam] | None = None,
-            local_gestures: bool = False, controller_poll: Poll | None = None) -> Iterator[Loopback]:
+            local_gestures: bool = False, controller_poll: Poll | None = None,
+            live_command: LiveCommandSink | None = None) -> Iterator[Loopback]:
     clock = Clock()
     selected = "local-controller-v1" if controller_poll else "local-gestures-v1" if local_gestures else "fixture-v1"
     simulation = load_simulation(selected)
@@ -406,15 +408,16 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
         profile = replace(profile, values={**profile.values, "max_event_message_bytes": event_limit})
     if frame_limit is not None:
         profile = replace(profile, values={**profile.values, "max_frame_bytes": frame_limit})
-    command = CommandDevice(profile)
-    command.start()
+    command = None if live_command else CommandDevice(profile)
+    if command:
+        command.start()
     invalidations: list[tuple[str, Channel]] = []
     with socket.socket() as listener:
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         config = Config(root, backend_port=port, simulation_profile="local-yoloe-v1" if local_vision else selected)
         app = create_app(config, storage=storage,
-                         simulation=Simulation(profile, observations, command, inference),
+                         simulation=Simulation(profile, observations, live_command or command, inference),
                          webcam=webcam_factory(profile, clock) if webcam_factory else None,
                          controller=Controller(SERIAL, profile.bound("input_sample_deadline_ms") / 1000,
                                                lambda: nullcontext(controller_poll), clock) if controller_poll else None,
@@ -438,7 +441,8 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
         finally:
             server.should_exit = True
             worker.join(5)
-            command.close()
+            if command:
+                command.close()
             assert not worker.is_alive()
 
 
@@ -1257,12 +1261,19 @@ def recover_workspace(laf: Loopback, session: dict) -> Iterator[tuple[dict, Work
 def test_manual_resume_requires_fresh_neutral_and_keeps_the_saved_search(tmp_path: Path) -> None:
     with service(tmp_path) as laf, driving_search(laf, "Gestures") as (headers, driver):
         arm(laf, headers, "Gestures")
-        pause = search_action(laf, headers, driver, "pause", 1)
+        pause_id = str(uuid4())
+        pause = search_action(laf, headers, driver, "pause", 1, action_id=pause_id)
+        if pause.status_code == 202:
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+            pause = search_action(laf, headers, driver, "pause", 1, action_id=pause_id)
         assert pause.status_code == 200, pause.text
         wait_output(laf, None)
         wait_for(laf.http, "/snapshot", headers, lambda state: state["readiness"]["can_resume"])
         action_id = str(uuid4())
         response = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
+        if response.status_code == 202:
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["revision"] == 3)
+            response = search_action(laf, headers, driver, "resume", 2, action_id=action_id)
         assert response.status_code == 200, response.text
         resumed = {**driver.session, "state": "Searching", "revision": 3, "pause_causes": []}
         assert response.json()["result"]["session"] == resumed

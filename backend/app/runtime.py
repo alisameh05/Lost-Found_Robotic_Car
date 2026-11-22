@@ -11,6 +11,7 @@ from typing import Literal
 from .control import Revocation
 from .device_startup import DeviceStartup
 from .http import HttpError
+from .motion import LiveCommandSink
 from .operations import MAX_ORDINARY_PENDING, MAX_TERMINAL, Operation, mutation
 from .realtime import Channel, Realtime
 from .reference_image import Reference, prepare_reference
@@ -99,7 +100,8 @@ class RecordsRuntime:
 
     def enable_realtime(self, simulation: Simulation | None, unavailable_code: str,
                         invalidate: Callable[[str, Channel], None],
-                        on_control_revoked: Callable[[Revocation], None], *, device: DeviceStartup | None = None) -> Realtime:
+                        on_control_revoked: Callable[[Revocation], None], *, device: DeviceStartup | None = None,
+                        command: LiveCommandSink | None = None) -> Realtime:
         def revoked(revocation: Revocation) -> None:
             if self.sessions:
                 self.sessions.revoked(revocation)
@@ -115,7 +117,8 @@ class RecordsRuntime:
 
         self.realtime = Realtime(simulation, unavailable_code, self.boot_id, self.storage.monotonic,
                                  self.storage.clock, self.touch_client, self.realtime_projection, invalidate,
-                                 self.expire_clients, revoked, failure_changed, emergency, device=device)
+                                 self.expire_clients, revoked, failure_changed, emergency, device=device,
+                                 command=command)
         self.sessions = SessionCoordinator(self, self.realtime)
         self.realtime.on_candidate = self.sessions.admit_candidate
         return self.realtime

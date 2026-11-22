@@ -15,6 +15,7 @@ if TYPE_CHECKING:
 Direction = Literal["forward", "backward", "left", "right"]
 Intent = Literal[Direction, "neutral", "settling", "invalid", "emergency"]
 DIRECTIONS = get_args(Direction)
+COMMAND_FAILURES = ("CommandUnavailable", "CommandExpired")
 
 
 @dataclass(frozen=True)
@@ -69,15 +70,28 @@ class CommandEvent:
     cause: str | None = None
 
 
-class CommandSink(Protocol):
-    """Bounded, nonblocking device calls. A dropped or mismatched ACK is a failed renewal."""
-
+class CommandOutput(Protocol):
     @property
     def output(self) -> Direction | None: ...
     def probe(self) -> bool: ...
+    def revoke(self, generation: int, cause: str) -> None: ...
+
+
+class CommandSink(CommandOutput, Protocol):
+    """Synchronous fixture renewal."""
+
     def challenge(self, scope: InputScope, generation: int) -> Challenge: ...
     def renew(self, command: Command) -> Command | None: ...
-    def revoke(self, generation: int, cause: str) -> None: ...
+
+
+class LiveCommandSink(CommandOutput, Protocol):
+    @property
+    def cause(self) -> str | None: ...
+    @property
+    def failure(self) -> str: ...
+    @property
+    def latched_failure(self) -> str | None: ...
+    def pulse(self, generation: int, direction: Direction, deadline: float) -> str | None: ...
 
 
 class FixtureCommandSink:
@@ -186,8 +200,9 @@ class FixtureCommandSink:
 
 
 class Motion:
-    def __init__(self, sink: CommandSink, profile: "QualificationProfile"):
+    def __init__(self, sink: CommandSink | LiveCommandSink, profile: "QualificationProfile"):
         self.sink = sink
+        self.live = cast(LiveCommandSink, sink) if callable(getattr(sink, "pulse", None)) else None
         self._interval = profile.bound("command_renewal_interval_ms") / 1000
         self._ack_limit = profile.bound("command_ack_deadline_ms") / 1000
         self._limit = profile.bound("input_sample_deadline_ms") / 1000
@@ -215,7 +230,7 @@ class Motion:
         self._neutral = False
         self._direction = None
         self._renew_at = None
-        if was_held:
+        if was_held or (self.live and cause in COMMAND_FAILURES):
             try:
                 self.sink.revoke(self._generation, cause)
             except OSError:
@@ -257,20 +272,26 @@ class Motion:
     def loss(self, now: float) -> str | None:
         if self._direction is None:
             return None
+        if self.live and not self.live.probe():
+            return self.live.failure
         if self._renew_at is not None and self._logical_output() != self._direction:
             return "CommandExpired"
         return "InputUnavailable" if now - self._sample_at >= self._limit else None
 
-    def tick(self, scope: InputScope, now: float, clock: Callable[[], float]) -> str | None:
+    def tick(self, scope: InputScope, now: float, clock: Callable[[], float],
+             authority_until: float = math.inf) -> str | None:
         if self._direction is None or self._scope != scope:
             return None
         if failure := self.loss(now):
             return failure
+        if self.live:
+            return self.live.pulse(self._generation, self._direction, min(self._sample_at + self._limit, authority_until))
         if self._renew_at is not None and self._renew_at > now:
             return None
+        sink = cast(CommandSink, self.sink)
         try:
-            command = Command(self.sink.challenge(scope, self._generation), self._direction)
-            if self.sink.renew(command) != command or clock() - now >= self._ack_limit:
+            command = Command(sink.challenge(scope, self._generation), self._direction)
+            if sink.renew(command) != command or clock() - now >= self._ack_limit:
                 return "CommandUnavailable"
         except OSError:
             return "CommandUnavailable"

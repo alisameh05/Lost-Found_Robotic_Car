@@ -1,0 +1,10 @@
+{
+  "version": 1,
+  "profile_id": "uno-disabled-output-v1",
+  "kind": "DisabledFixture",
+  "serial_baud": 115200,
+  "packet_ms": 25,
+  "challenge_lifetime_ms": 180,
+  "firmware_expiry_ms": 220,
+  "hardware_watchdog_ms": 120
+}
