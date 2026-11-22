@@ -113,6 +113,7 @@ class Capture:
     height: int
     jpeg: bytes
     presence: FixturePresence | None = None
+    received_at_ms: int | None = None
 
     def fixture_presence(self, scope: InputScope) -> FixturePresence | None:
         sample = self.presence

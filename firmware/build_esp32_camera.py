@@ -47,6 +47,11 @@ def build(args: argparse.Namespace) -> None:
     if cli is None or f"Version: {CLI} " not in subprocess.check_output([cli, "version"], text=True):
         raise ValueError("The pinned Arduino CLI is required")
     data = args.arduino_data.resolve()
+    environment = {**os.environ, "ARDUINO_DIRECTORIES_DATA": str(data)}
+    installed = json.loads(subprocess.check_output([cli, "core", "list", "--json"], env=environment))
+    if not any(platform["id"] == "esp32:esp32" and platform["installed_version"] == CORE
+               for platform in installed["platforms"]):
+        raise ValueError("The active ESP32 core does not match the pinned version")
     esp32 = data / "packages" / "esp32"
     pins = esp32 / "hardware" / "esp32" / CORE / "libraries" / "ESP32" / "examples" / "Camera" / "CameraWebServer" / "camera_pins.h"
     pin_bytes = pins.read_bytes()
@@ -67,7 +72,6 @@ def build(args: argparse.Namespace) -> None:
                                 c_string("CameraBuildId", build_id), f"constexpr uint16_t CameraPort = {port};\n")),
                       encoding="ascii")
     output = out / "build"
-    environment = {**os.environ, "ARDUINO_DIRECTORIES_DATA": str(data)}
     try:
         with (out / "compile.log").open("wb") as log:
             subprocess.run([cli, "compile", "--fqbn", TARGET, "--build-path", str(output), str(sketch)],

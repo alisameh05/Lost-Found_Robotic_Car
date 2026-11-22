@@ -11,6 +11,7 @@ from backend.app.camera_link import CLOCK, CameraFault, Reply
 from backend.app.config import LOOPBACK, Config
 from backend.app.main import create_app
 from backend.app.simulation import FIXTURES
+from backend.app.storage import utc_ms
 from backend.tests.device_documents import write_camera_documents
 
 
@@ -39,7 +40,7 @@ def main() -> None:
             meta = f"1 {build} {boot} {stream} {sequence} {stamp} 320 240"
             fields = {"x-laf-frame": meta, "content-length": str(len(jpeg)), "content-type": "image/jpeg"}
         size = read_body(200, fields, 256)
-        return Reply(jpeg if size else b"", perf_counter())
+        return Reply(jpeg if size else b"", perf_counter(), utc_ms())
 
     app = create_app(config, camera_exchange=peer)
     uvicorn.run(app, host=LOOPBACK, port=config.backend_port, proxy_headers=False, access_log=False,

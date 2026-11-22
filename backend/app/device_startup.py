@@ -12,8 +12,7 @@ from typing import Annotated, Literal, NoReturn, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from .camera_link import TOKEN as CAMERA_TOKEN
-from .camera_link import VERSION as CAMERA_VERSION
+from . import camera_link
 from .controller import serial_key
 from .simulation import IncompatibleProfile, QualificationProfile
 from .uno_wire import DISCARD_PARTIAL, MAX_FRAME, REQUEST_FRAME, VERSION
@@ -360,15 +359,20 @@ def camera_selection(root: Path, selection: CameraInterface, network: str | None
     reference = selection.build_artifact_sha256
     if reference is None or network is None:
         raise ValueError("The selected camera build and protected network are required")
-    if selection.protocol_version != CAMERA_VERSION:
+    if (selection.protocol_version != camera_link.VERSION or selection.variant != camera_link.VARIANT
+            or selection.esp32_cam.target != camera_link.TARGET):
         raise IncompatibleProfile("Unsupported ESP32-CAM protocol")
     build = CameraBuild.model_validate(decode(read_artifact(root, reference)))
-    verify_artifacts(root, {selection.contract_sha256, network})
+    contract = decode(read_artifact(root, selection.contract_sha256))
+    canonical = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("ascii")
+    if sha256(canonical).hexdigest() != camera_link.CONTRACT_SHA256:
+        raise IncompatibleProfile("Unsupported ESP32-CAM contract")
+    read_artifact(root, network)
     if (build.variant != selection.variant or selection.esp32_cam.model_dump()
             != build.model_dump(include=set(Build.model_fields))):
         raise ValueError("The ESP32-CAM build does not match the measured selection")
     token = read_local_file(root, Path("device", "camera.token")).decode("ascii").rstrip("\r\n")
-    if not CAMERA_TOKEN.fullmatch(token):
+    if not camera_link.TOKEN.fullmatch(token):
         raise ValueError("The selected camera credential is invalid")
     return SelectedCamera(selection, build.build_id, token)
 

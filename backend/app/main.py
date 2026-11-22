@@ -185,7 +185,7 @@ def create_app(
                 camera = device.camera
                 exchange = camera_exchange or open_http_exchange(
                     camera.interface.address, camera.interface.port, camera.token,
-                    profile.bound("max_header_bytes"), runtime.storage.monotonic,
+                    profile.bound("max_header_bytes"), runtime.storage.monotonic, runtime.storage.clock,
                 )
                 link = CameraLink(profile, camera.build_id, exchange, runtime.storage.monotonic)
                 tasks += (asyncio.create_task(realtime.maintain_camera(link)),)

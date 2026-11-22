@@ -128,10 +128,12 @@ class Frame:
         age = self.age(now)
         if now < sample.observed_at or age >= profile.bound("capture_age_limit_ms"):
             return None
+        received = sample.received_at_ms
         metadata = canonical_json({
             "protocol_version": 1, "source": source, "stream_epoch": sample.stream_epoch,
             "capture_seq": sample.sequence, "frame_id": self.id, "width": sample.width, "height": sample.height,
-            "received_at_ms": utc, "capture_age_bound_ms": age, "source_capture_us": sample.source_us,
+            "received_at_ms": utc if received is None else received,
+            "capture_age_bound_ms": age if received is None else sample.age_ms, "source_capture_us": sample.source_us,
             "source_clock_epoch": sample.clock_epoch,
         }).encode("utf-8")
         if len(metadata) > profile.bound("max_header_bytes") or (
@@ -1143,16 +1145,19 @@ class Realtime:
             return None
         utc = self.utc()
         age = capture.age_ms + math.ceil((now - capture.observed_at) * 1000)
-        frame = Frame(token_urlsafe(18), capture, max(0, utc - age), scope)
+        captured_at = (utc - age if capture.received_at_ms is None
+                       else capture.received_at_ms - capture.age_ms)
+        frame = Frame(token_urlsafe(18), capture, max(0, captured_at), scope)
         if frame.header(source, now, utc, profile) is None:
             return None
         if previous:
             old = previous.capture
-            if old.stream_epoch == capture.stream_epoch and (
-                old.clock_epoch != capture.clock_epoch or old.sequence >= capture.sequence
-                or old.source_us >= capture.source_us
-            ):
-                return None
+            if old.stream_epoch == capture.stream_epoch:
+                if old.clock_epoch == capture.clock_epoch:
+                    if old.sequence >= capture.sequence or old.source_us >= capture.source_us:
+                        return None
+                elif not decoded:
+                    return None
             # Static scene bytes have already been decoded and checked.
             if capture.jpeg is old.jpeg and (capture.width, capture.height) == (old.width, old.height):
                 return frame
@@ -1481,7 +1486,7 @@ class Realtime:
         frame = self._frames.get("robot")
         if (self._rejected_track is track and self._input_scope() == scope
                 and self._active_state in ("Searching", "Paused") and frame and frame.scope == scope
-                and "robot" in self._live_sources
+                and self.component_cause("RobotVideo") is None
                 and self.component_cause("AI") is None
                 and frame.age(self.monotonic()) < profile.bound("capture_age_limit_ms")
                 and frame.capture.observed_at - frame.capture.age_ms / 1000
@@ -1524,7 +1529,7 @@ class Realtime:
 
     def _matching_frame(self, scope: InputScope, profile: QualificationProfile) -> Frame | None:
         frame, lease, now = self._frames.get("robot"), self._lease, self.monotonic()
-        if (frame and lease and "robot" in self._live_sources and scope == self._motion_scope()
+        if (frame and lease and self.component_cause("RobotVideo") is None and scope == self._motion_scope()
                 and frame.age(now) < profile.bound("capture_age_limit_ms")
                 and frame.capture.observed_at - frame.capture.age_ms / 1000
                 >= max(self._active_since, lease.generation_started or 0.0)):
@@ -1818,8 +1823,9 @@ class Realtime:
                 self._replace(connection)
                 source: Source = "robot" if channel == "robot-video" else "webcam"
                 if source in self._live_sources:
-                    connection.waiting = self._frames[source]
-                    connection.ready.set()
+                    if source != "robot" or self.component_cause("RobotVideo") is None:
+                        connection.waiting = self._frames[source]
+                        connection.ready.set()
             await self._deliver(socket, connection, profile)
         except (WebSocketDisconnect, OSError):
             pass
@@ -1876,6 +1882,8 @@ class Realtime:
             elif connection.waiting is not None:
                 frame, connection.waiting = connection.waiting, None
                 source: Source = "robot" if connection.channel == "robot-video" else "webcam"
+                if source == "robot" and self.component_cause("RobotVideo") is not None:
+                    continue
                 metadata = frame.header(source, self.monotonic(), self.utc(), profile)
                 if metadata is not None:
                     if source == "robot":
@@ -1890,7 +1898,7 @@ class Realtime:
         for ident, old in tuple(connection.issued.items()):
             if now >= old.retire_at:
                 del connection.issued[ident]
-        if frame.age(now) < limit and "robot" in self._live_sources:
+        if frame.age(now) < limit and self.component_cause("RobotVideo") is None:
             if len(connection.issued) >= MAX_ISSUED_FRAMES:
                 del connection.issued[next(iter(connection.issued))]
             capture = frame.capture
@@ -1937,7 +1945,7 @@ class Realtime:
             video = self._connections.get((connection.client, "robot-video"))
             if (not isinstance(indication, dict) or indication.keys() != {"frame_id", "stream_epoch"}
                     or not all(domain_id(value) for value in indication.values()) or video is None
-                    or "robot" not in self._live_sources):
+                    or self.component_cause("RobotVideo") is not None):
                 return False
             frame = video.issued.get(indication["frame_id"])
             if frame is None or indication["stream_epoch"] != frame.stream_epoch:

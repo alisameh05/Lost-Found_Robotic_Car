@@ -14,10 +14,14 @@ from .registration_input import SAFE_INTEGER
 from .simulation import Capture, QualificationProfile, dimensions_allowed, read_sample
 
 VERSION = 1
+CONTRACT_SHA256 = "cb82f461a75f4fe87c3417c3a62bf67f54f74c57932a38c5f61b1be06dd1d51e"
+VARIANT = "ai-thinker-rhyx-gc2145"
+TARGET = "esp32:esp32:esp32cam"
 CLOCK = "/laf/camera/v1/clock"
 FRAME = "/laf/camera/v1/frame"
 MAX_HEADER = 4096
 MAX_JPEG = 64 * 1024
+FRAME_DIMENSIONS = (320, 240)
 MAX_EPOCHS = 128
 RELATIVE_DRIFT_PPM = 1000
 HEX_ID = re.compile(r"[0-9a-f]{32}")
@@ -38,6 +42,7 @@ class CameraFault(ValueError):
 class Reply:
     body: bytes
     received: float
+    received_at_ms: int | None = None
 
 
 ReadBody = Callable[[int, Mapping[str, str], int], int]
@@ -63,7 +68,7 @@ def parse_headers(raw: bytes) -> tuple[int, dict[str, str]]:
 
 
 def open_http_exchange(address: str, port: int, token: str, header_limit: int,
-                       monotonic: Callable[[], float]) -> Exchange:
+                       monotonic: Callable[[], float], utc: Callable[[], int] | None = None) -> Exchange:
     """Only the selected literal address is used. No redirects, DNS, proxies, or implicit credentials."""
     limit = min(MAX_HEADER, header_limit)
 
@@ -98,7 +103,9 @@ def open_http_exchange(address: str, port: int, token: str, header_limit: int,
                         if not count:
                             raise CameraFault("Camera response was incomplete")
                         pending += count
-                    return Reply(bytes(body), monotonic())
+                    payload = bytes(body)
+                    received_utc = utc() if utc else None
+                    return Reply(payload, monotonic(), received_utc)
         except (OSError, TimeoutError) as error:
             raise CameraFault("The selected camera response was unavailable or over budget") from error
 
@@ -239,6 +246,7 @@ class CameraLink:
                 raise CameraFault("Camera acquisition did not advance", discard=True)
             size = unsigned(headers.get("content-length", ""), minimum=1, maximum=MAX_JPEG)
             if (headers.get("content-type") != "image/jpeg" or not dimensions_allowed(self.profile, w, h)
+                    or (w, h) != FRAME_DIMENSIONS
                     or size + header_bytes > self.profile.bound("max_frame_bytes")):
                 raise CameraFault("Camera JPEG exceeds its declared bounds")
             metadata = (sequence, source_us, w, h)
@@ -256,4 +264,5 @@ class CameraLink:
         if self.monotonic() >= self.clock_deadline:
             raise CameraFault("Camera clock synchronization expired during decode")
         self.last_sequence, self.last_source_us = sequence, source_us
-        return Capture(epoch[1], epoch[0], sequence, source_us, reply.received, age, w, h, reply.body)
+        return Capture(epoch[1], epoch[0], sequence, source_us, reply.received, age, w, h, reply.body,
+                       received_at_ms=reply.received_at_ms)

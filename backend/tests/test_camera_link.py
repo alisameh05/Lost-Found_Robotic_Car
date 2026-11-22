@@ -24,8 +24,8 @@ STREAM = "c" * 32
 TOKEN = "1" * 64
 
 
-def jpeg_sample() -> bytes:
-    with Image.new("RGB", (320, 240), "darkblue") as image, BytesIO() as out:
+def jpeg_sample(size: tuple[int, int] = (320, 240)) -> bytes:
+    with Image.new("RGB", size, "darkblue") as image, BytesIO() as out:
         image.save(out, format="JPEG")
         return out.getvalue()
 
@@ -106,7 +106,8 @@ def test_camera_rejects_invalid_clock_exchange(fault: str, message: str) -> None
 
 
 @pytest.mark.parametrize("fault, message, bodies", [
-    ("oversize", "integer", 0), ("pixels", "bounds", 0), ("dimensions", "Invalid camera JPEG", 1),
+    ("oversize", "integer", 0), ("pixels", "bounds", 0), ("wrong_mode", "bounds", 0),
+    ("dimensions", "Invalid camera JPEG", 1),
     ("malformed", "Invalid camera JPEG", 1), ("future", "cannot be bounded", 1),
     ("old", "too old", 1), ("expired_sync", "synchronization expired", 1),
 ])
@@ -117,8 +118,11 @@ def test_camera_rejects_ineligible_jpeg(fault: str, message: str, bodies: int) -
         await link.synchronize()
         if fault == "oversize":
             peer.frame = frame_headers(1_000_000)
-        elif fault in ("pixels", "dimensions"):
+        elif fault in ("pixels", "wrong_mode"):
             peer.frame = frame_headers(len(peer.jpeg), width=1000 if fault == "pixels" else 319)
+        elif fault == "dimensions":
+            peer.jpeg = jpeg_sample((319, 240))
+            peer.frame = frame_headers(len(peer.jpeg))
         elif fault == "malformed":
             peer.jpeg = b"not a JPEG"
         elif fault == "future":
@@ -209,6 +213,7 @@ def test_selected_camera_feeds_protected_preview_but_cannot_renew_a_stalled_disp
     assert load_device_startup(tmp_path, {}).camera is not None
     jpeg = jpeg_sample()
     sequence = 0
+    receipt_origin_ms = 1_800_000_000_000
     disconnected = Event()
 
     async def peer(path, headers, read_body, timeout):
@@ -223,7 +228,7 @@ def test_selected_camera_feeds_protected_preview_but_cannot_renew_a_stalled_disp
             sequence += 1
             response = frame_headers(len(jpeg), sequence, int(perf_counter() * 1_000_000))
         size = read_body(200, response, 256)
-        return Reply(jpeg if size else b"", perf_counter())
+        return Reply(jpeg if size else b"", perf_counter(), receipt_origin_ms + sequence)
 
     app = create_app(Config(tmp_path, backend_mode="device"), camera_exchange=peer)
     with TestClient(app, base_url=BASE) as client:
@@ -253,6 +258,7 @@ def test_selected_camera_feeds_protected_preview_but_cannot_renew_a_stalled_disp
             validate("FrameMetadata", metadata)
             assert raw[4 + length:] == jpeg
             assert metadata["stream_epoch"] == STREAM and metadata["source_clock_epoch"] == BOOT
+            assert metadata["received_at_ms"] == receipt_origin_ms + metadata["capture_seq"]
             events.send_json(heartbeat(boot, lease, 1, metadata))
             wait_for(client, "/snapshot", headers, lambda s: status(s, "DisplayedRobotVideo") == "Ready")
             for seq in range(2, 7):
@@ -266,3 +272,10 @@ def test_selected_camera_feeds_protected_preview_but_cannot_renew_a_stalled_disp
             disconnected.clear()
             restored = wait_for(client, "/snapshot", headers, lambda s: status(s, "RobotVideo") == "Ready")
             assert restored["lease"]["state"] == "Unowned"
+
+
+def test_hash_correct_but_incompatible_camera_contract_is_unavailable(tmp_path: Path) -> None:
+    write_camera_documents(tmp_path, BUILD, TOKEN, unsupported_contract=True)
+    loaded = load_device_startup(tmp_path, {})
+    assert loaded.profile is not None and loaded.camera is None
+    assert loaded.causes["RobotVideo"] == "PROTOCOL_UNSUPPORTED"
