@@ -100,3 +100,14 @@ def write_device_documents(
         **profile,
     }), encoding="utf-8")
     return folder
+
+
+def write_camera_documents(root: Path, build_id: str, token: str) -> None:
+    profile, interfaces, evidence, artifact = device_documents()
+    camera = interfaces["esp32_cam"]
+    build = json.dumps({**camera["esp32_cam"], "version": 1, "variant": camera["variant"], "build_id": build_id}).encode()
+    reference = sha256(build).hexdigest()
+    camera["build_artifact_sha256"] = reference
+    folder = write_device_documents(root, profile, interfaces, evidence, artifact)
+    (folder / "artifacts" / reference).write_bytes(build)
+    (folder / "camera.token").write_text(token, encoding="ascii")

@@ -81,6 +81,7 @@ class Lease:
     heartbeat_seq: int = 0
     workspace: bool = False
     displayed: bool = False
+    displayed_sequence: int = 0
     setup_handoff: bool = False
     previous_generation: int | None = None
     generation_started: float | None = None

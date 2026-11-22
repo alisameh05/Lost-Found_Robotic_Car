@@ -157,6 +157,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const mode = session.control_mode;
   const gestures = mode === "Gestures";
   const { integrated, localMatching, localGestures, localController } = localSearchPaths(profile);
+  const deviceMode = profile?.evidence_kind === "Device";
   const gestureInactive = !gestures && (localGestures || localController);
   const webcamLive = !!workspace?.webcamLive && !gestureInactive;
   const recognitionReady = connected && readiness.components.some(
@@ -183,7 +184,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
     : sample && sample !== "neutral" ? `Held ${sample}` : "No direction held";
   const searching = state === "Searching";
   const matching = searching && connected && readiness.components.some(({ component, status }) => component === "AI" && status === "Ready");
-  const matchingLabel = localMatching
+  const matchingLabel = localMatching || deviceMode
     ? matching ? "Offline YOLOE matching active" : "Offline YOLOE matching suspended"
     : matching ? recordsMode ? "Simulated AI matching active" : "AI matching active"
       : localGestures || localController ? "Simulated AI matching suspended" : "AI matching suspended";
@@ -231,7 +232,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
         ? `${gestures ? "Simulated gestures" : "Selected USB DualShock 4"} · Simulated robot video and commands`
       : localMatching
       ? `Simulated robot video, commands and input · ${permission}`
-      : profile?.evidence_kind === "Device" ? `Device mode · ${permission}` : recordsMode ? `Backend simulation · ${permission}` : undefined} actions={<>
+      : deviceMode ? `Device mode · ${permission}` : recordsMode ? `Backend simulation · ${permission}` : undefined} actions={<>
       <Button onClick={() => setHelp(!help)} aria-expanded={help} aria-controls={help ? "live-control-help" : undefined}>Control Help</Button>
       {(state === "Paused" || recoveryOpen) && <Button onClick={() => setRecovery(!recoveryOpen)}
         aria-expanded={recoveryOpen} aria-controls={recoveryOpen ? "search-recovery" : undefined}>Recovery</Button>}
@@ -297,7 +298,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
           </Panel>
           <Panel className={styles.camera} aria-labelledby="robot-title">
             <header><h2 id="robot-title"><Video aria-hidden="true" />Robot camera</h2>
-              <StatusBadge tone={robotLive ? "success" : "warning"}>{robotLive ? "Live sample" : "Not live"}</StatusBadge></header>
+              <StatusBadge tone={robotLive ? "success" : "warning"}>{robotLive ? deviceMode ? "Live" : "Live sample" : "Not live"}</StatusBadge></header>
             <div ref={robot} className={styles.surface} />
             <p>{matchingLabel} · {snapshot.pending_candidate ? "Candidate awaiting review" : "No candidate awaiting review"}</p>
           </Panel>

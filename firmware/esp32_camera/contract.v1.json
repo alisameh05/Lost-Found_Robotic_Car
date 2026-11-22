@@ -1,0 +1,28 @@
+{
+  "version": 1,
+  "transport": "HTTP/1.1 over the selected protected local Wi-Fi network",
+  "method": "GET",
+  "success_status": 200,
+  "request_header_limit_bytes": 512,
+  "response_header_limit_bytes": 4096,
+  "device_jpeg_limit_bytes": 65536,
+  "selected_width": 320,
+  "selected_height": 240,
+  "clock_units": "integer microseconds since boot",
+  "max_wire_integer": 9007199254740991,
+  "max_retired_epochs": 128,
+  "maximum_relative_clock_drift_ppm": 1000,
+  "clock": {
+    "path": "/laf/camera/v1/clock",
+    "request_headers": ["X-LAF-Request", "X-LAF-Epoch"],
+    "response_header": "X-LAF-Clock",
+    "response_fields": ["version", "request", "requested_epoch", "build_id", "boot_epoch", "stream_epoch", "rx_us", "tx_us"],
+    "content_length": 0
+  },
+  "frame": {
+    "path": "/laf/camera/v1/frame",
+    "response_header": "X-LAF-Frame",
+    "response_fields": ["version", "build_id", "boot_epoch", "stream_epoch", "sequence", "capture_us", "width", "height"],
+    "content_type": "image/jpeg"
+  }
+}

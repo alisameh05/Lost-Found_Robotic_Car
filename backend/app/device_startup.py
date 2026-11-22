@@ -12,6 +12,8 @@ from typing import Annotated, Literal, NoReturn, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
+from .camera_link import TOKEN as CAMERA_TOKEN
+from .camera_link import VERSION as CAMERA_VERSION
 from .controller import serial_key
 from .simulation import IncompatibleProfile, QualificationProfile
 from .uno_wire import DISCARD_PARTIAL, MAX_FRAME, REQUEST_FRAME, VERSION
@@ -96,6 +98,7 @@ class CameraInterface(Interface):
     address: Annotated[str, StringConstraints(pattern=r"^[0-9.]{7,15}$")]
     port: Annotated[int, Field(ge=1, le=65535)]
     esp32_cam: Build
+    build_artifact_sha256: Digest | None = None
 
     @model_validator(mode="after")
     def protected_address(self) -> Self:
@@ -103,6 +106,19 @@ class CameraInterface(Interface):
         if not any(address in network for network in RFC1918):
             raise ValueError("The selected camera address must be on a private IPv4 network.")
         return self
+
+
+class CameraBuild(Build):
+    version: Literal[1]
+    variant: Name
+    build_id: Annotated[str, StringConstraints(pattern=r"^[a-f0-9]{32}$")]
+
+
+@dataclass(frozen=True, repr=False)
+class SelectedCamera:
+    interface: CameraInterface
+    build_id: str
+    token: str
 
 
 class ProximityInterface(Interface):
@@ -187,6 +203,7 @@ class DeviceStartup:
     webcam_identity: str | None = None
     controller_identity: str | None = None
     command: SelectedCommand | None = None
+    camera: SelectedCamera | None = None
 
 
 def read_local_file(root: Path, path: Path) -> bytes:
@@ -339,6 +356,23 @@ def command_selection(root: Path, profile: QualificationProfile, selection: Comm
     return SelectedCommand(selection, bytes.fromhex(build.build_id))
 
 
+def camera_selection(root: Path, selection: CameraInterface, network: str | None) -> SelectedCamera:
+    reference = selection.build_artifact_sha256
+    if reference is None or network is None:
+        raise ValueError("The selected camera build and protected network are required")
+    if selection.protocol_version != CAMERA_VERSION:
+        raise IncompatibleProfile("Unsupported ESP32-CAM protocol")
+    build = CameraBuild.model_validate(decode(read_artifact(root, reference)))
+    verify_artifacts(root, {selection.contract_sha256, network})
+    if (build.variant != selection.variant or selection.esp32_cam.model_dump()
+            != build.model_dump(include=set(Build.model_fields))):
+        raise ValueError("The ESP32-CAM build does not match the measured selection")
+    token = read_local_file(root, Path("device", "camera.token")).decode("ascii").rstrip("\r\n")
+    if not CAMERA_TOKEN.fullmatch(token):
+        raise ValueError("The selected camera credential is invalid")
+    return SelectedCamera(selection, build.build_id, token)
+
+
 def local_identity(root: Path, value: object, windows: str | None, *, controller: bool = False) -> str | None:
     if windows is None:
         return None
@@ -380,12 +414,16 @@ def load_device_startup(root: Path, probes: Mapping[RobotPath, DeviceProbe]) -> 
     network = artifact_digest(interfaces.protected_network_sha256)
     causes: dict[str, Cause] = {}
     command = None
+    camera = None
     for name, model, selection in selections:
         try:
             selected = model.model_validate(selection)
             if isinstance(selected, CommandInterface) and selected.build_artifact_sha256 is not None:
                 command = command_selection(root, profile, selected)
                 # A selected build still needs a current correlated acknowledgment.
+                causes[name] = "NOT_READY"
+            elif isinstance(selected, CameraInterface) and selected.build_artifact_sha256 is not None:
+                camera = camera_selection(root, selected, network)
                 causes[name] = "NOT_READY"
             else:
                 causes[name] = endpoint_cause(root, profile, selected, probes.get(name), network)
@@ -396,4 +434,4 @@ def load_device_startup(root: Path, probes: Mapping[RobotPath, DeviceProbe]) -> 
     return DeviceStartup(profile, causes=MappingProxyType(causes),
                          webcam_identity=local_identity(root, interfaces.webcam, windows),
                          controller_identity=local_identity(root, interfaces.controller, windows, controller=True),
-                         command=command)
+                         command=command, camera=camera)
