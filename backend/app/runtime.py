@@ -539,6 +539,12 @@ class RecordsRuntime:
             operation.payload() for operation in self._terminal.values()
         ]
 
+    def begin_shutdown(self) -> int:
+        if not self._stopping and self.realtime:
+            self.realtime.stop()
+        self._stopping = True
+        return len(self.preparing())
+
     async def stop(self) -> None:
         self._stopping = True
         self._stop_retention.set()

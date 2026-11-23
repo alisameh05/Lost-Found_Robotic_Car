@@ -109,6 +109,7 @@ def create_app(
     on_control_revoked: Callable[[Revocation], None] = _ignore_revocation, webcam: Webcam | None = None,
     controller: Controller | None = None, device_probes: Mapping[RobotPath, DeviceProbe] | None = None,
     command_transport: OpenTransport | None = None, camera_exchange: Exchange | None = None,
+    capability: str | None = None,
 ) -> FastAPI:
     unavailable_code = "NOT_READY"
     device = None
@@ -135,6 +136,8 @@ def create_app(
             # Device acquisition and observation age use a shared high-resolution host clock.
             clock = perf_counter if device and (device.camera or device.proximity_minimum is not None) else monotonic
             runtime = RecordsRuntime(storage or RecordsStorage(config.data_root, monotonic=clock))
+            if capability is not None:
+                runtime.capability = capability
             app.state.runtime = runtime
             command = None
             if device and device.command and profile:
@@ -208,26 +211,34 @@ def create_app(
             finally:
                 # Keep ownership until startup and admitted registrations have finished.
                 try:
-                    realtime.stop()
+                    runtime.begin_shutdown()
                     for task in tasks:
                         task.cancel()
                     await asyncio.gather(*tasks, return_exceptions=True)
-                    if command:
-                        await asyncio.to_thread(command.close)
-                    if realtime.webcam:
-                        await asyncio.to_thread(realtime.webcam.close)
-                    if realtime.controller:
-                        await asyncio.to_thread(realtime.controller.close)
-                    await startup
-                    await runtime.stop()
+                    close_results = await asyncio.gather(
+                        *(asyncio.to_thread(adapter.close)
+                          for adapter in (command, realtime.webcam, realtime.controller) if adapter is not None),
+                        return_exceptions=True,
+                    )
+                    for result in close_results:
+                        if isinstance(result, BaseException):
+                            raise result
                 finally:
-                    await asyncio.to_thread(runtime.storage.close)
+                    try:
+                        await startup
+                    finally:
+                        try:
+                            await runtime.stop()
+                        finally:
+                            await asyncio.to_thread(runtime.storage.close)
+        app.state.shutdown_complete = True
 
     app = FastAPI(
         lifespan=lifespan, docs_url=None, redoc_url=None, openapi_url=None, redirect_slashes=False,
     )
 
     app.state.socket_message_limit = profile.bound("max_client_message_bytes") if profile else 4096
+    app.state.shutdown_complete = False
 
     @app.middleware("http")
     async def protect(request: Request, next_route: Callable[[Request], Awaitable[Response]]) -> Response:
