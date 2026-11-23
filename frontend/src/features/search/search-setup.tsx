@@ -111,7 +111,16 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   if (!notice && integrated && blockedPaths.some(({ component }) => component === "RobotVideo")) {
     notice = pathCheck("RobotVideo", true);
   }
-  if (!notice && blockedPaths.length) notice = blockedPaths.map(({ component }) => devicePaths[component].label).join(", ") + " must report Ready.";
+  if (!notice && blockedPaths.length) {
+    const selected = required.selected;
+    const webcam = selected?.component === "Webcam";
+    const usesLocalInput = webcam ? localGestures : localController;
+    const missing = blockedPaths.map(({ component }) => devicePaths[component].label).join(", ");
+    const nextStep = selected && selected.status !== "Ready" && profile?.evidence_kind === "Fixture" && !usesLocalInput
+      ? "Restore the simulated " + (webcam ? "webcam" : "controller") + " input."
+      : "Open Devices for troubleshooting.";
+    notice = missing + " must report Ready. " + nextStep;
+  }
   if (!notice && workspace?.eventsLive && !previewLive) notice = "Wait for a fresh robot frame.";
 
   return <>

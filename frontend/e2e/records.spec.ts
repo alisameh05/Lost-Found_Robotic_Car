@@ -29,10 +29,11 @@ async function startBackend(options: {
   device?: boolean;
   cameraReplay?: boolean;
   proximityReplay?: string;
+  controlTrace?: string;
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.cameraReplay ? ["backend.tests.camera_preview_replay"]
-    : options.proximityReplay ? ["backend.tests.proximity_replay", options.proximityReplay]
+    : options.proximityReplay ? ["backend.tests.proximity_replay", options.proximityReplay, ...(options.controlTrace ? [options.controlTrace] : [])]
     : options.phase06 && options.phase06 !== "production" ? ["backend.tests.phase06_replay", parent, options.phase06]
     : options.controllerSamples ? ["backend.tests.crash_registration", "controller", options.controllerSamples]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
@@ -148,6 +149,238 @@ test("shows Uno proximity advice in the protected live workspace without changin
   await expect(feedback).toContainText("Motion permission · Armed");
   await expect(page.getByText("Committed session · Searching", { exact: true })).toBeVisible();
 });
+
+type SearchControlReplay = {
+  fingers: number | null;
+  hands: number;
+  certain: boolean;
+  stable: boolean;
+  pad: string[];
+  circle: boolean;
+  gestureAvailable: boolean;
+  padAvailable: boolean;
+  holdPause: boolean;
+};
+
+for (const mode of ["Gestures", "PS4 controller"] as const) {
+  test("qualifies protected " + mode + " control and recovery", { tag: "@search-control-qualification" }, async ({ page, browser }, info) => {
+    test.setTimeout(70_000);
+    page.setDefaultTimeout(8_000);
+    const gestures = mode === "Gestures";
+    const scenario = join(parent, "search-control.jsonl");
+    const trace = join(parent, "search-control-trace.jsonl");
+    let replay: SearchControlReplay = {
+      fingers: 1, hands: 1, certain: true, stable: true,
+      pad: ["forward"], circle: false, gestureAvailable: !gestures, padAvailable: gestures, holdPause: false,
+    };
+    function send(update: Partial<SearchControlReplay>) {
+      replay = { ...replay, ...update };
+      appendFileSync(scenario, JSON.stringify({ input: replay }) + "\n");
+    }
+    function commands() {
+      if (!existsSync(trace)) return [];
+      return readFileSync(trace, "utf8").split("\n").slice(0, -1)
+        .map((line) => JSON.parse(line) as { kind: string; direction?: number })
+        .filter(({ kind }) => kind === "drive" || kind === "stop");
+    }
+    const button = (name: string) => page.getByRole("button", { name, exact: true });
+    const feedback = page.getByRole("region", { name: gestures ? "Gesture feedback" : "Controller feedback" });
+    const activity = page.getByRole("region", { name: "Session activity" });
+    const recovery = page.getByRole("region", { name: "Recovery" });
+    const cause = (label: string) => recovery.getByRole("listitem").filter({ has: page.locator("strong").filter({ hasText: label }) });
+    const availability = (available: boolean) => gestures ? { gestureAvailable: available } : { padAvailable: available };
+    const requiredInput = gestures ? "Laptop webcam" : "PS4 DualShock 4";
+    const directions = ["forward", "backward", "left", "right"] as const;
+    let liveHeartbeats = 0;
+    page.on("websocket", (socket) => {
+      if (!socket.url().endsWith("/events")) return;
+      socket.on("framesent", ({ payload }) => {
+        if (typeof payload !== "string") return;
+        const heartbeat = JSON.parse(payload);
+        if (heartbeat.session_id && heartbeat.displayed_robot_frame) liveHeartbeats++;
+      });
+    });
+
+    async function expectHeldDisarmed() {
+      const before = commands().length;
+      const heartbeat = liveHeartbeats;
+      await expect.poll(() => liveHeartbeats - heartbeat).toBeGreaterThanOrEqual(3);
+      await expect(feedback).toContainText("Motion permission · Disarmed");
+      expect(commands().slice(before).filter(({ kind }) => kind === "drive")).toEqual([]);
+    }
+
+    function input(direction: number) {
+      send(gestures ? { fingers: direction, hands: 1, certain: true, stable: true }
+        : { pad: direction === 0 ? [] : [directions[direction - 1]], circle: false });
+    }
+    async function arm(direction: number) {
+      input(0);
+      await expect(feedback).toContainText("Motion permission · Arming");
+      const before = commands().length;
+      input(direction);
+      await expect(feedback).toContainText("Motion permission · Armed");
+      await expect.poll(() => commands().slice(before)).toContainEqual(expect.objectContaining({ kind: "drive", direction }));
+    }
+    async function stopWith(update: Partial<SearchControlReplay>) {
+      const before = commands().length;
+      send(update);
+      await expect.poll(() => commands().slice(before)).toContainEqual(expect.objectContaining({ kind: "stop" }));
+      await expect(feedback).not.toContainText("Motion permission · Armed");
+      await expect(activity).toContainText("Committed session · Searching");
+    }
+
+    send({});
+    try {
+      await startBackend({ proximityReplay: scenario, controlTrace: trace });
+      await loopbackOnly(page);
+      await seedLibrary([["control-target", "Search control target", "Lost", Date.now() - 1000]], ["control-target"]);
+      await page.goto("/objects/control-target");
+      await page.getByRole("link", { name: "Open Search Setup" }).click();
+      await page.getByRole("radio", { name: mode }).check();
+      const preview = page.getByRole("region", { name: "Simulated robot preview" });
+      await expect(preview).toContainText("Backend simulation · Disarmed");
+      await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
+      await expect(preview.locator("canvas")).toHaveAttribute("width", "480");
+      await expect(page.getByRole("listitem").filter({ hasText: requiredInput })).toContainText("Unavailable");
+      await expect(button("Start Search")).toBeDisabled();
+
+      await page.getByRole("link", { name: "View Devices" }).click();
+      await expect(page.getByText("From Search Setup", { exact: true })).toBeVisible();
+      await expect(page.getByText("Backend simulation", { exact: true })).toBeVisible();
+      await expect(page.getByRole("heading", { name: gestures ? "Required for Gestures" : "Required for Controller (PS4)" })).toBeVisible();
+      await page.getByRole("link", { name: "Return to Search Setup" }).click();
+      await page.getByRole("link", { name: "Open Control Guide" }).click();
+      await expect(page.getByText("Backend simulation", { exact: true })).toBeVisible();
+      await expect(page.getByRole("heading", { name: gestures ? "Gesture directions and stop" : "PS4 controller", exact: true })).toBeVisible();
+      await page.getByRole("link", { name: "Return to Search Setup" }).click();
+      await expect(page.getByRole("radio", { name: mode })).toBeChecked();
+      await button("Acquire control").click();
+      await expect(button("Start Search")).toBeDisabled();
+      await expect(page.getByText(/restore the simulated (webcam|controller) input/i)).toBeVisible();
+      send(availability(true));
+      await button("Start Search").click();
+      await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
+      const live = page.url();
+      const target = page.getByRole("region", { name: "Active search target" });
+      const lockedMode = gestures ? "Gestures" : "PS4 DualShock 4";
+      await expect(target).toContainText(lockedMode + " · Target and mode locked");
+      await expect(feedback).toContainText("Motion permission · Disarmed");
+      await expectHeldDisarmed();
+      expect(commands().filter(({ kind }) => kind === "drive")).toEqual([]);
+
+      for (const [index, direction] of directions.entries()) {
+        await arm(index + 1);
+        await test.step("Release " + direction, async () => {
+          await stopWith(gestures ? { fingers: 0 } : { pad: [] });
+        });
+      }
+      if (gestures) {
+        for (const invalid of [{ fingers: null }, { hands: 2 }, { certain: false }, { fingers: 2, stable: false }]) {
+          await arm(1);
+          await stopWith(invalid);
+        }
+      } else {
+        await arm(1);
+        await stopWith({ pad: ["left", "right"] });
+      }
+
+      await arm(1);
+      const inactiveChanges = gestures ? [{ circle: true }, { padAvailable: false }] : [{ fingers: 4 }, { gestureAvailable: false }];
+      for (const change of inactiveChanges) {
+        const beforeInactive = commands().length;
+        send(change);
+        await expect.poll(() => commands().length - beforeInactive).toBeGreaterThanOrEqual(3);
+        expect(commands().slice(beforeInactive).every(({ kind, direction }) => kind === "drive" && direction === 1)).toBe(true);
+        await expect(feedback).toContainText("Motion permission · Armed");
+      }
+
+      await button("Pause").click();
+      await expect(activity).toContainText("Committed session · Paused");
+      await expect(page).toHaveURL(live);
+      await expect(target).toContainText(lockedMode + " · Target and mode locked");
+      await button("Resume").click();
+      await expect(activity).toContainText("Committed session · Searching");
+      await expectHeldDisarmed();
+
+      await arm(1);
+      const beforeLoss = commands().length;
+      send(availability(false));
+      await expect(activity).toContainText("Committed session · Paused");
+      await expect.poll(() => commands().slice(beforeLoss)).toContainEqual(expect.objectContaining({ kind: "stop" }));
+      const lost = cause("Selected input unavailable");
+      const acknowledgeLoss = lost.getByRole("button", { name: "Acknowledge" });
+      await expect(lost).toContainText("Awaiting restoration · Awaiting acknowledgment");
+      if (gestures) {
+        await button("Acquire control").click();
+        await expect(acknowledgeLoss).toBeEnabled();
+        await acknowledgeLoss.click();
+        await expect(lost).toContainText("Awaiting restoration · Acknowledged");
+        await expect(button("Resume")).toBeDisabled();
+        send(availability(true));
+      } else {
+        send(availability(true));
+        await expect(lost).toContainText("Restored · Awaiting acknowledgment");
+        await expect(button("Resume")).toBeDisabled();
+        await button("Acquire control").click();
+        await expect(acknowledgeLoss).toBeEnabled();
+        await acknowledgeLoss.click();
+      }
+      await expect(button("Resume")).toBeEnabled();
+      await expect(feedback).toContainText("Motion permission · Disarmed");
+      await button("Resume").click();
+      await expect(activity).toContainText("Committed session · Searching");
+      await expectHeldDisarmed();
+
+      await button("Stop Search").click();
+      await expect(page).toHaveURL(live.replace(/\/live$/, "/result"));
+      await expect(page.getByText("The object remains Lost.", { exact: true })).toBeVisible();
+
+      await page.getByRole("link", { name: "Search Again" }).click();
+      await expect(page.getByRole("radio", { name: mode })).toBeChecked();
+      await button("Acquire control").click();
+      await button("Start Search").click();
+      await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
+      expect(page.url()).not.toBe(live);
+      await arm(1);
+      await button("Control Help").click();
+      await expect(page.getByRole("region", { name: "Control Help" })).toBeVisible();
+      send({ holdPause: true });
+      const emergencyReply = page.waitForResponse((response) => response.url() === backend + "/emergency-stop" &&
+        response.request().method() === "POST", { timeout: 10_000 });
+      const emergency = button("Emergency Stop");
+      await page.getByRole("link", { name: "Return to Active Search", exact: true }).focus();
+      await page.keyboard.press("Tab");
+      await expect(emergency).toBeFocused();
+      await expect(emergency).toBeInViewport();
+      const display = await page.evaluate(() => ({
+        dpr: devicePixelRatio, screen: [screen.width, screen.height], viewport: [innerWidth, innerHeight],
+        focus: document.hasFocus(), visibility: document.visibilityState,
+        outline: getComputedStyle(document.activeElement!).outlineStyle, browser: navigator.userAgent,
+      }));
+      expect(display).toMatchObject({ outline: "solid", focus: true, visibility: "visible" });
+      const displayEvidence = info.outputPath("windows-keyboard-and-scale.json");
+      writeFileSync(displayEvidence, JSON.stringify({ platform: process.platform, version: browser.version(), ...display }, null, 2));
+      await info.attach("windows-keyboard-and-scale", { path: displayEvidence, contentType: "application/json" });
+      const beforeEmergency = commands().length;
+      await page.keyboard.press("Space");
+      const pending = await emergencyReply;
+      expect(pending.status()).toBe(202);
+      expect(await pending.json()).toMatchObject({ permission_revoked: true, persistence: "Pending" });
+      await expect(page.getByText("Motion permission revoked", { exact: true })).toBeVisible();
+      await expect(feedback).toContainText("Motion permission · Disarmed");
+      await expect(target).toContainText("Paused");
+      await expect(activity).toContainText("Committed session · Searching");
+      await expect(activity).toContainText("Session save pending");
+      await expect.poll(() => commands().slice(beforeEmergency)).toContainEqual(expect.objectContaining({ kind: "stop" }));
+      send({ holdPause: false });
+      await expect(activity).toContainText("Committed session · Paused");
+      await expect(cause("Emergency Stop")).toContainText("Awaiting acknowledgment");
+      await expect(button("Resume")).toBeDisabled();
+    } finally {
+      if (existsSync(trace)) await info.attach("simulated-command-trace", { path: trace, contentType: "application/x-ndjson" });
+    }
+  });
+}
 
 async function setTargetCoordinates(page: Page, coordinates = ["10", "20", "30", "60"]) {
   for (const [index, label] of ["X", "Y", "Width", "Height"].entries()) {
