@@ -2,6 +2,8 @@
 
 Start the backend with `$env:LAF_BACKEND_MODE = 'device'` and `python -m backend.app`. Keep the frontend in `LAF_MODE=records`. Open Devices, or open Search Setup for a saved Lost target and select Gestures or Controller. The backend begins disarmed. Health, saved records, and Emergency Stop remain available while device requirements are missing. The existing `LAF_SIMULATION_PROFILE=phase-06-v1` selection continues to run the labeled [Phase 06 fixture](PHASE_06.md). For an explicit fixture launch, set `LAF_BACKEND_MODE=fixture` with that selection.
 
+Use the [Phase 07 integration handoff](PHASE_07_INTEGRATION.md) for the combined operator journey, failure cases, and connected evidence still required.
+
 ## T2 interface inventory
 
 The [pending interface manifest](device/interfaces.pending.json) records the open selections. Keep the filled-in bundle under `<LAF_DATA_ROOT>/device/`. Keep credentials in protected local configuration and use opaque, non-secret IDs for public profile names. Firmware builds, wire contracts, and connected evidence belong to the owning adapter work.
