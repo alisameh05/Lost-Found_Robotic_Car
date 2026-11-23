@@ -5,6 +5,7 @@ import hashlib
 import http.client
 import json
 import os
+import re
 import shutil
 import signal
 import socket
@@ -38,20 +39,44 @@ def check_port(port: int, service: str) -> None:
 
 
 def check_models(config: Config) -> None:
-    inventory = json.loads((ROOT / "experiments/vision/assets.json").read_text(encoding="utf-8"))
+    try:
+        inventory = json.loads((ROOT / "experiments/vision/assets.json").read_text(encoding="utf-8"))
+        if not isinstance(inventory, dict):
+            raise ValueError("Expected a model inventory.")
+    except (OSError, ValueError):
+        print("Model inventory is missing or invalid. Restore experiments/vision/assets.json from this release.")
+        return
     for name, directory, variable in (
         ("yoloe-26s-seg.pt", config.yoloe_assets, "LAF_YOLOE_ASSETS"),
         ("hand_landmarker.task", config.gesture_assets, "LAF_GESTURE_ASSETS"),
     ):
+        entry = inventory.get(name)
+        if not isinstance(entry, dict) or not isinstance(entry.get("sha256"), str):
+            print(f"Model inventory entry is missing or invalid: {name}. Restore the release asset inventory.")
+            continue
         valid = False
         if directory is not None:
             try:
                 with (directory / name).open("rb") as stream:
-                    valid = hashlib.file_digest(stream, "sha256").hexdigest() == inventory[name]["sha256"]
+                    valid = hashlib.file_digest(stream, "sha256").hexdigest() == entry["sha256"]
             except OSError:
                 pass
         if not valid:
             print(f"Model missing, unreadable, or invalid: {name}. Run the asset setup or correct {variable}.")
+
+
+def installed_node() -> str:
+    node = shutil.which("node.exe")
+    if not node:
+        raise LaunchError("Node.js runtime is missing. Install the release's Node.js runtime and add it to PATH.")
+    try:
+        version = subprocess.check_output([node, "--version"], text=True, timeout=5).strip()
+    except (OSError, subprocess.SubprocessError) as exc:
+        raise LaunchError("Node.js did not report its version. Check the Node.js installation on PATH.") from exc
+    supported = re.fullmatch(r"v24\.(\d+)\.\d+", version)
+    if not supported or int(supported[1]) < 19:
+        raise LaunchError(f"Unsupported Node.js {version}. Install Node.js 24.19.0 or newer in the 24.x line.")
+    return node
 
 
 def request(port: int, route: str, capability: str | None = None) -> tuple[int, dict[str, Any]]:
@@ -84,13 +109,17 @@ def wait_for_startup(
     deadline = monotonic() + STARTUP_SECONDS
     frontend_ready = False
     backend_ready = False
-    browser_offered = False
     while not stop.is_set() and monotonic() < deadline:
         check_process(backend, "Backend")
         check_process(frontend, "Frontend")
         if not frontend_ready and request(config.frontend_port, "/")[0] == 200:
             frontend_ready = True
             print(f"Frontend available at {config.origin}")
+            if open_browser:
+                try:
+                    os.startfile(config.origin)
+                except OSError:
+                    print(f"Could not open the default browser. Open {config.origin} manually.")
         status, health = request(config.backend_port, "/api/v1/health", capability)
         if not backend_ready and status in (200, 503) and health.get("backend_boot_id"):
             backend_ready = True
@@ -101,13 +130,6 @@ def wait_for_startup(
             _, detail = request(config.backend_port, "/api/v1/settings", capability)
             problem = detail.get("message", "Check local storage permissions and the saved database.")
             raise LaunchError(f"Records storage is unavailable. {problem}")
-        if frontend_ready and backend_ready and not browser_offered:
-            browser_offered = True
-            if open_browser:
-                try:
-                    os.startfile(config.origin)
-                except OSError:
-                    print(f"Could not open the default browser. Open {config.origin} manually.")
         if frontend_ready and status == 200 and health.get("storage_integrity") == "Healthy":
             print("Records storage ready.")
             if config.backend_mode == "device":
@@ -143,15 +165,15 @@ def launch(*, open_browser: bool) -> int:
     for name in ("LAF_YOLOE_ASSETS", "LAF_GESTURE_ASSETS"):
         os.environ.setdefault(name, str(ROOT / ".local-runtime/assets"))
     config = Config.from_environment()
-    node = shutil.which("node.exe")
-    if not node:
-        raise LaunchError("Node.js runtime is missing. Install the release's Node.js runtime and add it to PATH.")
+    node = installed_node()
     next_bin = FRONTEND / "node_modules/next/dist/bin/next"
-    if not next_bin.is_file() or not (FRONTEND / ".next/BUILD_ID").is_file():
+    frontend_guard = FRONTEND / "scripts/exit-with-launcher.mjs"
+    if not all(path.is_file() for path in (next_bin, FRONTEND / ".next/BUILD_ID", frontend_guard)):
         raise LaunchError("Next.js dependencies or the production build are missing. Run the frontend setup and build.")
     check_port(config.frontend_port, "Frontend")
     check_port(config.backend_port, "Backend")
     check_models(config)
+    print(f"Lost & Found launcher (PID {os.getpid()})")
 
     stop = Event()
     signal.signal(signal.SIGINT, lambda *_: stop.set())
@@ -174,10 +196,12 @@ def launch(*, open_browser: bool) -> int:
         creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
     )
     frontend = None
+    clean_exit = False
     try:
         frontend = subprocess.Popen(
-            [node, str(next_bin), "start", "--hostname", LOOPBACK, "--port", str(config.frontend_port)],
-            cwd=FRONTEND, stdin=subprocess.DEVNULL, env=environment, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+            [node, "--import", frontend_guard.as_uri(), str(next_bin), "start",
+             "--hostname", LOOPBACK, "--port", str(config.frontend_port)],
+            cwd=FRONTEND, stdin=subprocess.PIPE, env=environment, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
         )
         wait_for_startup(frontend, backend, config, capability, stop, open_browser)
         while not stop.wait(0.25):
@@ -193,9 +217,9 @@ def launch(*, open_browser: bool) -> int:
             if not clean_exit:
                 print("Backend shutdown was incomplete. Check History or retry any unconfirmed saves after restart.")
         finally:
-            if frontend is not None and frontend.poll() is None:
-                frontend.terminate()
-                finish_process(frontend, "Frontend", 3)
+            if frontend is not None and frontend.stdin is not None:
+                frontend.stdin.close()
+                clean_exit = finish_process(frontend, "Frontend", 3) and clean_exit
     return 0 if clean_exit else 1
 
 

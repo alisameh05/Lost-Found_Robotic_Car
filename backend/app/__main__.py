@@ -2,6 +2,7 @@ import argparse
 import os
 import socket
 import sys
+from collections.abc import Sequence
 from threading import Event, Thread
 
 import uvicorn
@@ -46,10 +47,10 @@ def watch_launcher(stop: Event) -> None:
         stop.set()
 
 
-def main() -> int:
+def main(argv: Sequence[str] = ()) -> int:
     parser = argparse.ArgumentParser()
     parser.add_argument("--supervised", action="store_true", help=argparse.SUPPRESS)
-    args = parser.parse_args()
+    args = parser.parse_args(argv)
     try:
         stop = None
         capability = None
@@ -71,7 +72,8 @@ def main() -> int:
                       file=sys.stderr)
                 return 1
             with own_data_root(config.data_root):
-                app = create_app(config, held_owner=True, capability=capability)
+                app = (create_app(config, held_owner=True, capability=capability) if capability
+                       else create_app(config, held_owner=True))
                 server = RecordsServer(uvicorn.Config(
                     app, host=LOOPBACK, port=config.backend_port,
                     workers=1, reload=False, proxy_headers=False, access_log=False, http="httptools", ws="websockets",
@@ -79,11 +81,11 @@ def main() -> int:
                     log_level="warning", timeout_graceful_shutdown=5 if stop else None,
                 ), stop)
                 server.run(sockets=[listener])
-                return 0 if server.started else 1
+                return 0 if server.started and app.state.shutdown_complete else 1
     except (ValueError, OwnerUnavailable) as exc:
         print(str(exc), file=sys.stderr)
         return 1
 
 
 if __name__ == "__main__":
-    raise SystemExit(main())
+    raise SystemExit(main(sys.argv[1:]))

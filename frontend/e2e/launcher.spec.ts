@@ -1,4 +1,4 @@
-import { expect, test } from "@playwright/test";
+import { expect, test, type Page } from "@playwright/test";
 import { spawn } from "node:child_process";
 import { existsSync } from "node:fs";
 import { mkdir, mkdtemp, readFile, rm, writeFile } from "node:fs/promises";
@@ -25,7 +25,7 @@ function unusedPort(): Promise<number> {
   });
 }
 
-function start(parent: string, frontend: number, backend: number) {
+function start(parent: string, frontend: number, backend: number, mode?: "fixture") {
   const env = { ...process.env };
   for (const key of Object.keys(env)) {
     if (key.startsWith("LAF_")) delete env[key];
@@ -33,7 +33,7 @@ function start(parent: string, frontend: number, backend: number) {
   const child = spawn("pwsh", ["-NoProfile", "-File", join(repo, "launch.ps1"), "--no-browser"], {
     cwd: repo, windowsHide: true, env: {
       ...env, LOCALAPPDATA: parent, LAF_PYTHON: python, LAF_FRONTEND_PORT: String(frontend),
-      LAF_BACKEND_PORT: String(backend), LAF_MODE: "fixture", LAF_SIMULATION_PROFILE: "fixture-v1",
+      LAF_BACKEND_PORT: String(backend), LAF_MODE: "fixture", LAF_BACKEND_MODE: mode, LAF_SIMULATION_PROFILE: "fixture-v1",
       LAF_YOLOE_ASSETS: join(parent, "missing-models"), LAF_GESTURE_ASSETS: join(parent, "missing-models"),
     },
   });
@@ -56,6 +56,19 @@ function start(parent: string, frontend: number, backend: number) {
       return finished;
     },
   };
+}
+
+async function register(page: Page, origin: string, name: string) {
+  await page.goto(origin + "/objects/new");
+  await page.getByRole("textbox", { name: "Object name" }).fill(name);
+  await page.locator('input[type="file"]').setInputFiles(join(repo, "backend", "app", "preview_fixture", "robot.jpg"));
+  await expect(page.getByRole("img", { name: "Normalized reference preview" })).toBeVisible();
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  for (const [field, value] of Object.entries({ X: "10", Y: "20", Width: "30", Height: "40" })) {
+    await page.getByRole("textbox", { name: field + " · px", exact: true }).fill(value);
+  }
+  await page.getByRole("button", { name: "Register Object", exact: true }).click();
+  await expect(page.getByRole("heading", { name })).toBeVisible();
 }
 
 test("the installed Windows app registers and reopens a record through a disarmed restart", async ({ page }, info) => {
@@ -81,20 +94,12 @@ test("the installed Windows app registers and reopens a record through a disarme
     expect(launcher.log()).toContain("Device qualification is unavailable");
     const first = await boot();
     expect((await fetch(api + "/api/v1/health")).status).toBe(403);
+    expect((await fetch(api + "/api/v1/bootstrap", { headers: { Origin: api } })).status).toBe(403);
     await page.goto(origin + "/objects");
     await expect(page.getByRole("heading", { name: "No objects registered" })).toBeVisible();
     await page.getByRole("link", { name: "Devices", exact: true }).click();
     await expect(page.locator("summary").filter({ hasText: "Qualification profile" })).toContainText("Unavailable");
-    await page.goto(origin + "/objects/new");
-    await page.getByRole("textbox", { name: "Object name" }).fill("Launcher test wallet");
-    await page.locator('input[type="file"]').setInputFiles(join(repo, "backend", "app", "preview_fixture", "robot.jpg"));
-    await expect(page.getByRole("img", { name: "Normalized reference preview" })).toBeVisible();
-    await page.getByRole("button", { name: "Next", exact: true }).click();
-    for (const [name, value] of Object.entries({ X: "10", Y: "20", Width: "30", Height: "40" })) {
-      await page.getByRole("textbox", { name: name + " · px", exact: true }).fill(value);
-    }
-    await page.getByRole("button", { name: "Register Object", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Launcher test wallet" })).toBeVisible();
+    await register(page, origin, "Launcher test wallet");
     const saved = page.url();
 
     const duplicate = start(parent, secondFrontend, secondBackend);
@@ -123,6 +128,43 @@ test("the installed Windows app registers and reopens a record through a disarme
     await expect(page.getByRole("heading", { name: "Launcher test wallet" })).toBeVisible();
     await page.getByRole("link", { name: "Start Search", exact: true }).click();
     await expect(page.getByRole("button", { name: "Start Search", exact: true })).toBeDisabled();
+  } finally {
+    await launcher.stop();
+    await info.attach("launcher-output", { body: launcher.log(), contentType: "text/plain" });
+    await rm(parent, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("launcher shutdown disarms an active fixture and restart shows it as Interrupted", async ({ page }, info) => {
+  test.setTimeout(60_000);
+  const parent = await mkdtemp(join(tmpdir(), "laf-launcher-active-"));
+  const [frontend, backend] = await Promise.all([unusedPort(), unusedPort()]);
+  const origin = `http://127.0.0.1:${frontend}`;
+  const api = `http://127.0.0.1:${backend}`;
+  await page.context().route("**/*", (route) =>
+    [origin, api].includes(new URL(route.request().url()).origin) ? route.continue() : route.abort(),
+  );
+  let launcher = start(parent, frontend, backend, "fixture");
+  try {
+    await launcher.ready();
+    await register(page, origin, "Shutdown fixture");
+    await page.getByRole("link", { name: "Open Search Setup", exact: true }).click();
+    await page.getByRole("radio", { name: "PS4 controller" }).check();
+    await page.getByRole("button", { name: "Acquire control" }).click();
+    await page.getByRole("button", { name: "Start Search", exact: true }).click();
+    await expect(page).toHaveURL(/\/sessions\/[^/]+\/live$/);
+    await expect(page.getByText("Motion permission · Armed", { exact: true })).toBeVisible({ timeout: 15_000 });
+    const live = page.url();
+    expect(await launcher.stop()).toBe(0);
+    expect(launcher.log()).toContain("Motion permission revoked. Pending saves at shutdown: 1.");
+
+    launcher = start(parent, frontend, backend, "fixture");
+    await launcher.ready();
+    await page.goto(live);
+    await expect(page.getByText("Search has ended", { exact: true })).toBeVisible();
+    await page.getByRole("link", { name: "View Search Result" }).click();
+    await expect(page.getByText("Interrupted", { exact: true })).toBeVisible();
+    await expect(page.getByText("The object remains Lost.", { exact: true })).toBeVisible();
   } finally {
     await launcher.stop();
     await info.attach("launcher-output", { body: launcher.log(), contentType: "text/plain" });
@@ -163,6 +205,26 @@ test("failed storage initialization preserves the incompatible database and clos
     expect(launcher.log()).toContain("Backend available. Checking records storage.");
     expect(launcher.log()).toContain("Records storage is unavailable.");
     expect(await readFile(database, "utf8")).toBe(contents);
+    await expect(fetch(`http://127.0.0.1:${frontend}/`)).rejects.toThrow();
+    await expect(fetch(`http://127.0.0.1:${backend}/`)).rejects.toThrow();
+  } finally {
+    await launcher.stop();
+    await info.attach("launcher-output", { body: launcher.log(), contentType: "text/plain" });
+    await rm(parent, { recursive: true, force: true, maxRetries: 3 });
+  }
+});
+
+test("both services exit when the launcher process is lost", async ({}, info) => {
+  const parent = await mkdtemp(join(tmpdir(), "laf-launcher-lost-"));
+  const [frontend, backend] = await Promise.all([unusedPort(), unusedPort()]);
+  const launcher = start(parent, frontend, backend);
+  try {
+    await launcher.ready();
+    const pid = launcher.log().match(/Lost & Found launcher \(PID (\d+)\)/)?.[1];
+    expect(pid).toBeDefined();
+    process.kill(Number(pid));
+    expect(await launcher.finished).not.toBe(0);
+    expect(launcher.log()).toContain("Motion permission revoked.");
     await expect(fetch(`http://127.0.0.1:${frontend}/`)).rejects.toThrow();
     await expect(fetch(`http://127.0.0.1:${backend}/`)).rejects.toThrow();
   } finally {
