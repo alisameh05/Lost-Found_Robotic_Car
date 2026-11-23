@@ -25,11 +25,11 @@ import uvicorn
 from fastapi.testclient import TestClient
 from PIL import Image
 
-from backend.app import main as app_entry
 from backend.app import realtime
 from backend.app.camera_link import CLOCK, Reply
 from backend.app.config import Config
 from backend.app.controller import Controller
+from backend.app.device_startup import load_device_startup
 from backend.app.main import create_app
 from backend.app.motion import DIRECTIONS
 from backend.app.proximity_wire import AdvisoryPacket, decode_advisory
@@ -50,6 +50,7 @@ from backend.app.uno_wire import (
     decode,
     encode,
 )
+from backend.app.webcam import Webcam
 from backend.tests.device_documents import device_documents, write_camera_documents, write_device_documents
 from backend.tests.proximity_replay import BUILD as ADVISORY_BUILD
 from backend.tests.proximity_replay import ReplayUno
@@ -74,6 +75,7 @@ from backend.tests.test_realtime import (
     wait_for,
 )
 from backend.tests.test_records import BASE, ORIGIN
+from backend.tests.test_webcam import WebcamReplay
 from backend.tests.vision_stub import controlled_worker, publish
 
 BUILD = b"\x90" + bytes(31)
@@ -584,47 +586,33 @@ def test_device_proximity_is_calibrated_independently_of_command(tmp_path: Path,
             assert after["readiness"] == view["readiness"]
 
 
-def test_selected_camera_shares_the_detection_frame_with_display_and_evidence(
-    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+@pytest.mark.parametrize("mode", ["Controller", "Gestures"])
+def test_device_search_drives_and_reviews_the_displayed_camera_acquisition(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch, uno_peer_exe: Path, mode: str,
 ) -> None:
     monkeypatch.setattr(realtime, "VisionProcess", partial(realtime.VisionProcess, target=controlled_worker))
 
-    class DisabledCommandPeer:
-        cause = latched_failure = output = None
-        failure = "CommandUnavailable"
-
-        def start(self):
-            pass
-
-        def close(self):
-            pass
-
-        def probe(self):
-            return True
-
-        def revoke(self, generation, cause):
-            pass
-
-        def pulse(self, generation, direction, deadline):
-            pytest.fail("The camera and evidence check must leave motion disabled")
-
-    monkeypatch.setattr(app_entry, "SerialCommandLink", lambda *args, **kwargs: DisabledCommandPeer())
     documents = device_documents()
     profile, interfaces, evidence, result = documents
-    initialize_command_selection(profile, interfaces, evidence, "matched")
+    initialize_command_selection(profile, interfaces, evidence, "matched_ble")
     # Leave scheduling room for real sockets and the subprocess. These are synthetic test bounds.
     for name, value in {"clock_uncertainty_limit_us": 10_000, "camera_sync_max_rtt_us": 20_000,
                         "heartbeat_deadline_ms": 170, "display_deadline_ms": 180,
-                        "capture_age_limit_ms": 200, "input_sample_deadline_ms": 160}.items():
+                        "capture_age_limit_ms": 200, "input_sample_deadline_ms": 160,
+                        "command_ack_deadline_ms": 48, "challenge_lifetime_ms": 105, "firmware_expiry_ms": 150}.items():
         profile[name] = evidence["measurements"][name]["value"] = value
     evidence["stop_budget"] = {"software_ms": 460, "mechanical_margin_ms": 40}
     command = interfaces["hc05_uno"]
-    build = selected_command_build(profile, command, "matched")
+    build = selected_command_build(profile, command, "matched_ble")
     digest = command["build_artifact_sha256"] = sha256(build).hexdigest()
     interfaces["controller"] = {"identity": SERIAL, "profile_sha256": sha256(result).hexdigest()}
+    interfaces["webcam"] = {"identity": "synthetic-directshow", "profile_sha256": sha256(result).hexdigest()}
     folder = write_camera_documents(tmp_path, CAMERA_BUILD, CAMERA_TOKEN, documents=documents)
     (folder / "artifacts" / digest).write_bytes(build)
+    qualification = load_device_startup(tmp_path, {}).profile
+    assert qualification is not None
     jpeg = jpeg_sample()
+    camera_jpeg = jpeg
     sequence = 0
 
     async def camera(path, headers, read_body, timeout):
@@ -632,42 +620,138 @@ def test_selected_camera_shares_the_detection_frame_with_display_and_evidence(
         if path == CLOCK:
             stamp = int(perf_counter() * 1_000_000)
             fields = clock_headers(headers, rx=stamp, tx=stamp)
+            payload = b""
         else:
-            await asyncio.sleep(0.02)
+            await asyncio.sleep(0.045)
             sequence += 1
-            fields = frame_headers(len(jpeg), sequence, int(perf_counter() * 1_000_000))
+            payload = camera_jpeg
+            fields = frame_headers(len(payload), sequence, int(perf_counter() * 1_000_000))
         size = read_body(200, fields, 256)
-        return Reply(jpeg if size else b"", perf_counter(), utc_ms())
+        return Reply(payload if size else b"", perf_counter(), utc_ms())
 
-    def app_factory(port):
-        controller = Controller(SERIAL, 0.16, lambda: nullcontext(lambda: fresh_reports([device(1)])),
-                                clock=perf_counter)
-        return create_app(Config(tmp_path, backend_port=port, backend_mode="device", yoloe_assets=tmp_path),
-                          controller=controller, camera_exchange=camera)
+    # Start with both inputs held. Keep the unselected input held throughout the search.
+    buttons = (13,) if mode == "Gestures" else (11,)
+    replay = WebcamReplay()
+    replay.pose(1 if mode == "Gestures" else 15)
 
-    with service(tmp_path, app_factory=app_factory) as laf, driving_search(laf) as (headers, driver):
-        worker = tmp_path / "vision"
-        await_file(worker / "prompt.json")
-        publish(worker / "request", "candidate")
-        try:
-            await_file(worker / "frame.json")
-            frame = json.loads((worker / "frame.json").read_text(encoding="utf-8"))
+    def select_direction(direction: int) -> None:
+        nonlocal buttons
+        if mode == "Gestures":
+            replay.pose((0, 1, 3, 7, 15)[direction])
+        else:
+            buttons = ((), (11,), (12,), (13,), (14,))[direction]
+
+    with native_peer(uno_peer_exe, challenge=qualification.bound("challenge_lifetime_ms"),
+                     expiry=qualification.bound("firmware_expiry_ms")) as peer:
+        def app_factory(port):
+            controller = Controller(
+                SERIAL, qualification.bound("input_sample_deadline_ms") / 1000,
+                lambda: nullcontext(lambda: fresh_reports([device(1, *buttons)])), clock=perf_counter,
+            )
+            webcam = Webcam(qualification, replay.camera, replay.recognizer, replay.encode, perf_counter)
+            return create_app(Config(tmp_path, backend_port=port, backend_mode="device", yoloe_assets=tmp_path),
+                              controller=controller, webcam=webcam, command_transport=peer.open, camera_exchange=camera)
+
+        def hold_after_neutral(laf, headers, direction):
+            select_direction(0)
             wait_for(laf.http, "/snapshot", headers,
-                     lambda _: driver.latest and driver.latest["capture_seq"] > frame["sequence"])
-        finally:
-            (worker / "release").touch()
-        match, _ = review(laf, headers)
-        display = next(item for item in tuple(driver.received_frames) if item["frame_id"] == match["frame_id"])
-        assert (match["frame_id"], match["stream_epoch"]) == (frame["frame"], frame["stream"])
-        assert (display["capture_seq"], display["source_capture_us"], display["source_clock_epoch"]) == (
-            frame["sequence"], frame["source_us"], frame["clock"],
-        )
-        assert match["captured_at_ms"] == display["received_at_ms"] - display["capture_age_bound_ms"]
-        assert match["box"] == {"x": 2, "y": 3, "width": 5, "height": 7}
-        response = laf.http.get(f"{API}/media/{match['evidence_media']['id']}", headers=headers)
-        assert response.status_code == 200 and response.headers["content-type"] == "image/png"
-        with Image.open(BytesIO(jpeg)) as original, Image.open(BytesIO(response.content)) as captured:
-            assert original.convert("RGB").tobytes() == captured.tobytes()
+                     lambda s: s["runtime"]["motion_permission"] == "Arming")
+            select_direction(direction)
+            wait_until(lambda: peer.output == direction)
+
+        def assert_held_input_stays_disarmed(laf, headers, driver):
+            # Several fresh frame acknowledgments allow either input adapter to settle.
+            after = sequence + 5
+            snapshot = wait_for(laf.http, "/snapshot", headers,
+                                lambda _: driver.latest and driver.latest["capture_seq"] > after)
+            assert snapshot["runtime"]["motion_permission"] == "Disarmed"
+            assert peer.output == 0
+
+        with service(tmp_path, app_factory=app_factory) as laf:
+            with driving_search(laf, mode) as (headers, driver):
+                assert_held_input_stays_disarmed(laf, headers, driver)
+                assert not any(direction for _, direction in peer.outputs)
+                for direction in range(1, 5):
+                    hold_after_neutral(laf, headers, direction)
+                    select_direction(0)
+                    wait_until(lambda: peer.output == 0)
+                    active = wait_for(laf.http, "/snapshot", headers)["active_session"]
+                    assert active["state"] == "Searching" and active["pause_causes"] == []
+                assert [output for _, output in peer.outputs if output] == [1, 2, 3, 4]
+
+                hold_after_neutral(laf, headers, 1)
+                driver.freeze = True
+                failed = wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Paused")
+                paused = failed["active_session"]
+                failure = next(entry for entry in failed["failures"] if entry["cause"] == "DisplayStale")
+                assert component(failed, "RobotVideo")["status"] == "Ready"
+                assert driver.latest is not None
+                assert driver.received_frames[-1]["capture_seq"] > driver.latest["capture_seq"]
+                assert failed["runtime"]["motion_permission"] == "Disarmed"
+                wait_until(lambda: peer.output == 0)
+
+            with recover_workspace(laf, paused) as (headers, driver):
+                restored = wait_for(laf.http, "/snapshot", headers, lambda s: any(
+                    entry["failure_id"] == failure["failure_id"] and entry["restored"] for entry in s["failures"]
+                ))
+                assert peer.output == 0
+                revision = restored["active_session"]["revision"]
+                blocked = search_action(laf, headers, driver, "resume", revision)
+                assert blocked.json()["code"] == "RECOVERY_REQUIRED"
+                acknowledged = search_action(laf, headers, driver, "acknowledge", revision,
+                                              failure_ids=[failure["failure_id"]])
+                assert acknowledged.is_success, acknowledged.text
+                ready = wait_for(laf.http, "/snapshot", headers, lambda s: s["readiness"]["can_resume"])
+                resumed = search_action(laf, headers, driver, "resume", ready["active_session"]["revision"])
+                assert resumed.is_success, resumed.text
+                wait_for(laf.http, "/snapshot", headers, lambda s: s["active_session"]["state"] == "Searching")
+                assert_held_input_stays_disarmed(laf, headers, driver)
+                assert [output for _, output in peer.outputs if output] == [1, 2, 3, 4, 1]
+                hold_after_neutral(laf, headers, 1)
+
+                worker = tmp_path / "vision"
+                await_file(worker / "prompt.json")
+                publish(worker / "request", "candidate")
+                try:
+                    await_file(worker / "frame.json")
+                    frame = json.loads((worker / "frame.json").read_text(encoding="utf-8"))
+                    replacement = BytesIO()
+                    Image.new("RGB", (320, 240), "orange").save(replacement, "JPEG")
+                    camera_jpeg = replacement.getvalue()
+                    replaced_after = sequence
+                    wait_for(laf.http, "/snapshot", headers,
+                             lambda _: driver.latest and driver.latest["capture_seq"] > replaced_after)
+                    assert peer.output == 1
+                finally:
+                    (worker / "release").touch()
+                match, session = review(laf, headers)
+                wait_until(lambda: peer.output == 0)
+                display = next(item for item in tuple(driver.received_frames) if item["frame_id"] == match["frame_id"])
+                assert (match["frame_id"], match["stream_epoch"]) == (frame["frame"], frame["stream"])
+                assert (display["capture_seq"], display["source_capture_us"], display["source_clock_epoch"]) == (
+                    frame["sequence"], frame["source_us"], frame["clock"],
+                )
+                assert match["captured_at_ms"] == display["received_at_ms"] - display["capture_age_bound_ms"]
+                assert match["box"] == {"x": 2, "y": 3, "width": 5, "height": 7}
+                confirmed = search_action(laf, headers, driver, "confirm", session["revision"], candidate_id=match["id"])
+                assert confirmed.is_success, confirmed.text
+
+        with service(tmp_path, app_factory=app_factory) as laf:
+            headers = auth(laf.bootstrap())
+            target = wait_for(laf.http, f"/objects/{session['object_id']}", headers)
+            assert target["status"] == "Found"
+            history = wait_for(laf.http, f"/sessions/{session['id']}/matches", headers)
+            saved = history["items"][0]
+            assert saved["id"] == match["id"] and saved["disposition"] == "Confirmed"
+            assert (saved["frame_id"], saved["stream_epoch"], saved["box"]) == (
+                match["frame_id"], match["stream_epoch"], match["box"],
+            )
+            assert wait_for(laf.http, "/snapshot", headers)["runtime"]["motion_permission"] == "Disarmed"
+            assert peer.output == 0
+            response = laf.http.get(f"{API}/media/{saved['evidence_media']['id']}", headers=headers)
+            assert response.status_code == 200 and response.headers["content-type"] == "image/png"
+            with Image.open(BytesIO(jpeg)) as original, Image.open(BytesIO(response.content)) as captured:
+                assert original.convert("RGB").tobytes() == captured.tobytes()
 
 
 def test_serial_shutdown_waits_for_late_open_without_transmitting(uno_peer_exe: Path) -> None:
