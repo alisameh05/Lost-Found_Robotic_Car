@@ -12,9 +12,9 @@ from typing import Annotated, Literal, NoReturn, Self
 
 from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 
-from . import camera_link
+from . import camera_link, proximity_wire
 from .controller import serial_key
-from .simulation import IncompatibleProfile, QualificationProfile
+from .simulation import PROXIMITY_BOUNDS, IncompatibleProfile, QualificationProfile
 from .uno_wire import DISCARD_PARTIAL, MAX_FRAME, REQUEST_FRAME, VERSION
 
 DOCUMENT_LIMIT = 256 * 1024
@@ -90,6 +90,7 @@ class CommandBuild(Build):
 class SelectedCommand:
     interface: CommandInterface
     build_id: bytes
+    proximity_interval: int | None
 
 
 class CameraInterface(Interface):
@@ -123,8 +124,39 @@ class SelectedCamera:
 class ProximityInterface(Interface):
     source: Name
     transport: Name
-    endpoint_id: Name
+    endpoint_id: Identity
     unit: Literal["mm"]
+    uno_build_artifact_sha256: Digest
+    calibration_artifact_sha256: Digest
+    minimum_distance_mm: Positive
+
+
+class ProximityCalibration(ManifestModel):
+    version: Literal[1]
+    kind: Literal["HcSr04Calibration"]
+    profile_id: Name
+    uno_build_artifact_sha256: Digest
+    procedure_id: Name
+    result_sha256: Digest
+    bounds: dict[str, Positive]
+
+
+class ProximityReading(ManifestModel):
+    target_mm: Positive
+    distance_mm: Positive
+    upper_age_ms: Positive
+    state: Literal["Warning", "Clear", "Unknown"]
+
+
+class ProximityDeviceResult(ManifestModel):
+    version: Literal[1]
+    kind: Literal["HcSr04DeviceResult"]
+    source_identity: Identity
+    endpoint_id: Identity
+    transport: Literal["serial_com", "ble_gatt"]
+    uno_build_artifact_sha256: Digest
+    conditions: Annotated[str, StringConstraints(strip_whitespace=True, min_length=1, max_length=1024)]
+    readings: Annotated[list[ProximityReading], Field(min_length=2, max_length=4096)]
 
 
 class LocalInput(ManifestModel):
@@ -203,6 +235,7 @@ class DeviceStartup:
     controller_identity: str | None = None
     command: SelectedCommand | None = None
     camera: SelectedCamera | None = None
+    proximity_minimum: int | None = None
 
 
 def read_local_file(root: Path, path: Path) -> bytes:
@@ -253,8 +286,9 @@ def validate_evidence(root: Path, profile: QualificationProfile, evidence: Evide
             or evidence.interfaces_sha256 != profile.values["device_protocol_manifest_sha256"]):
         raise ValueError("Measured evidence must identify this profile and interface manifest.")
     bounds = {name: value for name, value in profile.values.items()
-              if type(value) is int and name != "protocol_version"}
-    if {name: entry.value for name, entry in evidence.measurements.items()} != bounds:
+              if type(value) is int and name != "protocol_version" and name not in PROXIMITY_BOUNDS}
+    measured = evidence.measurements
+    if {name: entry.value for name, entry in measured.items()} != bounds:
         raise ValueError("Each Device bound needs matching measured provenance.")
     p = profile.bound
     stop = evidence.stop_budget
@@ -270,7 +304,7 @@ def validate_evidence(root: Path, profile: QualificationProfile, evidence: Evide
         and stop.software_ms + stop.mechanical_margin_ms <= 500
     ):
         raise ValueError("Measured Device timing exceeds the qualified bounds.")
-    references = {entry.artifact_sha256 for entry in evidence.measurements.values()} | {stop.artifact_sha256}
+    references = {entry.artifact_sha256 for entry in measured.values()} | {stop.artifact_sha256}
     artifacts = {digest: MeasurementArtifact.model_validate(decode(read_artifact(root, digest)))
                  for digest in references}
     if any(
@@ -278,7 +312,7 @@ def validate_evidence(root: Path, profile: QualificationProfile, evidence: Evide
         for artifact in artifacts.values()
     ) or any(
         artifacts[entry.artifact_sha256].bounds.get(name) != entry.value
-        for name, entry in evidence.measurements.items()
+        for name, entry in measured.items()
     ):
         raise ValueError("A measurement artifact does not support the selected profile and bound.")
     allowance = artifacts[stop.artifact_sha256].stop_allowance
@@ -333,7 +367,11 @@ def command_selection(root: Path, profile: QualificationProfile, selection: Comm
             != (8, "none", 2, "none")
             or profile.bound("serial_max_packet_bytes") != MAX_FRAME):
         raise IncompatibleProfile("Unsupported Uno command profile")
-    build = CommandBuild.model_validate(decode(read_artifact(root, reference)))
+    build_document = decode(read_artifact(root, reference))
+    if not isinstance(build_document, dict):
+        raise ValueError("Invalid Uno build artifact")
+    build = CommandBuild.model_validate({name: value for name, value in build_document.items()
+                                         if not name.startswith("proximity_")})
     verify_artifacts(root, {selection.contract_sha256, selection.logical_output_sha256, build.reset_evidence_sha256})
     wire_ms = (MAX_FRAME * 10_000 + build.serial_baud - 1) // build.serial_baud
     stop_bits = (len(DISCARD_PARTIAL) + 2 * REQUEST_FRAME) * 10
@@ -352,7 +390,61 @@ def command_selection(root: Path, profile: QualificationProfile, selection: Comm
             or not (270_000 + build.serial_baud - 1) // build.serial_baud < build.packet_ms
             < min(build.challenge_lifetime_ms, build.firmware_expiry_ms)):
         raise ValueError("Uno build does not match the measured selection")
-    return SelectedCommand(selection, bytes.fromhex(build.build_id))
+    proximity_settings = tuple(build_document.get(f"proximity_{name}") for name in (
+        "protocol_version", "trigger_pin", "echo_pin",
+    ))
+    interval = build_document.get("proximity_sample_interval_ms")
+    if (not all(type(value) is int for value in proximity_settings)
+            or proximity_settings != (proximity_wire.VERSION, 12, 13)
+            or type(interval) is not int or not 60 <= interval <= 60_000):
+        interval = None
+    return SelectedCommand(selection, bytes.fromhex(build.build_id), interval)
+
+
+def proximity_selection(root: Path, profile: QualificationProfile, selection: ProximityInterface,
+                        command: SelectedCommand | None) -> int:
+    if (selection.protocol_version, selection.source, selection.transport) != (
+        proximity_wire.VERSION, "uno-r3", "uno-command",
+    ):
+        raise IncompatibleProfile("Unsupported HC-SR04 observation source")
+    contract = decode(read_artifact(root, selection.contract_sha256))
+    canonical = json.dumps(contract, sort_keys=True, separators=(",", ":")).encode("ascii")
+    if sha256(canonical).hexdigest() != proximity_wire.CONTRACT_SHA256:
+        raise IncompatibleProfile("Unsupported HC-SR04 observation contract")
+    if (command is None or command.proximity_interval is None
+            or selection.endpoint_id != command.interface.identity
+            or selection.uno_build_artifact_sha256 != command.interface.build_artifact_sha256
+            or not PROXIMITY_BOUNDS.issubset(profile.values)):
+        raise ValueError("The HC-SR04 requires its selected Uno build and calibrated bounds")
+    p = profile.bound
+    minimum = selection.minimum_distance_mm
+    if not (minimum <= p("proximity_warning_mm") < p("proximity_clear_mm")
+            <= p("proximity_max_distance_mm") <= proximity_wire.MAX_DISTANCE_MM
+            and command.proximity_interval < p("proximity_sample_deadline_ms")):
+        raise ValueError("The proximity thresholds, range or sample deadline are inconsistent")
+    calibration = ProximityCalibration.model_validate(decode(read_artifact(root, selection.calibration_artifact_sha256)))
+    if (calibration.profile_id, calibration.uno_build_artifact_sha256) != (
+        profile.values["profile_id"], selection.uno_build_artifact_sha256,
+    ):
+        raise ValueError("The proximity calibration does not identify this build and profile")
+    expected = {name: p(name) for name in PROXIMITY_BOUNDS}
+    expected.update(proximity_min_distance_mm=minimum, proximity_sample_interval_ms=command.proximity_interval)
+    if any(calibration.bounds.get(name) != value for name, value in expected.items()):
+        raise ValueError("The proximity calibration does not support these bounds")
+    result = ProximityDeviceResult.model_validate(decode(read_artifact(root, calibration.result_sha256)))
+    if (result.source_identity, result.endpoint_id, result.transport, result.uno_build_artifact_sha256) != (
+        selection.identity, selection.endpoint_id, command.interface.transport, selection.uno_build_artifact_sha256,
+    ):
+        raise ValueError("The calibration result must identify the selected sensor, link and build")
+    current = [
+        row for row in result.readings
+        if minimum <= row.distance_mm <= p("proximity_max_distance_mm")
+        and row.upper_age_ms < p("proximity_sample_deadline_ms")
+    ]
+    if (not any(row.state == "Warning" and row.distance_mm <= p("proximity_warning_mm") for row in current)
+            or not any(row.state == "Clear" and row.distance_mm >= p("proximity_clear_mm") for row in current)):
+        raise ValueError("The calibration result must record measured warning and clear behavior")
+    return minimum
 
 
 def camera_selection(root: Path, selection: CameraInterface, network: str | None) -> SelectedCamera:
@@ -403,6 +495,9 @@ def load_device_startup(root: Path, probes: Mapping[RobotPath, DeviceProbe]) -> 
             ):
                 raise IncompatibleProfile("The Device manifest version is unsupported.")
         interfaces = InterfaceManifest.model_validate(interfaces_json)
+        if isinstance(evidence_json, dict) and isinstance(evidence_json.get("measurements"), dict):
+            evidence_json["measurements"] = {name: entry for name, entry in evidence_json["measurements"].items()
+                                             if name not in PROXIMITY_BOUNDS}
         validate_evidence(root, profile, EvidenceManifest.model_validate(evidence_json))
     except IncompatibleProfile:
         return DeviceStartup(profile_cause="PROTOCOL_UNSUPPORTED")
@@ -412,7 +507,6 @@ def load_device_startup(root: Path, probes: Mapping[RobotPath, DeviceProbe]) -> 
     selections: tuple[tuple[RobotPath, type[Interface], object], ...] = (
         ("Command", CommandInterface, interfaces.hc05_uno),
         ("RobotVideo", CameraInterface, interfaces.esp32_cam),
-        ("Proximity", ProximityInterface, interfaces.hcsr04),
     )
     windows = artifact_digest(interfaces.windows_profile_sha256)
     network = artifact_digest(interfaces.protected_network_sha256)
@@ -435,7 +529,18 @@ def load_device_startup(root: Path, probes: Mapping[RobotPath, DeviceProbe]) -> 
             causes[name] = "PROTOCOL_UNSUPPORTED"
         except (OSError, RuntimeError, ValueError):
             causes[name] = "NOT_READY"
+    proximity_minimum = None
+    causes["Proximity"] = "NOT_READY"
+    if interfaces.hcsr04 is not None:
+        try:
+            proximity_minimum = proximity_selection(
+                root, profile, ProximityInterface.model_validate(interfaces.hcsr04), command,
+            )
+        except IncompatibleProfile:
+            causes["Proximity"] = "PROTOCOL_UNSUPPORTED"
+        except (OSError, RuntimeError, ValueError):
+            pass
     return DeviceStartup(profile, causes=MappingProxyType(causes),
                          webcam_identity=local_identity(root, interfaces.webcam, windows),
                          controller_identity=local_identity(root, interfaces.controller, windows, controller=True),
-                         command=command, camera=camera)
+                         command=command, camera=camera, proximity_minimum=proximity_minimum)

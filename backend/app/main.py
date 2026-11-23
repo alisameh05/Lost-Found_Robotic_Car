@@ -132,9 +132,8 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owner: AbstractContextManager[None] = nullcontext() if held_owner else own_data_root(config.data_root)
         with owner:
-            # Python 3.11 on Windows gives monotonic() a ~16 ms tick. A selected camera
-            # needs a shared high-resolution host clock for acquisition, display and safety.
-            clock = perf_counter if device and device.camera else monotonic
+            # Device acquisition and observation age use a shared high-resolution host clock.
+            clock = perf_counter if device and (device.camera or device.proximity_minimum is not None) else monotonic
             runtime = RecordsRuntime(storage or RecordsStorage(config.data_root, monotonic=clock))
             app.state.runtime = runtime
             command = None
@@ -146,7 +145,7 @@ def create_app(
                 command = SerialCommandLink(
                     profile, selected.build_id, command_transport or (
                         lambda: open_command(selected.interface, ack_deadline)
-                    ), runtime.storage.monotonic,
+                    ), runtime.storage.monotonic, proximity_minimum=device.proximity_minimum,
                 )
             realtime = runtime.enable_realtime(simulation, unavailable_code, on_channel_invalidated, on_control_revoked,
                                                device=device, command=command)
@@ -181,6 +180,8 @@ def create_app(
                 tasks = (asyncio.create_task(realtime.maintain_projection()),
                          asyncio.create_task(realtime.maintain_control()),
                          asyncio.create_task(runtime.maintain_safety_storage(realtime)))
+            if profile:
+                tasks += (asyncio.create_task(realtime.maintain_proximity()),)
             if device and device.camera and profile:
                 camera = device.camera
                 exchange = camera_exchange or open_http_exchange(

@@ -45,6 +45,7 @@ from .device_startup import DeviceStartup
 from .http import DOMAIN_ID, HEADER_LIMIT, HttpError, authorize_address, header, json_fields, read_json
 from .motion import FixtureCommandSink, InputSample, InputScope, LiveCommandSink, Motion
 from .registration_input import SAFE_INTEGER, canonical_json
+from .serial_link import SerialCommandLink
 from .simulation import (
     SOURCES,
     CandidateObservation,
@@ -52,6 +53,7 @@ from .simulation import (
     FixturePresence,
     InferenceSample,
     ProximityAdvisory,
+    ProximitySample,
     QualificationProfile,
     Simulation,
     Source,
@@ -168,6 +170,7 @@ class Connection:
     events: deque[bytes] = field(default_factory=deque)
     event_bytes: int = 0
     sending_event: bytes | None = None
+    advisory_event: bytes | None = None
     waiting: Frame | None = None
     issued: dict[str, IssuedFrame] = field(default_factory=dict)
 
@@ -176,6 +179,7 @@ class Connection:
             self.close.set_result(code)
         self.events.clear()
         self.event_bytes = 0
+        self.advisory_event = None
         self.waiting = None
         self.issued.clear()
 
@@ -267,6 +271,8 @@ class Realtime:
         self.on_candidate: Callable[[CandidateCapture], None] | None = None
         self._motion = None
         self._proximity = None
+        self._proximity_link = None
+        self._published_proximity: Projection | None = None
         self._fixture_sink = None
         self._published_permission = "Disarmed"
         self._circle_held = False
@@ -282,8 +288,13 @@ class Realtime:
             sink = simulation.command_sink or self._fixture_sink
             assert sink is not None
             self._motion = Motion(sink, simulation.profile)
+            command = sink if isinstance(sink, SerialCommandLink) else None
         elif command and device and device.profile:
             self._motion = Motion(command, device.profile)
+        if isinstance(command, SerialCommandLink) and command.proximity_minimum is not None:
+            assert self.profile is not None
+            self._proximity = ProximityAdvisory(self.profile, command.proximity_minimum)
+            self._proximity_link = command
 
     @property
     def profile(self) -> QualificationProfile | None:
@@ -542,11 +553,27 @@ class Realtime:
                     self._lose_camera(profile, "RobotVideoUnavailable")
                 else:
                     self._observe_source("robot", None, None, now, profile)
-            if self._proximity:
-                before = self._proximity.payload
-                self._proximity.expire(now)
-                self._publish_proximity(before)
             await asyncio.sleep(interval)
+
+    async def maintain_proximity(self) -> None:
+        advisory, link = self._proximity, self._proximity_link
+        if advisory is None:
+            return
+        interval = min(20, advisory.profile.bound("proximity_sample_deadline_ms") / 4) / 1000
+        while not self._closed:
+            if link:
+                for sample in link.take_proximity():
+                    self._observe_proximity(sample, self.monotonic())
+            advisory.expire(self.monotonic())
+            self._publish_proximity()
+            await asyncio.sleep(interval)
+
+    def _observe_proximity(self, sample: ProximitySample | None, now: float) -> None:
+        if self._proximity:
+            if sample is None:
+                self._proximity.unknown()
+            else:
+                self._proximity.observe(sample, now, self.utc())
 
     def _input_scope(self) -> InputScope | None:
         return InputScope(self.boot, self._active_session, self._generation) if self._active_session else None
@@ -806,12 +833,13 @@ class Realtime:
             return None
         return "Webcam" if self._active_mode == "Gestures" else "Controller"
 
-    def _envelope(self, kind: EventKind, payload: object) -> bytes:
+    def _envelope(self, kind: EventKind, payload: object, *, sequence: int | None = None) -> bytes:
         session = (payload.get("session") if kind == "session_changed" and isinstance(payload, dict)
                    else self._projection.get("active_session")
                    if self._projection and kind in ("snapshot", "candidate_pending", "recovery_changed") else None)
         return canonical_json({
-            "protocol_version": 1, "backend_boot_id": self.boot, "event_seq": self.sequence,
+            "protocol_version": 1, "backend_boot_id": self.boot,
+            "event_seq": self.sequence if sequence is None else sequence,
             "session_id": session["id"] if isinstance(session, dict) else None,
             "session_revision": session["revision"] if isinstance(session, dict) else None, "type": kind,
             "occurred_at_ms": self.utc(), "payload": payload,
@@ -1268,10 +1296,8 @@ class Realtime:
                     self._accept_motion(scope, sample, now, deadline)
                 self._evaluate_motion(self.monotonic())
                 self._restore_failures()
-                if self._proximity:
-                    before = self._proximity.payload
-                    self._proximity.observe(observation.proximity, now, self.utc())
-                    self._publish_proximity(before)
+                if self._proximity_link is None and observation.proximity is not None:
+                    self._observe_proximity(observation.proximity, now)
                 await asyncio.sleep(min(CAPTURE_INTERVAL, deadline / 2))
         finally:
             if self._motion:
@@ -1662,9 +1688,30 @@ class Realtime:
         if was_ready != available and self._projection is not None:
             self._publish("readiness_changed", None)
 
-    def _publish_proximity(self, before: Projection) -> None:
-        if self._proximity and self._projection is not None and before != self._proximity.payload:
-            self._publish("proximity_warning_changed", {"proximity": self._proximity.payload})
+    def _publish_proximity(self) -> None:
+        advisory = self._proximity
+        if (advisory is None or self._projection is None or advisory.payload == self._published_proximity
+                or self.sequence >= SAFE_INTEGER):
+            return
+        subscribers = [connection for connection in self._connections.values() if connection.channel == "events"]
+        if not subscribers:
+            self._published_proximity = advisory.payload
+            return
+        if any(connection.sending_event or connection.advisory_event or connection.events for connection in subscribers):
+            return
+        # Reserve the idle send position for each subscriber. Required events
+        # keep the full waiting queue, and no sequence is spent on coalesced samples.
+        sequence = self.sequence + 1
+        message = self._envelope("proximity_warning_changed", {"proximity": advisory.payload}, sequence=sequence)
+        profile = advisory.profile
+        if len(message) > min(profile.bound("max_event_message_bytes"), profile.bound("event_queue_bytes")):
+            return
+        self.sequence = sequence
+        self._projection["event_seq"] = sequence
+        self._published_proximity = advisory.payload
+        for connection in subscribers:
+            connection.advisory_event = message
+            connection.ready.set()
 
     def _path_lost(self, name: str, cause: str | None = None) -> None:
         cause = cause or PATH_FAILURES[name]
@@ -1870,9 +1917,14 @@ class Realtime:
             if connection.close.done():
                 return
             if connection.channel == "events":
-                if connection.events:
+                if connection.advisory_event is not None:
+                    data, connection.advisory_event = connection.advisory_event, None
+                elif connection.events:
                     data = connection.events.popleft()
                     connection.event_bytes -= len(data)
+                else:
+                    data = None
+                if data is not None:
                     connection.sending_event = data
                     try:
                         await socket.send_text(data.decode("utf-8"))

@@ -4,6 +4,7 @@
 
 #include "command.h"
 #include "command_port.h"
+#include "proximity.h"
 #include "selected_build.h"
 
 namespace {
@@ -76,7 +77,12 @@ void setup() {
     logicalOutput(0);
     const uint32_t boot = nextBoot();
     uno::port::begin();
+#if LAF_PROXIMITY
+    uno::proximity::begin();
+    static uno::Peer command(boot, Timings, BuildId, logicalOutput, uno::port::reply, uno::proximity::take);
+#else
     static uno::Peer command(boot, Timings, BuildId, logicalOutput, uno::port::reply);
+#endif
     peer = &command;
     wdt_enable(HardwareWatchdog);
 }
@@ -94,4 +100,7 @@ void loop() {
         }
         peer->receive(static_cast<uint8_t>(byte), millis());
     }
+#if LAF_PROXIMITY
+    uno::proximity::tick();
+#endif
 }

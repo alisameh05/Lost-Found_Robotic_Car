@@ -391,6 +391,7 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
             local_vision: bool = False, webcam_factory: Callable[[QualificationProfile, Clock], Webcam] | None = None,
             local_gestures: bool = False, controller_poll: Poll | None = None,
             live_command: LiveCommandSink | None = None,
+            qualification: QualificationProfile | None = None,
             app_factory: Callable[[int], FastAPI] | None = None) -> Iterator[Loopback]:
     clock = Clock()
     selected = "local-controller-v1" if controller_poll else "local-gestures-v1" if local_gestures else "fixture-v1"
@@ -403,7 +404,7 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
             return observations.storage and super().safety_storage_healthy(preparing)
 
     storage = ObservedStorage(root, monotonic=clock, checkpoint=checkpoint, **({"clock": wall} if wall else {}))
-    profile = simulation.profile
+    profile = qualification or simulation.profile
     if blocked and blocked_connection == 1:
         profile = replace(profile, values={**profile.values, "event_queue_messages": 1})
     if event_limit is not None:
@@ -2122,6 +2123,33 @@ def test_proximity_advisory_preserves_latch_and_has_no_motion_or_revision_effect
         assert not cleared["proximity"]["warning_latched"]
         assert cleared["active_session"] == driver.session and cleared["runtime"]["motion_permission"] == "Armed"
         assert laf.command.output == "forward"
+
+
+def test_proximity_coalesces_before_ordering_while_a_subscriber_is_blocked(tmp_path: Path) -> None:
+    with service(tmp_path, blocked=True, blocked_connection=2) as laf, driving_search(laf) as (headers, _):
+        arm(laf, headers)
+        spectator = auth(laf.bootstrap())
+        held = laf.blocked
+        assert held is not None
+        with laf.open("/events", laf.ticket(spectator, "events")) as events:
+            assert held.entered[API + "/events"].wait(2)
+            try:
+                laf.observations.proximity = 150
+                first = wait_for(laf.http, "/snapshot", headers, lambda s: s["proximity"]["state"] == "Warning")
+                later = wait_for(laf.http, "/snapshot", headers, lambda s:
+                                 (s["proximity"]["sample_seq"] or 0) >= first["proximity"]["sample_seq"] + 20)
+                assert later["event_seq"] == first["event_seq"]
+                assert later["runtime"] == first["runtime"]
+                assert later["active_session"] == first["active_session"]
+                assert later["readiness"] == first["readiness"]
+                assert laf.command.output == "forward"
+            finally:
+                held.resume_events.set()
+            initial, update = event(events), event(events)
+            assert initial["type"] == "snapshot"
+            assert update["type"] == "proximity_warning_changed"
+            assert update["event_seq"] == initial["event_seq"] + 1
+            assert update["payload"]["proximity"]["sample_seq"] >= later["proximity"]["sample_seq"]
 
 
 def test_repeated_path_observations_share_an_id_until_restoration(tmp_path: Path) -> None:

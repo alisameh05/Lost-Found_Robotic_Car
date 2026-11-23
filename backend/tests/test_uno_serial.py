@@ -32,11 +32,13 @@ from backend.app.config import Config
 from backend.app.controller import Controller
 from backend.app.main import create_app
 from backend.app.motion import DIRECTIONS
+from backend.app.proximity_wire import AdvisoryPacket, decode_advisory
 from backend.app.serial_link import SerialCommandLink
 from backend.app.simulation import load_simulation
 from backend.app.storage import utc_ms
 from backend.app.uno_wire import (
     ARM,
+    ARMED,
     DISCARD_PARTIAL,
     DRIVE,
     HELLO,
@@ -49,6 +51,8 @@ from backend.app.uno_wire import (
     encode,
 )
 from backend.tests.device_documents import device_documents, write_camera_documents, write_device_documents
+from backend.tests.proximity_replay import BUILD as ADVISORY_BUILD
+from backend.tests.proximity_replay import ReplayUno
 from backend.tests.test_camera_link import BUILD as CAMERA_BUILD
 from backend.tests.test_camera_link import TOKEN as CAMERA_TOKEN
 from backend.tests.test_camera_link import clock_headers, frame_headers, jpeg_sample
@@ -63,6 +67,7 @@ from backend.tests.test_realtime import (
     Observations,
     auth,
     driving_search,
+    event,
     recover_workspace,
     search_action,
     service,
@@ -244,6 +249,82 @@ def test_uno_expiry_survives_monotonic_clock_wrap(uno_peer_exe: Path) -> None:
         armed(peer, start=2**32 - 4)
         assert peer.step(now=217) == (1, b"")
         assert peer.step(now=218) == (0, b"")
+
+
+def test_uno_advisory_is_independent_of_the_drive_ack_and_watchdog(uno_peer_exe: Path) -> None:
+    with native_peer(uno_peer_exe) as peer:
+        armed(peer)
+        assert peer.step("sample 2 17 150", now=9) == (1, b"")
+        output, reply = peer.step(encode(Packet(DRIVE, 1, 1, 3, 3, direction=1)), now=10)
+        ack, advisory = reply.split(b"\0", 1)
+        verified = decode(ack + b"\0")
+        assert output == 1 and verified == Packet(DRIVE | REPLY, 1, 1, 3, 3, 4, 1, ARMED)
+        assert decode_advisory(advisory) == AdvisoryPacket(1, 4, 2, 17, 150)
+        assert peer.step(now=230) == (0, b"")
+
+
+def test_proximity_wire_projects_advice_through_protected_workspace(tmp_path: Path) -> None:
+    fixture = load_simulation("fixture-v1")
+    assert fixture
+    profile = replace(fixture.profile, values={**fixture.profile.values, "proximity_sample_deadline_ms": 900})
+    scenario = {}
+    peer = ReplayUno(lambda: scenario)
+    link = SerialCommandLink(profile, ADVISORY_BUILD, peer.open, proximity_minimum=15)
+    link.start()
+    try:
+        with service(tmp_path, live_command=link, qualification=profile) as laf, \
+                driving_search(laf) as (headers, driver):
+            assert wait_for(laf.http, "/snapshot", headers)["proximity"]["state"] == "Unknown"
+            wait_for(laf.http, "/snapshot", headers, lambda s: s["runtime"]["motion_permission"] == "Arming")
+            laf.observations.dpad = ("forward",)
+            control = wait_for(laf.http, "/snapshot", headers, lambda s: s["runtime"]["motion_permission"] == "Armed")
+            assert link.output == "forward"
+            delivery = 0
+
+            def send(sequence, distance, state, latched, *, unterminated=False, bad_route=False, **override):
+                nonlocal delivery, scenario
+                delivery += 1
+                sample = {"sequence": sequence, "distance": distance, **override}
+                scenario = {"delivery": delivery, "sample": sample, "unterminated": unterminated, "bad_route": bad_route}
+                current = wait_for(laf.http, "/snapshot", headers, lambda s:
+                                   s["proximity"]["state"] == state and (s["proximity"]["sample_seq"] == sequence
+                                   if state != "Unknown" or delivery == 1 else s["proximity"]["distance_mm"] is None))
+                assert current["proximity"]["warning_latched"] is latched
+                assert current["runtime"] == control["runtime"]
+                assert current["readiness"] == control["readiness"]
+                assert current["active_session"] == control["active_session"]
+                assert link.output == "forward"
+                return current["proximity"]
+
+            send(1, 230, "Unknown", False)  # Initial clear proof is incomplete.
+            send(2, 150, "Warning", True)   # Equality latches Warning.
+            send(3, 229, "Warning", True)   # Hysteresis.
+            send(4, 230, "Warning", True)
+            send(5, 0, "Unknown", True, valid=0)
+            send(6, 230, "Warning", True)
+            send(7, 230, "Unknown", True, age_ms=1500)
+            send(8, 230, "Warning", True)
+            send(8, 230, "Unknown", True)   # Replay during a clear run.
+            send(9, 230, "Warning", True)
+            send(10, 230, "Unknown", True, boot=6)
+            send(11, 230, "Warning", True)
+            send(12, 230, "Unknown", True, unterminated=True)
+            send(13, 230, "Warning", True)
+            send(14, 230, "Unknown", True, bad_route=True)
+            send(15, 230, "Warning", True)
+            send(16, 230, "Warning", True)
+            cleared = send(17, 230, "Clear", False)
+            spectator = auth(laf.bootstrap())
+            with laf.open("/events", laf.ticket(spectator, "events")) as events:
+                initial = event(events)
+                assert initial["type"] == "snapshot"
+                assert initial["payload"]["proximity"] == cleared
+                assert initial["session_revision"] == driver.session["revision"]
+            assert wait_for(laf.http, "/snapshot", headers, lambda s: s["proximity"]["state"] == "Unknown")[
+                "runtime"
+            ] == control["runtime"]
+    finally:
+        link.close()
 
 
 def test_stop_preempts_partial_wire_and_invalidates_an_armed_generation(uno_peer_exe: Path) -> None:
@@ -429,6 +510,80 @@ def selected_command_build(profile: dict, selected: dict, condition: str) -> byt
     }).encode()
 
 
+@pytest.mark.parametrize("condition", [
+    "selected", "missing", "bounds", "artifact", "version", "endpoint", "build_proximity", "fixture_result",
+])
+def test_device_proximity_is_calibrated_independently_of_command(tmp_path: Path, condition: str) -> None:
+    profile, interfaces, evidence, recorded_result = device_documents()
+    initialize_command_selection(profile, interfaces, evidence, "matched_ble")
+    selected = interfaces["hc05_uno"]
+    build = json.dumps({
+        **json.loads(selected_command_build(profile, selected, "matched_ble")),
+        "build_id": ADVISORY_BUILD.hex(), "proximity_protocol_version": 1, "proximity_trigger_pin": 12,
+        "proximity_echo_pin": 13, "proximity_sample_interval_ms": "unknown" if condition == "build_proximity" else 60,
+    }).encode()
+    build_digest = selected["build_artifact_sha256"] = sha256(build).hexdigest()
+    specification = Path(__file__).resolve().parents[2] / "firmware" / "uno" / "proximity.v1.json"
+    contract = specification.read_bytes()
+    contract_digest = sha256(contract).hexdigest()
+    bounds = {key: profile[key] for key in profile if key.startswith("proximity_")}
+    result = json.dumps({
+        "version": 1, "kind": "Fixture" if condition == "fixture_result" else "HcSr04DeviceResult",
+        "source_identity": "test-proximity", "endpoint_id": selected["identity"], "transport": "ble_gatt",
+        "uno_build_artifact_sha256": build_digest, "conditions": "Synthetic loader test. No connected hardware.",
+        "readings": [
+            {"target_mm": 100, "distance_mm": 100, "upper_age_ms": 85, "state": "Warning"},
+            {"target_mm": 250, "distance_mm": 250, "upper_age_ms": 92, "state": "Clear"},
+        ],
+    }).encode()
+    result_digest = sha256(result).hexdigest()
+    calibration = json.dumps({
+        "version": 1, "kind": "HcSr04Calibration", "profile_id": profile["profile_id"],
+        "uno_build_artifact_sha256": build_digest, "procedure_id": "synthetic-proximity-test",
+        "bounds": {**bounds, "proximity_min_distance_mm": 15, "proximity_sample_interval_ms": 60},
+        "result_sha256": result_digest,
+    }).encode()
+    calibration_digest = sha256(calibration).hexdigest()
+    interfaces["hcsr04"] = {
+        "identity": "test-proximity", "source": "uno-r3", "transport": "uno-command",
+        "unit": "mm", "protocol_version": 2 if condition == "version" else 1, "contract_sha256": contract_digest,
+        "endpoint_id": "wrong-device" if condition == "endpoint" else selected["identity"],
+        "uno_build_artifact_sha256": build_digest, "calibration_artifact_sha256": calibration_digest,
+        "minimum_distance_mm": 15,
+    }
+    if condition == "missing":
+        for key in bounds:
+            del profile[key]
+            del evidence["measurements"][key]
+    if condition == "bounds":
+        profile["proximity_clear_mm"] = 109
+    artifacts = write_device_documents(tmp_path, profile, interfaces, evidence, recorded_result) / "artifacts"
+    (artifacts / build_digest).write_bytes(build)
+    (artifacts / contract_digest).write_bytes(contract)
+    (artifacts / result_digest).write_bytes(result)
+    if condition != "artifact":
+        (artifacts / calibration_digest).write_bytes(calibration)
+
+    scenario = {}
+    peer = ReplayUno(lambda: scenario)
+    app = create_app(Config(tmp_path, backend_mode="device"), command_transport=peer.open)
+    with TestClient(app, base_url=BASE) as client:
+        headers = auth(client.get(API + "/bootstrap", headers=ORIGIN).json())
+        view = wait_for(client, "/snapshot", headers, lambda s: component(s, "Command")["status"] == "Ready")
+        assert view["proximity"]["state"] == "Unknown"
+        assert view["runtime"]["motion_permission"] == "Disarmed"
+        scenario = {"delivery": 1, "sample": {"sequence": 1, "distance": 110}}
+        if condition == "selected":
+            warning = wait_for(client, "/snapshot", headers, lambda s: s["proximity"]["state"] == "Warning")
+            assert warning["proximity"]["distance_mm"] == 110
+        else:
+            wait_until(lambda: peer.delivered == 1)
+            wait_until(lambda: peer.challenge > 6)
+            after = wait_for(client, "/snapshot", headers)
+            assert after["proximity"] == view["proximity"]
+            assert after["readiness"] == view["readiness"]
+
+
 def test_selected_camera_shares_the_detection_frame_with_display_and_evidence(
     tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
 ) -> None:
@@ -453,7 +608,7 @@ def test_selected_camera_shares_the_detection_frame_with_display_and_evidence(
         def pulse(self, generation, direction, deadline):
             pytest.fail("The camera and evidence check must leave motion disabled")
 
-    monkeypatch.setattr(app_entry, "SerialCommandLink", lambda *args: DisabledCommandPeer())
+    monkeypatch.setattr(app_entry, "SerialCommandLink", lambda *args, **kwargs: DisabledCommandPeer())
     documents = device_documents()
     profile, interfaces, evidence, result = documents
     initialize_command_selection(profile, interfaces, evidence, "matched")

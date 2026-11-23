@@ -1,6 +1,6 @@
 # Uno command wire v1
 
-The Windows backend owns motion authority. The HC-05 link carries only serial commands and acknowledgments. The Uno reports commanded logical motor output and armed state. The command link is independent of camera transport and proximity observations.
+The Windows backend owns motion authority. The Uno reports commanded logical motor output and armed state. An enabled build can also send independently framed [HC-SR04 advisory observations](UNO_PROXIMITY.md) over the same HC-05 link. The camera uses its own transport.
 
 ## Framing and fields
 

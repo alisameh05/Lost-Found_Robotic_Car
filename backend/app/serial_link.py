@@ -1,6 +1,7 @@
 """Single-owner HC-05 worker. The application hands it one bounded renewal at a time."""
 
 import sys
+from collections import deque
 from collections.abc import Callable, Iterator
 from contextlib import AbstractContextManager, contextmanager
 from dataclasses import dataclass
@@ -10,6 +11,8 @@ from time import monotonic
 from typing import TYPE_CHECKING, Protocol, cast
 
 from .motion import COMMAND_FAILURES, DIRECTIONS, Direction
+from .proximity_wire import TAG, decode_advisory, misrouted_advisory
+from .simulation import ProximitySample
 from .uno_wire import (
     ARM,
     ARMED,
@@ -22,6 +25,7 @@ from .uno_wire import (
     REQUEST_FRAME,
     STATUS,
     STOP,
+    VERSION,
     Packet,
     WireError,
     WireVersionError,
@@ -90,20 +94,58 @@ class CommandSession:
         self.challenge_until = 0.0
         self.generation: int | None = None
         self.frame = bytearray()
+        self.discard_advisory = False
+        self.advisory_credit: tuple[int, int, float] | None = None
+        self.sent = 0.0
+
+    def _observe_advisory(self, frame: bytes) -> bool:
+        credit, self.advisory_credit = self.advisory_credit, None
+        try:
+            sample = decode_advisory(frame)
+        except ValueError:
+            self.link._note_proximity(None)
+            return False
+        if self.link.proximity_minimum is None:
+            return True
+        if credit is None or (sample.boot, sample.credit) != credit[:2] or sample.boot < self.link._proximity_boot:
+            self.link._note_proximity(None)
+            return True
+        # Capture preceded the firmware reply. Request send is the earliest
+        # possible reply creation time, so this bounds age through BLE buffering.
+        self.link._note_proximity(ProximitySample(
+            f"uno-{sample.boot}", sample.sequence, credit[2] - sample.age_ms / 1000, sample.distance_mm,
+        ))
+        return True
+
+    def _recover_ack(self, frame: bytes, request: Packet) -> Packet | None:
+        # An advisory may lose its delimiter or split into fragments. Only a
+        # complete, correlated command ACK can end recovery before the deadline.
+        opcode = request.op | REPLY
+        for offset in range(max(0, len(frame) - MAX_FRAME), len(frame) - 3):
+            if frame[offset + 1:offset + 3] != bytes((VERSION, opcode)):
+                continue
+            try:
+                reply = decode(frame[offset:])
+            except WireError:
+                continue
+            if (reply.op, reply.sequence) == (opcode, request.sequence):
+                return reply
+        return None
 
     def _exchange(self, packet: Packet, deadline: float) -> Packet:
         signal, clock = self.link._wake, self.link._clock
         resync = packet.op in (HELLO, STOP)
         wire = (DISCARD_PARTIAL if resync else b"") + encode(packet)
-        sent = self.link._commit_write(
+        self.sent = self.link._commit_write(
             packet.op, deadline if resync else min(deadline, self.challenge_until),
         )
         if self.port.write(wire) != len(wire):
             raise OSError("Incomplete command write")
+        recovering = self.discard_advisory
         while clock() < deadline:
             if packet.op != STOP and self.link._stopping():
                 raise Preempted
-            data = self.port.read(MAX_FRAME - len(self.frame))
+            data = self.port.read(MAX_FRAME)
             if not data:
                 signal.wait(min(0.002, max(0.0, deadline - clock())))
                 signal.clear()
@@ -112,19 +154,40 @@ class CommandSession:
             while (index := self.frame.find(0)) >= 0:
                 frame = bytes(self.frame[:index + 1])
                 del self.frame[:index + 1]
+                if not self.discard_advisory and frame[0] == TAG:
+                    if self._observe_advisory(frame):
+                        continue
+                    recovering = True
+                elif not self.discard_advisory and misrouted_advisory(frame):
+                    self.advisory_credit = None
+                    self.link._note_proximity(None)
+                    continue
+                self.discard_advisory = False
                 if len(frame) == 1:
                     continue
-                reply = decode(frame)
+                if recovering:
+                    reply = self._recover_ack(frame, packet)
+                    if reply is None:
+                        continue
+                else:
+                    reply = decode(frame)
                 if packet.op == STOP and reply.boot == self.boot and reply.sequence < packet.sequence:
                     # A previously transmitted request can finish while STOP is written.
                     continue
                 if (reply.op != packet.op | REPLY or reply.sequence != packet.sequence or clock() >= deadline
                         or reply.next_challenge <= self.challenge):
                     raise WireError("Unexpected or late command acknowledgment")
-                self.challenge_until = sent + self.link._challenge
+                self.challenge_until = self.sent + self.link._challenge
                 return reply
             if len(self.frame) >= MAX_FRAME:
-                raise WireError("Oversized command acknowledgment")
+                if not self.discard_advisory and self.frame[0] != TAG:
+                    raise WireError("Oversized command acknowledgment")
+                if not self.discard_advisory:
+                    self.advisory_credit = None
+                    self.link._note_proximity(None)
+                recovering = True
+                self.discard_advisory = True
+                del self.frame[:-(MAX_FRAME - 1)]
         raise WireError("Command acknowledgment deadline expired")
 
     def hello(self) -> None:
@@ -136,6 +199,10 @@ class CommandSession:
             raise WireError("Invalid disarmed HELLO reply")
         self.boot, self.sequence, self.challenge = reply.boot, reply.challenge, reply.next_challenge
         self.floor = self.issued_floor = reply.generation
+        if self.link.proximity_minimum is not None and self.boot > self.link._proximity_boot:
+            self.link._proximity_boot = self.boot
+            self.link._note_proximity(None)
+        self.advisory_credit = (self.boot, self.challenge, self.sent)
 
     def send(self, op: int, deadline: float, renewal: Renewal | None = None) -> None:
         if self.sequence == MAX_COUNTER:
@@ -165,6 +232,7 @@ class CommandSession:
         self.floor = self.issued_floor = reply.generation
         self.challenge = reply.next_challenge
         self.generation = renewal.generation if renewal is not None else None
+        self.advisory_credit = (self.boot, self.challenge, self.sent)
 
     def best_effort_stop(self) -> None:
         # Even an uncorrelated STOP disables any compatible boot before it can acknowledge.
@@ -178,7 +246,7 @@ class CommandSession:
 class SerialCommandLink:
     def __init__(
         self, profile: "QualificationProfile", build: bytes, open_port: OpenTransport,
-        clock: Callable[[], float] = monotonic,
+        clock: Callable[[], float] = monotonic, *, proximity_minimum: int | None = None,
     ):
         self._clock = clock
         self._open = open_port
@@ -199,6 +267,25 @@ class SerialCommandLink:
         self._ready_until = self._lease_until = self._submit_after = 0.0
         self._cause = "NOT_READY"
         self._output: Direction | None = None
+        self.proximity_minimum = proximity_minimum
+        self._proximity_boot = 0
+        self._proximity_lock = Lock()
+        self._proximity: deque[ProximitySample | None] = deque(maxlen=8)
+
+    def _note_proximity(self, sample: ProximitySample | None) -> None:
+        if self.proximity_minimum is None:
+            return
+        with self._proximity_lock:
+            if len(self._proximity) == self._proximity.maxlen:
+                self._proximity.clear()
+                self._proximity.append(None)
+            self._proximity.append(sample)
+
+    def take_proximity(self) -> tuple[ProximitySample | None, ...]:
+        with self._proximity_lock:
+            samples = tuple(self._proximity)
+            self._proximity.clear()
+            return samples
 
     def start(self) -> None:
         self._worker.start()
@@ -292,6 +379,7 @@ class SerialCommandLink:
                 self._output = direction
 
     def _failed(self, cause: str) -> None:
+        self._note_proximity(None)
         with self._lock:
             if self._ready_until:
                 self._latched_fault = self._fault_reason(self._clock())

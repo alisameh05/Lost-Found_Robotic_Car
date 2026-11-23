@@ -49,7 +49,22 @@ def encode(packet: Packet) -> bytes:
 
 
 def decode(frame: bytes) -> Packet:
-    if not 1 < len(frame) <= MAX_FRAME or frame[-1] != 0 or 0 in frame[:-1]:
+    if len(frame) > MAX_FRAME:
+        raise WireError("Invalid frame delimiter or length")
+    raw = decode_cobs(frame)
+    if len(raw) < HEADER.size + 2 or crc_hqx(raw[:-2], 0xFFFF) != int.from_bytes(raw[-2:], "little"):
+        raise WireError("Invalid packet length or checksum")
+    version, op, boot, generation, sequence, challenge, successor, direction, flags = HEADER.unpack_from(raw)
+    if version != VERSION:
+        raise WireVersionError("Unsupported Uno command protocol")
+    build = bytes(raw[HEADER.size:-2])
+    if len(build) != (32 if op == HELLO | REPLY else 0):
+        raise WireError("Invalid packet payload length")
+    return Packet(op, boot, generation, sequence, challenge, successor, direction, flags, build)
+
+
+def decode_cobs(frame: bytes) -> bytearray:
+    if len(frame) < 2 or frame[-1] != 0 or 0 in frame[:-1]:
         raise WireError("Invalid frame delimiter or length")
     raw = bytearray()
     cursor = 0
@@ -62,12 +77,4 @@ def decode(frame: bytes) -> Packet:
         if offset < end:
             raw.append(0)
         cursor = offset
-    if len(raw) < HEADER.size + 2 or crc_hqx(raw[:-2], 0xFFFF) != int.from_bytes(raw[-2:], "little"):
-        raise WireError("Invalid packet length or checksum")
-    version, op, boot, generation, sequence, challenge, successor, direction, flags = HEADER.unpack_from(raw)
-    if version != VERSION:
-        raise WireVersionError("Unsupported Uno command protocol")
-    build = bytes(raw[HEADER.size:-2])
-    if len(build) != (32 if op == HELLO | REPLY else 0):
-        raise WireError("Invalid packet payload length")
-    return Packet(op, boot, generation, sequence, challenge, successor, direction, flags, build)
+    return raw
