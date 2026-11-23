@@ -1,5 +1,6 @@
 """Exercise the same Uno parser/watchdog source over the backend command wire."""
 
+import asyncio
 import json
 import os
 import select
@@ -9,23 +10,31 @@ import subprocess
 from collections import deque
 from contextlib import contextmanager, nullcontext
 from dataclasses import replace
+from functools import partial
 from hashlib import sha256
+from io import BytesIO
 from multiprocessing import get_context
 from pathlib import Path
 from threading import Event, Lock, Thread
-from time import monotonic, sleep
+from time import monotonic, perf_counter, sleep
 from uuid import uuid4
 
 import httpx
 import pytest
 import uvicorn
 from fastapi.testclient import TestClient
+from PIL import Image
 
+from backend.app import main as app_entry
+from backend.app import realtime
+from backend.app.camera_link import CLOCK, Reply
 from backend.app.config import Config
+from backend.app.controller import Controller
 from backend.app.main import create_app
 from backend.app.motion import DIRECTIONS
 from backend.app.serial_link import SerialCommandLink
 from backend.app.simulation import load_simulation
+from backend.app.storage import utc_ms
 from backend.app.uno_wire import (
     ARM,
     DISCARD_PARTIAL,
@@ -39,8 +48,14 @@ from backend.app.uno_wire import (
     decode,
     encode,
 )
-from backend.tests.device_documents import device_documents, write_device_documents
+from backend.tests.device_documents import device_documents, write_camera_documents, write_device_documents
+from backend.tests.test_camera_link import BUILD as CAMERA_BUILD
+from backend.tests.test_camera_link import TOKEN as CAMERA_TOKEN
+from backend.tests.test_camera_link import clock_headers, frame_headers, jpeg_sample
+from backend.tests.test_candidate_review import review
+from backend.tests.test_controller import SERIAL, device, fresh_reports
 from backend.tests.test_device_startup import component
+from backend.tests.test_local_matching import await_file
 from backend.tests.test_realtime import (
     API,
     Clock,
@@ -54,6 +69,7 @@ from backend.tests.test_realtime import (
     wait_for,
 )
 from backend.tests.test_records import BASE, ORIGIN
+from backend.tests.vision_stub import controlled_worker, publish
 
 BUILD = b"\x90" + bytes(31)
 
@@ -363,25 +379,9 @@ def test_selected_command_is_independent_of_device_camera(
     tmp_path: Path, uno_peer_exe: Path, condition: str,
 ) -> None:
     profile, interfaces, evidence, recorded_result = device_documents()
-    profile["serial_max_packet_bytes"] = evidence["measurements"]["serial_max_packet_bytes"]["value"] = MAX_FRAME
+    initialize_command_selection(profile, interfaces, evidence, condition)
     selected = interfaces["hc05_uno"]
-    profile["serial_baud"] = evidence["measurements"]["serial_baud"]["value"] = selected["serial_baud"] = 38400
-    selected["uno"]["target"] = "arduino:avr:uno"
-    if condition == "usb_identity":
-        selected["identity"] = "USB VID:PID=1A86:7523"
-    if condition in ("matched_ble", "mixed_endpoint"):
-        selected.update(transport="ble_gatt", identity=r"BTHLE\DEV_020102030405\7&synthetic", ble_address_type="public")
-        if condition == "matched_ble":
-            del selected["windows_port"]
-    build = json.dumps({
-        **selected["uno"], "version": 1, "kind": "DisabledFixture" if condition == "fixture_artifact" else "Device",
-        "build_id": (bytes(32) if condition == "wrong_build" else BUILD).hex(),
-        "logical_output_sha256": selected["logical_output_sha256"], "serial_baud": profile["serial_baud"],
-        "serial_rx_pin": 2, "serial_tx_pin": 2 if condition == "same_pin" else 3,
-        "packet_ms": 25, "challenge_lifetime_ms": profile["challenge_lifetime_ms"],
-        "firmware_expiry_ms": profile["firmware_expiry_ms"],
-        "hardware_watchdog_ms": 120, "reset_evidence_sha256": selected["logical_output_sha256"],
-    }).encode()
+    build = selected_command_build(profile, selected, condition)
     digest = selected["build_artifact_sha256"] = sha256(build).hexdigest()
     folder = write_device_documents(tmp_path, profile, interfaces, evidence, recorded_result)
     (folder / "artifacts" / digest).write_bytes(build if condition != "changed_artifact" else b"changed")
@@ -402,6 +402,117 @@ def test_selected_command_is_independent_of_device_camera(
                 assert not peer.trace
             elif condition in ("matched", "matched_ble"):
                 assert any(packet.op == HELLO for _, packet in peer.trace)
+
+
+def initialize_command_selection(profile: dict, interfaces: dict, evidence: dict, condition: str) -> None:
+    profile["serial_max_packet_bytes"] = evidence["measurements"]["serial_max_packet_bytes"]["value"] = MAX_FRAME
+    selected = interfaces["hc05_uno"]
+    profile["serial_baud"] = evidence["measurements"]["serial_baud"]["value"] = selected["serial_baud"] = 38400
+    selected["uno"]["target"] = "arduino:avr:uno"
+    if condition == "usb_identity":
+        selected["identity"] = "USB VID:PID=1A86:7523"
+    if condition in ("matched_ble", "mixed_endpoint"):
+        selected.update(transport="ble_gatt", identity=r"BTHLE\DEV_020102030405\7&synthetic", ble_address_type="public")
+        if condition == "matched_ble":
+            del selected["windows_port"]
+
+
+def selected_command_build(profile: dict, selected: dict, condition: str) -> bytes:
+    return json.dumps({
+        **selected["uno"], "version": 1, "kind": "DisabledFixture" if condition == "fixture_artifact" else "Device",
+        "build_id": (bytes(32) if condition == "wrong_build" else BUILD).hex(),
+        "logical_output_sha256": selected["logical_output_sha256"], "serial_baud": profile["serial_baud"],
+        "serial_rx_pin": 2, "serial_tx_pin": 2 if condition == "same_pin" else 3,
+        "packet_ms": 25, "challenge_lifetime_ms": profile["challenge_lifetime_ms"],
+        "firmware_expiry_ms": profile["firmware_expiry_ms"],
+        "hardware_watchdog_ms": 120, "reset_evidence_sha256": selected["logical_output_sha256"],
+    }).encode()
+
+
+def test_selected_camera_shares_the_detection_frame_with_display_and_evidence(
+    tmp_path: Path, monkeypatch: pytest.MonkeyPatch,
+) -> None:
+    monkeypatch.setattr(realtime, "VisionProcess", partial(realtime.VisionProcess, target=controlled_worker))
+
+    class DisabledCommandPeer:
+        cause = latched_failure = output = None
+        failure = "CommandUnavailable"
+
+        def start(self):
+            pass
+
+        def close(self):
+            pass
+
+        def probe(self):
+            return True
+
+        def revoke(self, generation, cause):
+            pass
+
+        def pulse(self, generation, direction, deadline):
+            pytest.fail("The camera and evidence check must leave motion disabled")
+
+    monkeypatch.setattr(app_entry, "SerialCommandLink", lambda *args: DisabledCommandPeer())
+    documents = device_documents()
+    profile, interfaces, evidence, result = documents
+    initialize_command_selection(profile, interfaces, evidence, "matched")
+    # Leave scheduling room for real sockets and the subprocess. These are synthetic test bounds.
+    for name, value in {"clock_uncertainty_limit_us": 10_000, "camera_sync_max_rtt_us": 20_000,
+                        "heartbeat_deadline_ms": 170, "display_deadline_ms": 180,
+                        "capture_age_limit_ms": 200, "input_sample_deadline_ms": 160}.items():
+        profile[name] = evidence["measurements"][name]["value"] = value
+    evidence["stop_budget"] = {"software_ms": 460, "mechanical_margin_ms": 40}
+    command = interfaces["hc05_uno"]
+    build = selected_command_build(profile, command, "matched")
+    digest = command["build_artifact_sha256"] = sha256(build).hexdigest()
+    interfaces["controller"] = {"identity": SERIAL, "profile_sha256": sha256(result).hexdigest()}
+    folder = write_camera_documents(tmp_path, CAMERA_BUILD, CAMERA_TOKEN, documents=documents)
+    (folder / "artifacts" / digest).write_bytes(build)
+    jpeg = jpeg_sample()
+    sequence = 0
+
+    async def camera(path, headers, read_body, timeout):
+        nonlocal sequence
+        if path == CLOCK:
+            stamp = int(perf_counter() * 1_000_000)
+            fields = clock_headers(headers, rx=stamp, tx=stamp)
+        else:
+            await asyncio.sleep(0.02)
+            sequence += 1
+            fields = frame_headers(len(jpeg), sequence, int(perf_counter() * 1_000_000))
+        size = read_body(200, fields, 256)
+        return Reply(jpeg if size else b"", perf_counter(), utc_ms())
+
+    def app_factory(port):
+        controller = Controller(SERIAL, 0.16, lambda: nullcontext(lambda: fresh_reports([device(1)])),
+                                clock=perf_counter)
+        return create_app(Config(tmp_path, backend_port=port, backend_mode="device", yoloe_assets=tmp_path),
+                          controller=controller, camera_exchange=camera)
+
+    with service(tmp_path, app_factory=app_factory) as laf, driving_search(laf) as (headers, driver):
+        worker = tmp_path / "vision"
+        await_file(worker / "prompt.json")
+        publish(worker / "request", "candidate")
+        try:
+            await_file(worker / "frame.json")
+            frame = json.loads((worker / "frame.json").read_text(encoding="utf-8"))
+            wait_for(laf.http, "/snapshot", headers,
+                     lambda _: driver.latest and driver.latest["capture_seq"] > frame["sequence"])
+        finally:
+            (worker / "release").touch()
+        match, _ = review(laf, headers)
+        display = next(item for item in tuple(driver.received_frames) if item["frame_id"] == match["frame_id"])
+        assert (match["frame_id"], match["stream_epoch"]) == (frame["frame"], frame["stream"])
+        assert (display["capture_seq"], display["source_capture_us"], display["source_clock_epoch"]) == (
+            frame["sequence"], frame["source_us"], frame["clock"],
+        )
+        assert match["captured_at_ms"] == display["received_at_ms"] - display["capture_age_bound_ms"]
+        assert match["box"] == {"x": 2, "y": 3, "width": 5, "height": 7}
+        response = laf.http.get(f"{API}/media/{match['evidence_media']['id']}", headers=headers)
+        assert response.status_code == 200 and response.headers["content-type"] == "image/png"
+        with Image.open(BytesIO(jpeg)) as original, Image.open(BytesIO(response.content)) as captured:
+            assert original.convert("RGB").tobytes() == captured.tobytes()
 
 
 def test_serial_shutdown_waits_for_late_open_without_transmitting(uno_peer_exe: Path) -> None:

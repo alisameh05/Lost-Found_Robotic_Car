@@ -19,6 +19,7 @@ from uuid import uuid4
 import httpx
 import pytest
 import uvicorn
+from fastapi import FastAPI
 from fastapi.testclient import TestClient
 from jsonschema import Draft202012Validator
 from PIL import Image
@@ -389,7 +390,8 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
             checkpoint: Callable[[str], None] | None = None, wall: Callable[[], int] | None = None,
             local_vision: bool = False, webcam_factory: Callable[[QualificationProfile, Clock], Webcam] | None = None,
             local_gestures: bool = False, controller_poll: Poll | None = None,
-            live_command: LiveCommandSink | None = None) -> Iterator[Loopback]:
+            live_command: LiveCommandSink | None = None,
+            app_factory: Callable[[int], FastAPI] | None = None) -> Iterator[Loopback]:
     clock = Clock()
     selected = "local-controller-v1" if controller_poll else "local-gestures-v1" if local_gestures else "fixture-v1"
     simulation = load_simulation(selected)
@@ -408,7 +410,7 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
         profile = replace(profile, values={**profile.values, "max_event_message_bytes": event_limit})
     if frame_limit is not None:
         profile = replace(profile, values={**profile.values, "max_frame_bytes": frame_limit})
-    command = None if live_command else CommandDevice(profile)
+    command = None if live_command or app_factory else CommandDevice(profile)
     if command:
         command.start()
     invalidations: list[tuple[str, Channel]] = []
@@ -416,7 +418,7 @@ def service(root: Path, *, blocked: bool = False, event_limit: int | None = None
         listener.bind(("127.0.0.1", 0))
         port = listener.getsockname()[1]
         config = Config(root, backend_port=port, simulation_profile="local-yoloe-v1" if local_vision else selected)
-        app = create_app(config, storage=storage,
+        app = app_factory(port) if app_factory else create_app(config, storage=storage,
                          simulation=Simulation(profile, observations, live_command or command, inference),
                          webcam=webcam_factory(profile, clock) if webcam_factory else None,
                          controller=Controller(SERIAL, profile.bound("input_sample_deadline_ms") / 1000,

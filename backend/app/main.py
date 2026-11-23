@@ -2,12 +2,14 @@ import asyncio
 import sqlite3
 from collections.abc import AsyncIterator, Awaitable, Callable, Mapping
 from contextlib import AbstractContextManager, asynccontextmanager, nullcontext
+from time import monotonic, perf_counter
 
 from fastapi import FastAPI, Request, WebSocket
 from fastapi.responses import JSONResponse, Response
 from PIL import Image
 
 from .ble_link import open_selected_ble
+from .camera_link import CameraLink, Exchange, open_http_exchange
 from .config import Config
 from .control import LeaseFailure, LeaseRejected, Revocation, parse_lease
 from .controller import Controller, open_windows_controller
@@ -106,7 +108,7 @@ def create_app(
     simulation: Simulation | None = None, on_channel_invalidated: Callable[[str, Channel], None] = _ignore_invalidation,
     on_control_revoked: Callable[[Revocation], None] = _ignore_revocation, webcam: Webcam | None = None,
     controller: Controller | None = None, device_probes: Mapping[RobotPath, DeviceProbe] | None = None,
-    command_transport: OpenTransport | None = None,
+    command_transport: OpenTransport | None = None, camera_exchange: Exchange | None = None,
 ) -> FastAPI:
     unavailable_code = "NOT_READY"
     device = None
@@ -130,7 +132,10 @@ def create_app(
     async def lifespan(app: FastAPI) -> AsyncIterator[None]:
         owner: AbstractContextManager[None] = nullcontext() if held_owner else own_data_root(config.data_root)
         with owner:
-            runtime = RecordsRuntime(storage or RecordsStorage(config.data_root))
+            # Python 3.11 on Windows gives monotonic() a ~16 ms tick. A selected camera
+            # needs a shared high-resolution host clock for acquisition, display and safety.
+            clock = perf_counter if device and device.camera else monotonic
+            runtime = RecordsRuntime(storage or RecordsStorage(config.data_root, monotonic=clock))
             app.state.runtime = runtime
             command = None
             if device and device.command and profile:
@@ -154,7 +159,7 @@ def create_app(
                 if (device and webcam_identity is not None) or fixture in (LOCAL_GESTURES_PROFILE_NAME, PHASE_06_PROFILE_NAME):
                     realtime.webcam = webcam or Webcam(
                         profile, lambda: open_windows_camera(webcam_identity),
-                        lambda: open_hand_landmarker(config.gesture_assets), encode_preview,
+                        lambda: open_hand_landmarker(config.gesture_assets), encode_preview, clock=runtime.storage.monotonic,
                     )
                 if (device and controller_identity is not None) or fixture in (LOCAL_CONTROLLER_PROFILE_NAME, PHASE_06_PROFILE_NAME):
                     deadline = (
@@ -162,6 +167,7 @@ def create_app(
                     )
                     realtime.controller = controller or Controller(
                         controller_identity, deadline, lambda: open_windows_controller(controller_identity),
+                        clock=runtime.storage.monotonic,
                     )
             startup = asyncio.create_task(runtime.initialize())
             tasks: tuple[asyncio.Task[None], ...] = ()
@@ -175,6 +181,14 @@ def create_app(
                 tasks = (asyncio.create_task(realtime.maintain_projection()),
                          asyncio.create_task(realtime.maintain_control()),
                          asyncio.create_task(runtime.maintain_safety_storage(realtime)))
+            if device and device.camera and profile:
+                camera = device.camera
+                exchange = camera_exchange or open_http_exchange(
+                    camera.interface.address, camera.interface.port, camera.token,
+                    profile.bound("max_header_bytes"), runtime.storage.monotonic, runtime.storage.clock,
+                )
+                link = CameraLink(profile, camera.build_id, exchange, runtime.storage.monotonic)
+                tasks += (asyncio.create_task(realtime.maintain_camera(link)),)
             if command:
                 command.start()
             if realtime.local_vision:

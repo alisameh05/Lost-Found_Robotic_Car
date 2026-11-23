@@ -2,6 +2,7 @@
 
 import asyncio
 import json
+import logging
 import math
 import re
 from collections import deque
@@ -17,6 +18,7 @@ from fastapi import Request, WebSocket
 from PIL import Image
 from starlette.websockets import WebSocketDisconnect
 
+from .camera_link import CameraFault, CameraLink
 from .candidate import CandidateCapture, evidence_box
 from .config import Config
 from .continuity import Acquisition, Observation, Position, RejectedTrack
@@ -82,6 +84,7 @@ MAX_OUTSTANDING = 32
 # Keep recent consumed entries distinguishable from unknown tickets without an unbounded replay cache.
 MAX_KNOWN_TICKETS = 256
 CAPTURE_INTERVAL = 0.1
+LOGGER = logging.getLogger(__name__)
 PROJECTION_INTERVAL = 0.25
 Projection = dict[str, object]
 EventKind = Literal["snapshot", "session_changed", "candidate_pending", "recovery_changed", "readiness_changed",
@@ -125,10 +128,12 @@ class Frame:
         age = self.age(now)
         if now < sample.observed_at or age >= profile.bound("capture_age_limit_ms"):
             return None
+        received = sample.received_at_ms
         metadata = canonical_json({
             "protocol_version": 1, "source": source, "stream_epoch": sample.stream_epoch,
             "capture_seq": sample.sequence, "frame_id": self.id, "width": sample.width, "height": sample.height,
-            "received_at_ms": utc, "capture_age_bound_ms": age, "source_capture_us": sample.source_us,
+            "received_at_ms": utc if received is None else received,
+            "capture_age_bound_ms": age if received is None else sample.age_ms, "source_capture_us": sample.source_us,
             "source_clock_epoch": sample.clock_epoch,
         }).encode("utf-8")
         if len(metadata) > profile.bound("max_header_bytes") or (
@@ -151,6 +156,7 @@ class IssuedFrame:
     display_deadline: float
     captured_at: float
     retire_at: float
+    sequence: int
 
 
 @dataclass
@@ -164,7 +170,6 @@ class Connection:
     sending_event: bytes | None = None
     waiting: Frame | None = None
     issued: dict[str, IssuedFrame] = field(default_factory=dict)
-    video_generation: int = 0
 
     def end(self, code: int) -> None:
         if not self.close.done():
@@ -267,6 +272,8 @@ class Realtime:
         self._circle_held = False
         self._controller_sample_at = -math.inf
         self._command_cause: str | None = "NOT_READY"
+        self._camera_cause = "NOT_READY"
+        self._camera: CameraLink | None = None
         if simulation:
             self._proximity = ProximityAdvisory(simulation.profile)
             if simulation.command_sink is None:
@@ -526,11 +533,15 @@ class Realtime:
                     self._command_cause = cause
                     if self._projection is not None:
                         self._publish_snapshot()
+            if self.device:
                 self._restore_failures()
             self._evaluate_motion(now)
             robot = self._frames.get("robot")
-            if robot and "robot" in self._live_sources and robot.age(now) >= profile.bound("capture_age_limit_ms"):
-                self._observe_source("robot", None, None, now, profile)
+            if robot and "robot" in self._live_sources and self.component_cause("RobotVideo") is not None:
+                if self._camera:
+                    self._lose_camera(profile, "RobotVideoUnavailable")
+                else:
+                    self._observe_source("robot", None, None, now, profile)
             if self._proximity:
                 before = self._proximity.payload
                 self._proximity.expire(now)
@@ -560,6 +571,7 @@ class Realtime:
         lease.generation_started = self.monotonic()
         lease.motion_generation = True
         lease.workspace = lease.displayed = False
+        lease.displayed_sequence = 0
         if publish:
             self._publish_snapshot()
 
@@ -587,6 +599,8 @@ class Realtime:
                             lease.display_deadline, lease.heartbeat_deadline, self._input_deadlines.get(selected, now),
                             now + (profile.bound("capture_age_limit_ms") - robot.age(now)) / 1000,
                         )
+                        if self._camera:
+                            until = min(until, self._camera.clock_deadline)
                     failed = self._motion.tick(scope, now, self.monotonic, until)
                 if failed:
                     self._revoke(failed)
@@ -600,7 +614,8 @@ class Realtime:
                 self._publish("readiness_changed", None)
 
     def _can_acquire(self, client: str | None) -> bool:
-        return bool(client and self._motion and self.profile and not self._closed and self._generation < SAFE_INTEGER - 1
+        preview = self._camera is not None and self.component_cause("RobotVideo") is None
+        return bool(client and (self._motion or preview) and self.profile and not self._closed and self._generation < SAFE_INTEGER - 1
                     and (client, "events") in self._connections)
 
     async def change_lease(self, request: LeaseRequest) -> Projection:
@@ -737,7 +752,7 @@ class Realtime:
             cause = self._motion.live.cause
             if cause or self.device:
                 return cause
-        if self.device and name in ("Command", "RobotVideo"):
+        if self.device and (name == "Command" or (name == "RobotVideo" and self.device.camera is None)):
             return self.device.causes.get(name, "NOT_READY")
         now = self.monotonic()
         if name == "AI" and self.local_vision:
@@ -746,8 +761,9 @@ class Realtime:
             return None if self._storage_ready and now < self._storage_until else "STORAGE_UNAVAILABLE"
         if name == "RobotVideo":
             frame = self._frames.get("robot")
-            live = "robot" in self._live_sources and frame and frame.age(now) < self.profile.bound("capture_age_limit_ms")
-            return None if live else "NOT_READY"
+            live = ("robot" in self._live_sources and frame and frame.age(now) < self.profile.bound("capture_age_limit_ms")
+                    and (self._camera is None or now < self._camera.clock_deadline))
+            return None if live else self._camera_cause
         if (name == "Command" and self._motion and
                 (self.failure_for(self.safety_session, "CommandUnavailable") or
                  self.failure_for(self.safety_session, "CommandExpired")) and not self._motion.command_ready()):
@@ -1071,7 +1087,9 @@ class Realtime:
         owns = lease is not None and lease.client == client
         readiness = cast(Projection, state["readiness"])
         live = {"Workspace": bool(owns and lease and lease.workspace),
-                "DisplayedRobotVideo": bool(owns and lease and lease.displayed)}
+                "DisplayedRobotVideo": bool(owns and lease and lease.displayed
+                                            and self.monotonic() < lease.display_deadline
+                                            and self.component_cause("RobotVideo") is None)}
         components = []
         for component in cast(list[Projection], readiness["components"]):
             name = str(component["component"])
@@ -1119,7 +1137,7 @@ class Realtime:
             await asyncio.sleep(PROJECTION_INTERVAL)
 
     def _check_capture(self, source: Source, capture: Capture, previous: Frame | None, now: float,
-                       profile: QualificationProfile, scope: InputScope | None) -> Frame | None:
+                       profile: QualificationProfile, scope: InputScope | None, *, decoded: bool = False) -> Frame | None:
         if (not capture_identity_valid(capture) or not math.isfinite(capture.observed_at)
                 or capture.observed_at > now or not dimensions_allowed(profile, capture.width, capture.height)
                 or len(capture.jpeg) + 4 >= profile.bound("max_frame_bytes")
@@ -1127,24 +1145,63 @@ class Realtime:
             return None
         utc = self.utc()
         age = capture.age_ms + math.ceil((now - capture.observed_at) * 1000)
-        frame = Frame(token_urlsafe(18), capture, max(0, utc - age), scope)
+        captured_at = (utc - age if capture.received_at_ms is None
+                       else capture.received_at_ms - capture.age_ms)
+        frame = Frame(token_urlsafe(18), capture, max(0, captured_at), scope)
         if frame.header(source, now, utc, profile) is None:
             return None
         if previous:
             old = previous.capture
-            if old.stream_epoch == capture.stream_epoch and (
-                old.clock_epoch != capture.clock_epoch or old.sequence >= capture.sequence
-                or old.source_us >= capture.source_us
-            ):
-                return None
+            if old.stream_epoch == capture.stream_epoch:
+                if old.clock_epoch == capture.clock_epoch:
+                    if old.sequence >= capture.sequence or old.source_us >= capture.source_us:
+                        return None
+                elif not decoded:
+                    return None
             # Static scene bytes have already been decoded and checked.
             if capture.jpeg is old.jpeg and (capture.width, capture.height) == (old.width, old.height):
                 return frame
+        if decoded:
+            return frame
         try:
             read_sample(capture.jpeg, profile, (capture.width, capture.height))
         except (OSError, ValueError, Image.DecompressionBombError):
             return None
         return frame
+
+    async def maintain_camera(self, camera: CameraLink) -> None:
+        self._camera = camera
+        profile = camera.profile
+        retry = min(CAPTURE_INTERVAL, profile.bound("capture_age_limit_ms") / 2000)
+        while not self._closed:
+            try:
+                if camera.sync_due() and await camera.synchronize():
+                    self._lose_camera(profile, "CameraEpochChanged")
+                capture = await camera.capture()
+                now = self.monotonic()
+                frame = self._check_capture("robot", capture, self._frames.get("robot"), now,
+                                            profile, self._input_scope(), decoded=True)
+                if frame is None:
+                    raise CameraFault("Camera frame expired before admission or exceeded the video envelope")
+                was_live = "robot" in self._live_sources
+                self._camera_cause = "NOT_READY"
+                self._observe_source("robot", capture, frame, now, profile)
+                if not was_live:
+                    self._publish_snapshot()
+            except CameraFault as error:
+                if not error.discard:
+                    LOGGER.debug("Camera acquisition unavailable: %s", error)
+                    reason = "CameraEpochChanged" if error.epoch_changed else "RobotVideoUnavailable"
+                    self._lose_camera(profile, reason, incompatible=error.incompatible)
+                await asyncio.sleep(retry)
+
+    def _lose_camera(self, profile: QualificationProfile, reason: str, *, incompatible: bool = False) -> None:
+        cause = "PROTOCOL_UNSUPPORTED" if incompatible else "NOT_READY"
+        changed = self._camera_cause != cause or "robot" in self._live_sources
+        self._camera_cause = cause
+        self._observe_source("robot", None, None, self.monotonic(), profile, failure=reason)
+        if changed:
+            self._publish_snapshot()
 
     async def capture(self) -> None:
         simulation = self.simulation
@@ -1429,7 +1486,7 @@ class Realtime:
         frame = self._frames.get("robot")
         if (self._rejected_track is track and self._input_scope() == scope
                 and self._active_state in ("Searching", "Paused") and frame and frame.scope == scope
-                and "robot" in self._live_sources
+                and self.component_cause("RobotVideo") is None
                 and self.component_cause("AI") is None
                 and frame.age(self.monotonic()) < profile.bound("capture_age_limit_ms")
                 and frame.capture.observed_at - frame.capture.age_ms / 1000
@@ -1472,7 +1529,7 @@ class Realtime:
 
     def _matching_frame(self, scope: InputScope, profile: QualificationProfile) -> Frame | None:
         frame, lease, now = self._frames.get("robot"), self._lease, self.monotonic()
-        if (frame and lease and "robot" in self._live_sources and scope == self._motion_scope()
+        if (frame and lease and self.component_cause("RobotVideo") is None and scope == self._motion_scope()
                 and frame.age(now) < profile.bound("capture_age_limit_ms")
                 and frame.capture.observed_at - frame.capture.age_ms / 1000
                 >= max(self._active_since, lease.generation_started or 0.0)):
@@ -1641,13 +1698,14 @@ class Realtime:
                 self._publish("readiness_changed", None)
 
     def _observe_source(self, source: Source, capture: Capture | None, frame: Frame | None, now: float,
-                        profile: QualificationProfile) -> None:
+                        profile: QualificationProfile, *, failure: str | None = None) -> None:
         old = self._frames.get(source)
         channel: Channel = "robot-video" if source == "robot" else "webcam-video"
         if frame:
             self._frames[source] = frame
             self._live_sources.add(source)
-            epoch_changed = bool(old and old.capture.stream_epoch != frame.capture.stream_epoch)
+            epoch_changed = bool(old and (old.capture.stream_epoch, old.capture.clock_epoch)
+                                 != (frame.capture.stream_epoch, frame.capture.clock_epoch))
             if epoch_changed and source == "robot":
                 self._exit_observation = None
                 self._interrupt_tracking()
@@ -1674,14 +1732,18 @@ class Realtime:
             if source == "robot":
                 self._exit_observation = None
                 self._interrupt_tracking()
-            if was_live and source == "robot" and self._lease is None:
-                self._path_lost("RobotVideo")
+                if failure and (was_live or failure == "CameraEpochChanged"):
+                    if self._lease:
+                        self._revoke(failure)
+                    elif self.safety_session is not None:
+                        self.record_failure(failure, self.safety_session)
+                elif was_live and self._lease is None:
+                    self._path_lost("RobotVideo")
             for connection in tuple(self._connections.values()):
                 if connection.channel == channel:
                     connection.waiting = None
                     connection.issued.clear()
                     if was_live:
-                        connection.video_generation += 1
                         self._invalidate_channel(connection.client, channel)
 
     def object_removed(self, owner: str, hidden_actions: Collection[str] = ()) -> None:
@@ -1761,8 +1823,9 @@ class Realtime:
                 self._replace(connection)
                 source: Source = "robot" if channel == "robot-video" else "webcam"
                 if source in self._live_sources:
-                    connection.waiting = self._frames[source]
-                    connection.ready.set()
+                    if source != "robot" or self.component_cause("RobotVideo") is None:
+                        connection.waiting = self._frames[source]
+                        connection.ready.set()
             await self._deliver(socket, connection, profile)
         except (WebSocketDisconnect, OSError):
             pass
@@ -1819,12 +1882,13 @@ class Realtime:
             elif connection.waiting is not None:
                 frame, connection.waiting = connection.waiting, None
                 source: Source = "robot" if connection.channel == "robot-video" else "webcam"
+                if source == "robot" and self.component_cause("RobotVideo") is not None:
+                    continue
                 metadata = frame.header(source, self.monotonic(), self.utc(), profile)
                 if metadata is not None:
-                    generation = connection.video_generation
-                    await socket.send_bytes(len(metadata).to_bytes(4, "big") + metadata + frame.capture.jpeg)
-                    if source == "robot" and not connection.close.done() and generation == connection.video_generation:
+                    if source == "robot":
                         self._track_frame(connection, frame, profile)
+                    await socket.send_bytes(len(metadata).to_bytes(4, "big") + metadata + frame.capture.jpeg)
                 continue
             connection.ready.clear()
 
@@ -1834,13 +1898,15 @@ class Realtime:
         for ident, old in tuple(connection.issued.items()):
             if now >= old.retire_at:
                 del connection.issued[ident]
-        if frame.age(now) < limit and "robot" in self._live_sources:
+        if frame.age(now) < limit and self.component_cause("RobotVideo") is None:
             if len(connection.issued) >= MAX_ISSUED_FRAMES:
                 del connection.issued[next(iter(connection.issued))]
             capture = frame.capture
             deadline = capture.observed_at + (limit - capture.age_ms) / 1000
             retired = capture.observed_at + (profile.bound("capture_age_limit_ms") - capture.age_ms) / 1000
-            connection.issued[frame.id] = IssuedFrame(capture.stream_epoch, deadline, capture.observed_at, retired)
+            connection.issued[frame.id] = IssuedFrame(capture.stream_epoch, deadline,
+                                                      capture.observed_at - capture.age_ms / 1000,
+                                                      retired, capture.sequence)
 
     def _heartbeat(self, connection: Connection, data: object, profile: QualificationProfile) -> bool:
         now = self.monotonic()
@@ -1874,11 +1940,12 @@ class Realtime:
         if indication is None and lease.displayed and lease.session and not setup_heartbeat:
             self._revoke("DisplayStale")
             return True
+        displayed = False
         if indication is not None:
             video = self._connections.get((connection.client, "robot-video"))
             if (not isinstance(indication, dict) or indication.keys() != {"frame_id", "stream_epoch"}
                     or not all(domain_id(value) for value in indication.values()) or video is None
-                    or "robot" not in self._live_sources):
+                    or self.component_cause("RobotVideo") is not None):
                 return False
             frame = video.issued.get(indication["frame_id"])
             if frame is None or indication["stream_epoch"] != frame.stream_epoch:
@@ -1888,10 +1955,17 @@ class Realtime:
                 return True
             if lease.generation_started is not None and frame.captured_at < lease.generation_started:
                 return True
-            # The deadline is anchored to acquisition, so receiving the same identity never extends it.
-            if not setup_heartbeat:
+            # Only forward acquisitions can update the deadline. The same frame may still be on screen.
+            if not setup_heartbeat and frame.sequence > lease.displayed_sequence:
                 lease.display_deadline = frame.display_deadline
-        changed = lease.setup_handoff or not lease.workspace or lease.displayed != (indication is not None)
+                lease.displayed_sequence = frame.sequence
+                displayed = True
+            elif frame.sequence < lease.displayed_sequence:
+                self._revoke("DisplayStale")
+                return True
+            else:
+                displayed = lease.displayed
+        changed = lease.setup_handoff or not lease.workspace or lease.displayed != displayed
         lease.heartbeat_seq = data["heartbeat_seq"]
         if setup_heartbeat:
             # An in-flight setup heartbeat cannot renew the newly bound session.
@@ -1900,7 +1974,7 @@ class Realtime:
         lease.previous_generation = None
         lease.heartbeat_deadline = now + profile.bound("heartbeat_deadline_ms") / 1000
         lease.workspace = True
-        lease.displayed = indication is not None
+        lease.displayed = displayed
         if changed and self._projection is not None:
             self._publish("readiness_changed", None)
         return True

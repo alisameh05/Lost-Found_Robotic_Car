@@ -79,10 +79,12 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
   }, [eligible, busy, accepted, runtime, workspace?.controlling, workspace?.acquiring]);
 
   const readiness = view.failedRead ? health?.readiness : snapshot?.readiness ?? health?.readiness;
+  const previewLive = !!workspace?.previewLive && (!deviceMode || readiness?.components.some(
+    ({ component, status }) => component === "RobotVideo" && status === "Ready"));
   const required = describeDeviceReadiness(readiness, mode);
   const blockedPaths = [...required.shared, ...(required.selected ? [required.selected] : [])]
     .filter(({ component, status }) => status !== "Ready" && component !== "Workspace" && component !== "DisplayedRobotVideo");
-  const ready = eligible && !!workspace?.eventsLive && workspace.usable && workspace.controlling && workspace.previewLive &&
+  const ready = eligible && !!workspace?.eventsLive && workspace.usable && workspace.controlling && previewLive &&
     snapshot?.readiness.can_start[mode] === true;
   const spectator = snapshot?.lease.state === "Owned" && !workspace?.controlling && !workspace?.acquiring && !workspace?.retryAcquisition;
   const acquisitionBlocked = recordBlock ?? (referenceDisplayed === false ? "The reference image is unavailable."
@@ -90,7 +92,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
     : !profile ? "A compatible qualification profile is unavailable."
     : !workspace?.eventsLive ? "Wait for current search readiness."
     : spectator ? "Another workspace holds control."
-    : !workspace.previewLive ? "Wait for a live robot preview."
+    : !previewLive ? "Wait for a live robot preview."
     : !workspace.usable ? "Keep this workspace visible and focused."
     : !eligible || (!snapshot?.lease.can_acquire && !workspace?.retryAcquisition) ? "Control is currently unavailable." : undefined);
 
@@ -110,7 +112,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
     notice = pathCheck("RobotVideo", true);
   }
   if (!notice && blockedPaths.length) notice = blockedPaths.map(({ component }) => devicePaths[component].label).join(", ") + " must report Ready.";
-  if (!notice && workspace?.eventsLive && !workspace.previewLive) notice = "Wait for a fresh robot frame.";
+  if (!notice && workspace?.eventsLive && !previewLive) notice = "Wait for a fresh robot frame.";
 
   return <>
     <div className={styles.columns}>
@@ -123,7 +125,7 @@ function Setup({ object, initialMode }: { object: ObjectRecord; initialMode: Con
         {showPreview && <Panel className={styles.card} aria-labelledby="robot-preview-title">
           <div className={styles.row}>
             <h2 id="robot-preview-title">{recordsMode && !deviceMode ? "Simulated robot preview" : "Robot preview"}</h2>
-            <StatusBadge tone={workspace?.previewLive ? "success" : "warning"}>{workspace?.previewLive ? "Live preview" : "Not live"}</StatusBadge>
+            <StatusBadge tone={previewLive ? "success" : "warning"}>{previewLive ? "Live preview" : "Not live"}</StatusBadge>
           </div>
           <div ref={canvas} className={styles.preview} />
           <p className={styles.muted}>{integrated ? "Offline YOLOE · Recorded robot video and simulated commands"

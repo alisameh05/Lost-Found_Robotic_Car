@@ -37,9 +37,10 @@ BOUNDS = {
 }
 PAIRED_ID = r"BTHENUM\synthetic-command-identity"
 BUILD_HASH = "a" * 64
+DeviceDocuments = tuple[dict[str, Any], dict[str, Any], dict[str, Any], bytes]
 
 
-def device_documents() -> tuple[dict[str, Any], dict[str, Any], dict[str, Any], bytes]:
+def device_documents() -> DeviceDocuments:
     artifact = b"Synthetic adapter-boundary fixture. No connected-device measurements."
     digest = sha256(artifact).hexdigest()
     build = {"target": "test:fixture:board", "firmware_sha256": BUILD_HASH,
@@ -99,4 +100,24 @@ def write_device_documents(
         "device_protocol_manifest_sha256": interfaces_hash, "evidence_manifest_sha256": sha256(evidence_data).hexdigest(),
         **profile,
     }), encoding="utf-8")
+    return folder
+
+
+def write_camera_documents(root: Path, build_id: str, token: str, *, unsupported_contract: bool = False,
+                           documents: DeviceDocuments | None = None) -> Path:
+    profile, interfaces, evidence, artifact = documents or device_documents()
+    camera = interfaces["esp32_cam"]
+    camera["variant"] = "ai-thinker-rhyx-gc2145"
+    camera["esp32_cam"] = {**camera["esp32_cam"], "target": "esp32:esp32:esp32cam"}
+    specification = Path(__file__).resolve().parents[2] / "firmware" / "esp32_camera" / "contract.v1.json"
+    contract = b'{"version":1}' if unsupported_contract else specification.read_bytes()
+    contract_reference = sha256(contract).hexdigest()
+    camera["contract_sha256"] = contract_reference
+    build = json.dumps({**camera["esp32_cam"], "version": 1, "variant": camera["variant"], "build_id": build_id}).encode()
+    reference = sha256(build).hexdigest()
+    camera["build_artifact_sha256"] = reference
+    folder = write_device_documents(root, profile, interfaces, evidence, artifact)
+    (folder / "artifacts" / contract_reference).write_bytes(contract)
+    (folder / "artifacts" / reference).write_bytes(build)
+    (folder / "camera.token").write_text(token, encoding="ascii")
     return folder

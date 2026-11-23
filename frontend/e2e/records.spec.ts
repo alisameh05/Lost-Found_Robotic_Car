@@ -27,8 +27,10 @@ async function startBackend(options: {
   controllerSamples?: string;
   phase06?: "gestures" | "controller" | "native-landmarker" | "production";
   device?: boolean;
+  cameraReplay?: boolean;
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
+    : options.cameraReplay ? ["backend.tests.camera_preview_replay"]
     : options.phase06 && options.phase06 !== "production" ? ["backend.tests.phase06_replay", parent, options.phase06]
     : options.controllerSamples ? ["backend.tests.crash_registration", "controller", options.controllerSamples]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
@@ -44,7 +46,7 @@ async function startBackend(options: {
     cwd: repo, windowsHide: true, env: {
       ...process.env, LOCALAPPDATA: parent, LAF_DATA_ROOT: join(parent, "records"),
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
-      LAF_BACKEND_MODE: options.device ? "device" : options.phase06 ? "fixture" : undefined,
+      LAF_BACKEND_MODE: options.device || options.cameraReplay ? "device" : options.phase06 ? "fixture" : undefined,
       LAF_SIMULATION_PROFILE: options.phase06 ? "phase-06-v1" : options.yoloe ? "local-yoloe-v1"
         : options.gestures ? "local-gestures-v1"
           : options.localController || options.controllerSamples ? "local-controller-v1"
@@ -253,6 +255,25 @@ test("keeps the explicit Phase 06 fixture labeled with simulated robot paths", a
   for (const name of ["Robot command connection", "Robot camera"]) {
     await expect(page.locator("summary").filter({ hasText: name })).toContainText("Ready");
   }
+});
+
+test("renders the selected camera adapter in Search Setup and retains the last image after link loss", async ({ page }) => {
+  await startBackend({ cameraReplay: true });
+  await loopbackOnly(page);
+  await seedLibrary([["camera-target", "Camera target", "Lost", Date.now() - 1_000]], ["camera-target"]);
+  await page.goto("/objects/camera-target/search");
+  const preview = page.getByRole("region", { name: "Robot preview" });
+  await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Search" })).toBeDisabled();
+  const canvas = preview.getByRole("img", { name: "Robot camera view", exact: true });
+  const displayed = await canvas.evaluate((element: HTMLCanvasElement) => element.toDataURL());
+  const dropped = join(parent, "records", "replay-drop-camera");
+  writeFileSync(dropped, "offline");
+  await expect(preview.getByText("Not live", { exact: true })).toBeVisible();
+  expect(await canvas.evaluate((element: HTMLCanvasElement) => element.toDataURL())).toBe(displayed);
+  unlinkSync(dropped);
+  await expect(preview.getByText("Live preview", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Start Search" })).toBeDisabled();
 });
 
 type PreviewProbe = { events?: WebSocket; initialSnapshot?: string; repeatFrames: boolean };
