@@ -30,6 +30,10 @@ LOCAL_CONTROLLER_PROFILE_NAME = "local-controller-v1"
 PHASE_06_PROFILE_NAME = "phase-06-v1"
 SOURCES: tuple[Source, ...] = ("robot", "webcam")
 ID = re.compile(r"[A-Za-z0-9_-]{1,128}")
+PROXIMITY_BOUNDS = frozenset({
+    "proximity_sample_deadline_ms", "proximity_warning_mm", "proximity_clear_mm",
+    "proximity_clear_samples", "proximity_max_distance_mm",
+})
 
 
 class IncompatibleProfile(ValueError):
@@ -58,6 +62,17 @@ class QualificationProfile:
         ):
             raise IncompatibleProfile("The qualification profile is incompatible.")
         definitions = contract_definitions()
+        if kind == "Device":
+            # The local Device bundle can omit unqualified advisory bounds.
+            # The exported v1 schema and safe frontend subset stay intact.
+            schema = definitions["QualificationProfile"]
+            assert isinstance(schema, dict)
+            definitions["QualificationProfile"] = {
+                **schema, "required": [key for key in schema["required"] if key not in PROXIMITY_BOUNDS],
+            }
+            if isinstance(document, dict):
+                document = {key: value for key, value in document.items() if key not in PROXIMITY_BOUNDS
+                            or (type(value) is int and 1 <= value <= SAFE_INTEGER)}
         validator = Draft202012Validator({"$defs": definitions, "$ref": "#/$defs/QualificationProfile"})
         if not isinstance(document, dict) or not validator.is_valid(document):
             raise ValueError("The qualification profile is invalid.")
@@ -82,9 +97,12 @@ class QualificationProfile:
             and p["command_renewal_interval_ms"] < min(p["challenge_lifetime_ms"], p["firmware_expiry_ms"])
             and p["clock_uncertainty_limit_us"] <= p["camera_sync_max_rtt_us"]
             and p["clock_uncertainty_limit_us"] < p["capture_age_limit_ms"] * 1000
-            and p["proximity_warning_mm"] < p["proximity_clear_mm"] <= p["proximity_max_distance_mm"]
         ):
             raise ValueError("The qualification profile bounds are inconsistent.")
+        if kind == "Fixture" and not (
+            p["proximity_warning_mm"] < p["proximity_clear_mm"] <= p["proximity_max_distance_mm"]
+        ):
+            raise ValueError("The fixture proximity bounds are inconsistent.")
         frontend_schema = definitions["FrontendProfile"]
         assert isinstance(frontend_schema, dict)
         frontend = {name: p[name] for name in frontend_schema["required"]}
@@ -151,8 +169,9 @@ class ProximitySample:
 
 
 class ProximityAdvisory:
-    def __init__(self, profile: QualificationProfile):
+    def __init__(self, profile: QualificationProfile, minimum: int = 0):
         self.profile = profile
+        self.minimum = minimum
         self.latest: ProximitySample | None = None
         self.clear_count = 0
         self.payload: dict[str, object] = {
@@ -160,30 +179,26 @@ class ProximityAdvisory:
             "sample_seq": None, "source_epoch": None, "observed_at_ms": None,
         }
 
-    def observe(self, sample: ProximitySample | None, now: float, utc: int) -> None:
-        if sample is None:
-            self.expire(now)
-            return
+    def observe(self, sample: ProximitySample, now: float, utc: int) -> None:
+        self.expire(now)
         previous = self.latest
         limit = self.profile.bound("proximity_sample_deadline_ms") / 1000
-        if (previous and type(sample.sequence) is int and sample.source_epoch == previous.source_epoch
-                and sample.sequence <= previous.sequence):
-            self.expire(now)
-            return
         if (not isinstance(sample.source_epoch, str) or not ID.fullmatch(sample.source_epoch) or type(sample.sequence) is not int
-                or not 1 <= sample.sequence <= SAFE_INTEGER or not math.isfinite(sample.observed_at)
-                or not 0 <= now - sample.observed_at < limit
-                or (previous is not None and sample.observed_at <= previous.observed_at)):
+                or not 1 <= sample.sequence <= SAFE_INTEGER or type(sample.observed_at) not in (float, int)
+                or not math.isfinite(sample.observed_at)
+                or (previous is not None and sample.source_epoch == previous.source_epoch
+                    and sample.sequence <= previous.sequence)):
             self.unknown()
             return
         if (previous is None or sample.source_epoch != previous.source_epoch
                 or sample.sequence != previous.sequence + 1 or sample.observed_at - previous.observed_at >= limit):
-            self.clear_count = 0
+            self.unknown()
         self.latest = sample
         distance = sample.distance_mm
-        state = "Unknown" if previous and sample.source_epoch != previous.source_epoch else self.payload["state"]
+        state = self.payload["state"]
         latched = self.payload["warning_latched"]
-        if type(distance) is not int or not 0 <= distance <= self.profile.bound("proximity_max_distance_mm"):
+        if (not 0 <= now - sample.observed_at < limit or type(distance) is not int
+                or not self.minimum <= distance <= self.profile.bound("proximity_max_distance_mm")):
             self.unknown()
             return
         if distance <= self.profile.bound("proximity_warning_mm"):

@@ -17,9 +17,17 @@ struct Timing {
 using Output = void (*)(uint8_t direction);
 using ReplyWriter = void (*)(const uint8_t *, size_t);
 
+struct ProximitySample {
+    uint32_t sequence;
+    uint16_t age_ms;
+    uint16_t distance_mm;  // Zero represents an invalid observation.
+};
+using TakeProximity = bool (*)(uint32_t now, ProximitySample &sample);
+
 class Peer {
 public:
-    Peer(uint32_t boot, Timing timing, const uint8_t *build, Output output, ReplyWriter write);
+    Peer(uint32_t boot, Timing timing, const uint8_t *build, Output output, ReplyWriter write,
+         TakeProximity proximity = nullptr);
     void tick(uint32_t now);
     void receive(uint8_t byte, uint32_t now);
     void transportFault();
@@ -28,12 +36,14 @@ private:
     void disable();
     void apply(uint32_t now);
     void acknowledge(uint8_t op, uint32_t sequence, uint32_t echo, uint32_t now);
+    void reportProximity(uint32_t now);
 
     const uint32_t boot_;
     const Timing timing_;
     const uint8_t *const build_;
     const Output output_;
     const ReplyWriter write_;
+    const TakeProximity proximity_;
     uint32_t generation_ = 0, sequence_ = 0, counter_ = 0;
     uint32_t challenge_at_ = 0, lease_at_ = 0, packet_at_ = 0;
     uint8_t frame_[MaxFrame - 1], raw_[Request];

@@ -119,7 +119,7 @@ def test_device_connection_diagnostics_are_independent_and_disarmed(
     ("zero_limit", "NOT_READY"), ("frame_header", "NOT_READY"), ("event_queue", "NOT_READY"),
     ("heartbeat", "NOT_READY"), ("display_age", "NOT_READY"), ("capture_clock", "NOT_READY"),
     ("camera_rtt", "NOT_READY"), ("renewal_ack", "NOT_READY"), ("expiry", "NOT_READY"),
-    ("proximity", "NOT_READY"), ("no_margin", "NOT_READY"), ("wrong_value", "NOT_READY"),
+    ("no_margin", "NOT_READY"), ("wrong_value", "NOT_READY"),
     ("fixture_evidence", "NOT_READY"), ("changed_evidence", "NOT_READY"), ("fixture_measurement", "NOT_READY"),
     ("other_interfaces", "NOT_READY"), ("unsupported_measurement", "NOT_READY"),
 ])
@@ -132,7 +132,6 @@ def test_invalid_device_profile_never_reaches_adapter_boundary(tmp_path: Path, c
         "heartbeat": ("heartbeat_deadline_ms", 30), "display_age": ("display_deadline_ms", 161),
         "capture_clock": ("clock_uncertainty_limit_us", 7001), "camera_rtt": ("camera_sync_interval_ms", 1),
         "renewal_ack": ("command_ack_deadline_ms", 55), "expiry": ("firmware_expiry_ms", 20),
-        "proximity": ("proximity_clear_mm", 100),
     }.get(case)
     if invalid:
         key, value = invalid

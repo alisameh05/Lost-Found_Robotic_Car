@@ -22,7 +22,9 @@ COMMON = {"version", "profile_id", "kind", *SERIAL_FIELDS}
 DEVICE = {"enable_pins", "enable_active_high", "direction_pins", "direction_levels", "duty",
           "reset_enable_levels", "reset_evidence_sha256"}
 PIN_FIELDS = {"serial_rx_pin", "serial_tx_pin"}
-SKETCH = ("uno.ino", "command.h", "command.cpp", "command_port.h", "command_port.cpp")
+PROXIMITY_INTERVAL = "proximity_sample_interval_ms"
+SKETCH = ("uno.ino", "command.h", "command.cpp", "command_port.h", "command_port.cpp",
+          "proximity.h", "proximity.cpp")
 
 
 def int_in(value, low, high):
@@ -34,6 +36,7 @@ def load_mapping(data):
         raise ValueError("The logical mapping must be an object")
     kind = data.get("kind")
     allowed = COMMON | DEVICE | PIN_FIELDS if kind == "Device" else COMMON | (PIN_FIELDS & data.keys())
+    allowed |= {PROXIMITY_INTERVAL} & data.keys()
     if kind not in ("Device", "DisabledFixture") or data.keys() != allowed:
         raise ValueError("Supply an explicit v1 Device or DisabledFixture logical mapping")
     if type(data["version"]) is not int or data["version"] != 1 or not re.fullmatch(
@@ -68,6 +71,11 @@ def load_mapping(data):
                 or len(duties) != 5 or any(len(row) != 2 or not all(int_in(duty, 0, 255) for duty in row) for row in duties)
                 or duties[0] != [0, 0] or any(row == [0, 0] for row in duties[1:])):
             raise ValueError("Supply direction levels and PWM for disabled, forward, backward, left and right")
+    if PROXIMITY_INTERVAL in data:
+        if not int_in(data[PROXIMITY_INTERVAL], 60, 60_000):
+            raise ValueError("Invalid HC-SR04 sample interval")
+        if kind == "Device" and {12, 13}.intersection(data["enable_pins"] + data["direction_pins"]):
+            raise ValueError("HC-SR04 D12/D13 conflict with the configured motor outputs")
     return data
 
 
@@ -79,6 +87,7 @@ def header(mapping, build_id):
     lines = [
         f'#define LAF_DEVICE_OUTPUT {int(mapping["kind"] == "Device")}',
         f'#define LAF_HC05_PINS {int("serial_rx_pin" in mapping)}',
+        f'#define LAF_PROXIMITY {int(PROXIMITY_INTERVAL in mapping)}',
         f'constexpr unsigned long Baud = {mapping["serial_baud"]}UL;',
         "constexpr uno::Timing Timings = " + initializer([
             mapping["packet_ms"], mapping["challenge_lifetime_ms"], mapping["firmware_expiry_ms"],
@@ -86,6 +95,8 @@ def header(mapping, build_id):
         "constexpr uint8_t BuildId[32] = " + initializer(list(build_id)) + ";",
         f'constexpr uint8_t HardwareWatchdog = WDTO_{mapping["hardware_watchdog_ms"]}MS;',
     ]
+    if PROXIMITY_INTERVAL in mapping:
+        lines.append(f"constexpr uint32_t ProximityIntervalMs = {mapping[PROXIMITY_INTERVAL]}UL;")
     if "serial_rx_pin" in mapping:
         lines.extend((f'constexpr uint8_t RxPin = {mapping["serial_rx_pin"]};',
                       f'constexpr uint8_t TxPin = {mapping["serial_tx_pin"]};'))
@@ -160,6 +171,9 @@ def main():
         artifact["reset_evidence_sha256"] = mapping["reset_evidence_sha256"]
     if "serial_rx_pin" in mapping:
         artifact.update({key: mapping[key] for key in sorted(PIN_FIELDS)})
+    if PROXIMITY_INTERVAL in mapping:
+        artifact.update(proximity_protocol_version=1, proximity_trigger_pin=12, proximity_echo_pin=13,
+                        proximity_sample_interval_ms=mapping[PROXIMITY_INTERVAL])
     args.output.joinpath("build.json").write_text(json.dumps(artifact, indent=2) + "\n", encoding="utf-8")
     print(f"Uno firmware SHA-256 {firmware}")
 

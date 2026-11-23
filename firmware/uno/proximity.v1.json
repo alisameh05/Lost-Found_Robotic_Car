@@ -1,0 +1,18 @@
+{
+  "version": 1,
+  "source": "uno-r3",
+  "sensor": "HC-SR04",
+  "transport": "uno-command",
+  "target": "arduino:avr:uno",
+  "trigger_pin": 12,
+  "echo_pin": 13,
+  "unit": "mm",
+  "frame_bytes": 23,
+  "maximum_distance_mm": 6000,
+  "encoding": "01 followed by COBS(body + CRC16-CCITT-FALSE LE) and a zero delimiter",
+  "body_le": [["version", "u8"], ["boot", "u32"], ["ack_successor", "u32"], ["sequence", "u32"], ["age_ms", "u16"], ["distance_mm", "u16"], ["valid", "u8"]],
+  "invalid_distance_mm": 0,
+  "trigger_interval_build_field": "proximity_sample_interval_ms",
+  "freshness": "age_ms is rounded up from trigger to ACK creation. Using the correlated host request-send time minus age_ms gives a conservative host timestamp.",
+  "delivery": "At most one new observation after a STATUS or DRIVE acknowledgement. Lost, invalid, incompatible, old or repeated observations cannot establish Clear."
+}

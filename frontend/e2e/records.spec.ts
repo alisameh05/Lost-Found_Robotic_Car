@@ -28,9 +28,11 @@ async function startBackend(options: {
   phase06?: "gestures" | "controller" | "native-landmarker" | "production";
   device?: boolean;
   cameraReplay?: boolean;
+  proximityReplay?: string;
 } = {}) {
   const entry = options.initializationGate ? ["backend.tests.pause_startup", options.initializationGate]
     : options.cameraReplay ? ["backend.tests.camera_preview_replay"]
+    : options.proximityReplay ? ["backend.tests.proximity_replay", options.proximityReplay]
     : options.phase06 && options.phase06 !== "production" ? ["backend.tests.phase06_replay", parent, options.phase06]
     : options.controllerSamples ? ["backend.tests.crash_registration", "controller", options.controllerSamples]
     : options.crashAfterCommit ? ["backend.tests.crash_registration", "committed"]
@@ -102,6 +104,50 @@ function sourceImage(name = "operator-photo.png") {
   ], { windowsHide: true });
   return source;
 }
+
+test("shows Uno proximity advice in the protected live workspace without changing held control", async ({ page }) => {
+  const scenario = join(parent, "proximity-replay.jsonl");
+  let delivery = 0;
+  let holding = false;
+  function replay(sample?: { sequence: number; distance: number; age_ms?: number; valid?: number }) {
+    appendFileSync(scenario, JSON.stringify({ holding, delivery: sample ? ++delivery : delivery, sample }) + "\n");
+  }
+  replay();
+  await startBackend({ proximityReplay: scenario });
+  await loopbackOnly(page);
+  await seedLibrary([["proximity-target", "Proximity target", "Lost", Date.now() - 1000]], ["proximity-target"]);
+  await page.goto("/objects/proximity-target/search");
+  await page.getByRole("radio", { name: "PS4 controller" }).check();
+  await page.getByRole("button", { name: "Acquire control" }).click();
+  await page.getByRole("button", { name: "Start Search", exact: true }).click();
+  const advisory = page.getByRole("status", { name: "Proximity advisory" });
+  const feedback = page.getByRole("region", { name: "Controller feedback" });
+  await expect(advisory).toContainText("Proximity · Unknown");
+  await expect(feedback).toContainText("Motion permission · Arming");
+  holding = true;
+  replay();
+  await expect(feedback).toContainText("Motion permission · Armed");
+
+  async function seeSample(sequence: number, distance: number, state: "Warning" | "Clear") {
+    replay({ sequence, distance });
+    await expect(advisory).toContainText(`Proximity · ${state}`);
+    await expect(advisory).toContainText(`Distance ${distance} mm`);
+  }
+  await seeSample(1, 200, "Warning");
+  await seeSample(2, 250, "Warning");
+  await seeSample(3, 300, "Warning");
+  replay({ sequence: 4, distance: 0, valid: 0 });
+  await expect(advisory).toContainText("Proximity · Unknown");
+  await expect(advisory).toContainText("Previous obstacle warning remains active");
+  await expect(advisory).toContainText("Distance unavailable");
+  await seeSample(5, 301, "Warning");
+  await seeSample(6, 302, "Warning");
+  await seeSample(7, 300, "Clear");
+  await expect(advisory).toContainText("Proximity · Unknown");
+  await expect(advisory).not.toContainText("Previous obstacle warning");
+  await expect(feedback).toContainText("Motion permission · Armed");
+  await expect(page.getByText("Committed session · Searching", { exact: true })).toBeVisible();
+});
 
 async function setTargetCoordinates(page: Page, coordinates = ["10", "20", "30", "60"]) {
   for (const [index, label] of ["X", "Y", "Width", "Height"].entries()) {
