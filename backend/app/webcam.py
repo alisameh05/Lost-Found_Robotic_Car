@@ -88,18 +88,31 @@ class Webcam:
         for thread in self._threads:
             thread.join(timeout=0.2)
 
+    def recognition_ready(self) -> bool:
+        with self._changed:
+            frame, now = self._frame, self._clock()
+            return (frame is not None and 0 <= now - frame.at < self._deadline
+                    and self._recent_recognition(frame, now) is not None)
+
+    def _recent_recognition(self, frame: WebcamFrame, now: float) -> Recognition | None:
+        result = self._result
+        if (result is not None and result.frame.epoch == frame.epoch
+                and 0 <= now - result.frame.at < self._deadline):
+            return result
+        return None
+
     def observe(self, scope: InputScope | None) -> WebcamObservation:
         with self._changed:
             self._scope = scope
             now = self._clock()
-            frame, result, preview = self._frame, self._result, self._preview
+            frame, preview = self._frame, self._preview
             interruption, self._interruption = self._interruption, None
             if frame is None or not 0 <= now - frame.at < self._deadline:
                 return WebcamObservation(None, None, None)
             if preview is not None and preview.stream_epoch != frame.epoch:
                 preview = None
-            if (result is None or result.frame.epoch != frame.epoch
-                    or not 0 <= now - result.frame.at < self._deadline):
+            result = self._recent_recognition(frame, now)
+            if result is None:
                 return WebcamObservation(preview, None, None)
             at = result.frame.at
             sample = None

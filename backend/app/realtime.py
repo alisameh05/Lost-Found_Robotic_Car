@@ -797,6 +797,9 @@ class Realtime:
             return "NOT_READY"
         if name == "AI" and self.simulation and self.simulation.inference and now >= self._inference_until:
             return "NOT_READY"
+        if name == "Webcam" and self.webcam is not None:
+            # Readiness can see an admitted result before the input poll can accept its scoped sample.
+            return None if self.webcam.recognition_ready() else "NOT_READY"
         if name in ("Webcam", "Controller") and now >= self._input_deadlines.get(name, 0):
             return "NOT_READY"
         return None if self._readiness.get(name, False) else "NOT_READY"
@@ -1371,7 +1374,9 @@ class Realtime:
             await asyncio.sleep(CONTROLLER_POLL_SECONDS)
 
     def _webcam_ready(self, now: float) -> bool:
-        return now < self._input_deadlines.get("Webcam", now) and (self.webcam is not None or "webcam" in self._live_sources)
+        if self.webcam is not None:
+            return self.webcam.recognition_ready()
+        return now < self._input_deadlines.get("Webcam", now) and "webcam" in self._live_sources
 
     async def maintain_webcam(self) -> None:
         webcam = self.webcam

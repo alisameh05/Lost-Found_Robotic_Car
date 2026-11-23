@@ -12,9 +12,19 @@ import pytest
 from PIL import Image
 
 from backend.app.gestures import Hand, Pose, classify
-from backend.app.motion import Direction, InputScope
+from backend.app.motion import Direction, InputSample, InputScope
+from backend.app.runtime import RecordsRuntime
 from backend.app.simulation import load_simulation
-from backend.app.webcam import ReadFrame, Recognize, Webcam, encode_preview, open_hand_landmarker
+from backend.app.storage import RecordsStorage
+from backend.app.webcam import (
+    ReadFrame,
+    Recognition,
+    Recognize,
+    Webcam,
+    WebcamFrame,
+    encode_preview,
+    open_hand_landmarker,
+)
 from backend.tests.test_gestures import hand
 from backend.tests.test_realtime import (
     Loopback,
@@ -189,6 +199,39 @@ def test_missing_selected_camera_blocks_gestures_and_leaves_controller_ready(tmp
     with service(tmp_path, local_gestures=True) as laf, driving_search(laf) as (headers, _):
         assert status(wait_for(laf.http, "/snapshot", headers), "Webcam") == "Unavailable"
         arm(laf, headers)
+
+
+def test_realtime_reads_an_admitted_webcam_result_before_the_input_poll(tmp_path: Path) -> None:
+    composition = load_simulation("local-gestures-v1")
+    assert composition
+    now = 1.0
+
+    def clock() -> float:
+        return now
+
+    runtime = RecordsRuntime(RecordsStorage(tmp_path, monotonic=clock))
+    router = runtime.enable_realtime(composition, "NOT_READY", lambda *_: None, lambda _: None)
+    replay = WebcamReplay()
+    adapter = Webcam(composition.profile, replay.camera, replay.recognizer, replay.encode, clock)
+    router.webcam = adapter
+    scope = InputScope(runtime.boot_id, "session", 1)
+    frame = WebcamFrame("current", 2, 0.9, scope, replay.hands)
+    adapter._frame = frame
+    adapter._result = Recognition(frame, "forward", "1 finger - forward")
+    interruption = InputSample(scope, 0.82, "invalid")
+    adapter._interruption = interruption
+    router._input_deadlines["Webcam"] = 0.99
+    router._readiness["Webcam"] = True
+
+    assert router.component_cause("Webcam") is None
+    assert router._input_deadlines["Webcam"] == 0.99
+    assert adapter.observe(scope).input == interruption
+
+    adapter._frame = WebcamFrame("reopened", 1, 0.95, scope, replay.hands)
+    assert router.component_cause("Webcam") == "NOT_READY"
+    adapter._frame = frame
+    now = 1.2
+    assert router.component_cause("Webcam") == "NOT_READY"
 
 
 def test_late_recognition_cannot_refresh_health_after_the_next_acquisition() -> None:
