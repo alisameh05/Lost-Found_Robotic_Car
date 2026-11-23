@@ -15,7 +15,7 @@ export type SearchFeedback = ({ stage: "sending" | "pending" | "unknown" }
 
 type ActionBody = StartRequest | SessionAction;
 type Action = { context: ClientContext; body: ActionBody; objectId: string; feedback: SearchFeedback;
-  request?: AbortController; timer?: ReturnType<typeof setTimeout> };
+  request?: AbortController; timer?: ReturnType<typeof setTimeout>; retriedStop?: boolean };
 
 export const searchActionKey = (kind: SearchIntent["kind"], id: string) => `${kind}:${id}`;
 export function unresolved(feedback?: SearchFeedback) {
@@ -23,13 +23,14 @@ export function unresolved(feedback?: SearchFeedback) {
 }
 
 export function openSearchActions({
-  transport, signal, notify, refresh, removed,
+  transport, signal, notify, refresh, removed, ownsStopLease,
 }: {
   transport: ApplicationTransport;
   signal: AbortSignal;
   notify(feedback: Readonly<Record<string, SearchFeedback>>): void;
   refresh(code?: ApiError["code"]): void;
   removed?(objectId: string, sessionId: string): void;
+  ownsStopLease?(body: SessionAction, context: ClientContext): boolean;
 }) {
   const actions = new Map<string, Action>();
   const interrupted = new Map<string, { objectId: string; feedback: SearchFeedback }>();
@@ -95,8 +96,20 @@ export function openSearchActions({
     for (const action of actions.values()) {
       if (!current(action) || !sameContext(action.context, context)) continue;
       const receipt = snapshot.operations.find((operation) => operation.action_id === action.body.action_id && operation.request_id === null);
-      if (receipt?.action_id && (receipt.persistence !== "Pending" || action.feedback.stage !== "pending")) accept(action, receipt);
+      if (!receipt?.action_id || (receipt.persistence === "Pending" && action.feedback.stage === "pending")) continue;
+      if (receipt.persistence !== "Failed" || !retryStopAfterConflict(action, receipt.error)) accept(action, receipt);
     }
+  }
+
+  function retryStopAfterConflict(action: Action, error: ApiError): Promise<void> | undefined {
+    const { body, context } = action;
+    if (error.code !== "REVISION_CONFLICT" || !("action" in body) || body.action !== "stop" ||
+        error.revision === undefined || error.revision <= body.expected_revision ||
+        action.retriedStop || !ownsStopLease?.(body, context)) return;
+    // This attempt was definitively rejected. The new revision needs its own receipt identity.
+    action.retriedStop = true;
+    action.body = { ...body, action_id: crypto.randomUUID(), expected_revision: error.revision };
+    return send(action);
   }
 
   function poll(action: Action, remaining: number) {
@@ -113,7 +126,7 @@ export function openSearchActions({
     }, 250 * (4 - remaining));
   }
 
-  async function send(action: Action) {
+  async function send(action: Action): Promise<void> {
     cancel(action);
     const request = new AbortController();
     action.request = request;
@@ -131,17 +144,24 @@ export function openSearchActions({
     }
     if (delivery.aborted || !current(action)) return;
     if (response.kind === "api-error" && response.error.action_id !== body.action_id) {
+      const retry = retryStopAfterConflict(action, response.error);
+      if (retry) return retry;
       action.feedback = { stage: "rejected", message: `${response.error.code} · ${response.error.message}` };
       publish();
       refresh(response.error.code);
       return;
     }
-    if (response.kind !== "ok" || !conforms("MutationResponse", response.data) || !accept(action, response.data)) {
+    const data = response.kind === "ok" && conforms("MutationResponse", response.data) ? response.data : undefined;
+    if (data?.persistence === "Failed" && data.action_id === body.action_id) {
+      const retry = retryStopAfterConflict(action, data.error);
+      if (retry) return retry;
+    }
+    if (!data || !accept(action, data)) {
       action.feedback = { stage: "unknown" };
       publish();
     }
     poll(action, 3);
-    if (response.kind === "ok" && response.data.persistence === "Committed") refresh();
+    if (data?.persistence === "Committed") refresh();
   }
 
   return {

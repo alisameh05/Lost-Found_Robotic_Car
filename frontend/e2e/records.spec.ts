@@ -1,5 +1,6 @@
-import { expect, test, type Page, type TestInfo } from "@playwright/test";
+import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
+import { createHash } from "node:crypto";
 import { appendFileSync, existsSync, linkSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
@@ -19,7 +20,7 @@ test.use({ baseURL: frontend });
 
 async function startBackend(options: {
   initializationGate?: string; crashAfterCommit?: boolean; registrationGate?: string; clockOffset?: string;
-  cleanupFault?: string; settingsGate?: string; stopGate?: string; simulation?: boolean;
+  cleanupFault?: string; settingsGate?: string; stopGate?: string; confirmGate?: string; simulation?: boolean;
   reviewSimulation?: boolean; crashCandidate?: boolean; noWebcam?: boolean; crashSearch?: "start" | "resume";
   yoloe?: { assets: string; robot?: string };
   gestures?: { assets?: string; devicePath?: string };
@@ -40,6 +41,7 @@ async function startBackend(options: {
     : options.registrationGate ? ["backend.tests.crash_registration", "journaled", options.registrationGate]
     : options.settingsGate ? ["backend.tests.crash_registration", "retention_before_commit", options.settingsGate]
     : options.stopGate ? ["backend.tests.crash_registration", "before_stop_commit", options.stopGate]
+    : options.confirmGate ? ["backend.tests.crash_registration", "before_confirm_commit", options.confirmGate]
     : options.crashCandidate ? ["backend.tests.crash_registration", "candidate_promoted"]
     : options.crashSearch ? ["backend.tests.crash_registration", `before_${options.crashSearch}_commit`]
     : options.clockOffset ? ["backend.tests.crash_registration", "clock", options.clockOffset,
@@ -90,6 +92,10 @@ async function stopBackend() {
 
 async function selectTarget(page: Page, source: string, name: string) {
   await page.goto("/objects/new");
+  await chooseReference(page, source, name);
+}
+
+async function chooseReference(page: Page, source: string, name: string) {
   await page.getByRole("textbox", { name: "Object name" }).fill(name);
   await page.locator('input[type="file"]').setInputFiles(source);
   await expect(page.getByRole("img", { name: "Normalized reference preview" })).toBeVisible();
@@ -426,6 +432,13 @@ async function loopbackOnly(page: Page) {
     if (url.origin === frontend || url.origin === new URL(backend).origin) await route.continue();
     else await route.abort();
   });
+}
+
+function robotEnvelope(payload: Buffer | string) {
+  if (typeof payload === "string" || payload.length < 4) return;
+  const jpegOffset = 4 + payload.readUInt32BE(0);
+  const metadata = JSON.parse(payload.subarray(4, jpegOffset).toString("utf8")) as FrameMetadata;
+  return { metadata, jpeg: payload.subarray(jpegOffset) };
 }
 
 function objectRows(page: Page) {
@@ -2113,10 +2126,8 @@ async function openPhase06(page: Page, assets: string, mode: "gestures" | "contr
       });
     } else if (socket.url().endsWith("/video/robot")) {
       socket.on("framereceived", ({ payload }) => {
-        if (typeof payload === "string" || payload.length < 4) return;
-        const size = payload.readUInt32BE(0);
-        const metadata = JSON.parse(payload.subarray(4, 4 + size).toString("utf8")) as FrameMetadata;
-        frames.set(metadata.frame_id, metadata);
+        const frame = robotEnvelope(payload);
+        if (frame) frames.set(frame.metadata.frame_id, frame.metadata);
       });
     }
   });
@@ -2659,8 +2670,9 @@ async function replayReviewAction(page: Page, action: SessionAction) {
   }, { backend, action });
 }
 
-test("rejects a connected match, resumes across a fault, and reviews only after fixture re-entry", async ({ page }) => {
+test("rejects a simulated match, resumes across a fault, and reviews only after fixture re-entry", { tag: "@match-review-qualification" }, async ({ page }) => {
   test.setTimeout(60_000);
+  await loopbackOnly(page);
   const alerts: { id: string; captured_at_ms: number }[] = [];
   page.on("websocket", (socket) => {
     if (!socket.url().endsWith("/events")) return;
@@ -2690,6 +2702,8 @@ test("rejects a connected match, resumes across a fault, and reviews only after 
   await expect(panel).toHaveCount(0);
   await expect(paused).toBeVisible();
   await expect(disarmed).toBeVisible();
+  await expect(resume).toBeEnabled();
+  expect(alerts).toHaveLength(1);
   await resume.click();
   await expect(searching).toBeVisible();
   expect(alerts).toHaveLength(1);
@@ -2706,7 +2720,7 @@ test("rejects a connected match, resumes across a fault, and reviews only after 
   await expect(searching).toBeVisible();
   expect(alerts).toHaveLength(1);
   await expect(panel).toBeVisible({ timeout: 23_000 });
-  expect(alerts).toHaveLength(2);
+  await expect.poll(() => alerts.length).toBe(2);
   expect(alerts[1].id).not.toBe(alerts[0].id);
   expect(alerts[1].captured_at_ms - alerts[0].captured_at_ms).toBeGreaterThan(12_000);
   await expect(paused).toBeVisible();
@@ -2724,35 +2738,114 @@ test("rejects a connected match, resumes across a fault, and reviews only after 
   await expect(history.getByRole("img", { name: "Captured evidence", exact: true })).toHaveCount(2);
 });
 
+function observeCandidateSource(page: Page) {
+  const frames = new Map<string, { metadata: FrameMetadata; jpeg: Buffer }>();
+  const candidates: Match[] = [];
+  page.on("websocket", (socket) => {
+    if (socket.url().endsWith("/video/robot")) {
+      socket.on("framereceived", ({ payload }) => {
+        const frame = robotEnvelope(payload);
+        if (!frame) return;
+        frames.set(frame.metadata.frame_id, frame);
+        if (frames.size > 64) frames.delete(frames.keys().next().value!);
+      });
+    } else if (socket.url().endsWith("/events")) {
+      socket.on("framereceived", ({ payload }) => {
+        if (typeof payload !== "string") return;
+        const event = JSON.parse(payload);
+        if (event.type === "candidate_pending") candidates.push(event.payload.match);
+      });
+    }
+  });
+  return { frames, candidates };
+}
+
+async function verifyEvidence(scope: Locator, match: Match, digest: string) {
+  const image = scope.getByRole("img", { name: "Captured evidence", exact: true });
+  await expect(image).toBeVisible();
+  const { width, height } = match.evidence_media;
+  await expect(image).toHaveJSProperty("naturalWidth", width);
+  await expect(image).toHaveJSProperty("naturalHeight", height);
+  const paintedBox = await image.locator("+ span").evaluate((box) => [
+    box.style.left, box.style.top, box.style.width, box.style.height,
+  ].map(parseFloat));
+  [match.box.x / width, match.box.y / height, match.box.width / width, match.box.height / height]
+    .forEach((fraction, index) => expect(paintedBox[index]).toBeCloseTo(100 * fraction, 4));
+  expect(await image.evaluate(async (element: HTMLImageElement) => {
+    const response = await fetch(element.src);
+    const bytes = await response.arrayBuffer();
+    return {
+      type: response.headers.get("Content-Type"),
+      digest: Array.from(new Uint8Array(await crypto.subtle.digest("SHA-256", bytes)),
+        (byte) => byte.toString(16).padStart(2, "0")).join(""),
+    };
+  })).toEqual({ type: "image/png", digest });
+  await expect(scope.locator("time").first()).toHaveAttribute("datetime", new Date(match.captured_at_ms).toISOString());
+}
+
+async function readReviewRecord<T>(page: Page, path: string): Promise<T> {
+  const origin = { Origin: frontend };
+  const boot = await page.request.get(`${backend}/bootstrap`, { headers: origin });
+  expect(boot.ok()).toBe(true);
+  const { capability, client_id } = await boot.json();
+  const saved = await page.request.get(backend + path, {
+    headers: { ...origin, "X-App-Capability": capability, "X-App-Client-Id": client_id },
+  });
+  expect(saved.ok()).toBe(true);
+  return saved.json() as Promise<T>;
+}
+
 for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const) {
-  test(`saved candidate review recovers ${outcome} through a backend restart`, async ({ page }) => {
+  test(`saved candidate review recovers ${outcome} through a backend restart`, { tag: "@match-review-qualification" }, async ({ page }) => {
     test.setTimeout(60_000);
-    await startBackend({ reviewSimulation: true, crashCandidate: outcome === "uncommitted" });
+    await loopbackOnly(page);
+    const source = observeCandidateSource(page);
+    const confirmGate = outcome === "confirm" ? join(parent, "finish-confirm") : undefined;
+    await startBackend({ reviewSimulation: true, confirmGate, crashCandidate: outcome === "uncommitted" });
     const session = await startReviewSearch(page, outcome === "confirm" ? "Gestures" : "PS4 controller");
     const panel = page.getByRole("region", { name: "Review potential match" });
     let confirm: SessionAction | undefined;
     let receipt: string | undefined;
+    let capture: Match | undefined;
+    let evidence: { path: string; digest: string } | undefined;
     if (outcome === "uncommitted") {
       await expect.poll(() => backendProcess?.exitCode).toBe(84);
       await expect(panel).toHaveCount(0);
     } else {
       await expect(panel.getByText("Paused", { exact: true })).toBeVisible();
+      await expect(page.getByText("Backend simulation · Disarmed", { exact: true })).toBeVisible();
+      await expect(page.getByRole("region", { name: "Robot camera" })).toContainText("AI matching suspended");
+      await expect(page.getByRole("dialog")).toHaveCount(0);
       await expect(panel.getByRole("img", { name: "Selected target from Reference for Review target" })).toBeVisible();
-      await expect(panel.getByText("Captured", { exact: true })).toBeVisible();
-      const image = panel.getByRole("img", { name: "Captured evidence", exact: true });
-      await expect(image).toBeVisible();
-      await expect(image.locator("+ span")).toBeAttached();
-      const overlay = await image.locator("+ span").evaluate((box) => ({
-        left: box.style.left, top: box.style.top, width: box.style.width, height: box.style.height,
-      }));
-      expect(parseFloat(overlay.left)).toBeCloseTo(100 * 303 / 480, 4);
-      expect(parseFloat(overlay.width)).toBeCloseTo(100 * 83 / 480, 4);
-      expect(parseFloat(overlay.top)).toBeCloseTo(100 * 203 / 262, 4);
-      expect(parseFloat(overlay.height)).toBeCloseTo(100 * 41 / 262, 4);
+      await expect.poll(() => source.candidates.length).toBe(1);
+      const match = source.candidates[0];
+      capture = match;
+      expect(match.box).toEqual({ x: 303, y: 203, width: 83, height: 41 });
+      await expect.poll(() => source.frames.has(match.frame_id)).toBe(true);
+      const frame = source.frames.get(match.frame_id);
+      if (!frame) throw new Error("The analyzed frame was not observed on the protected camera stream");
+      expect(frame.metadata).toMatchObject({
+        frame_id: capture.frame_id, stream_epoch: capture.stream_epoch,
+        width: capture.evidence_media.width, height: capture.evidence_media.height,
+      });
+      expect((await readReviewRecord<MatchPage>(page, session + "/matches")).items).toEqual([match]);
+      const path = join(parent, "records", "media", `${capture.evidence_media.id}.png`);
+      const png = readFileSync(path);
+      const pixels = [
+        "import sys", "from PIL import Image", "from io import BytesIO",
+        "jpeg = Image.open(BytesIO(sys.stdin.buffer.read()))",
+        "png = Image.open(sys.argv[1])",
+        "assert png.format == 'PNG' and jpeg.size == png.size",
+        "assert jpeg.convert('RGB').tobytes() == png.convert('RGB').tobytes()",
+      ].join("\n");
+      execFileSync(python, ["-c", pixels, path], { input: frame.jpeg, windowsHide: true });
+      evidence = { path, digest: createHash("sha256").update(png).digest("hex") };
+      await verifyEvidence(panel, capture, evidence.digest);
+      await expect(panel.getByText("Reviewed", { exact: true })).toHaveCount(0);
       await expect(panel.getByRole("button", { name: "Reject Match" })).toBeEnabled();
       await expect(page.getByRole("button", { name: "Resume", exact: true })).toBeDisabled();
       await expect(page.getByRole("button", { name: "Emergency Stop", exact: true })).toBeEnabled();
-      if (outcome === "confirm") {
+      if (confirmGate) {
         await page.route(`${backend}${session}/actions`, async (route) => {
           confirm = route.request().postDataJSON();
           let response = await route.fetch();
@@ -2766,7 +2859,16 @@ for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const
           receipt = await response.text();
           await route.abort("connectionreset");
         }, { times: 1 });
-        await panel.getByRole("button", { name: "Confirm Match" }).click();
+        try {
+          await panel.getByRole("button", { name: "Confirm Match" }).click();
+          await expect(panel.getByText("Save pending", { exact: true })).toBeVisible();
+          await expect(page).toHaveURL(`${frontend}${session}/live`);
+          await expect(panel.getByText("Reviewed", { exact: true })).toHaveCount(0);
+          const object = await readReviewRecord<ObjectRecord>(page, "/objects/" + match.object_id);
+          expect(object.status).toBe("Lost");
+        } finally {
+          writeFileSync(confirmGate, "");
+        }
       } else if (outcome === "stop") {
         await panel.getByRole("button", { name: "Stop Search" }).click();
       }
@@ -2784,6 +2886,7 @@ for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const
     const summary = page.getByRole("region", { name: "Session summary" });
     await expect(summary).toContainText(outcome === "confirm" ? "Match confirmed" :
       outcome === "stop" ? "Stopped by operator" : "Interrupted");
+    const { items: matches } = await readReviewRecord<MatchPage>(page, session + "/matches");
     if (outcome === "confirm") {
       await expect(page.getByText("Found", { exact: true })).toBeVisible();
       expect(await replayReviewAction(page, confirm!)).toEqual({
@@ -2796,11 +2899,70 @@ for (const outcome of ["confirm", "stop", "interrupted", "uncommitted"] as const
     const history = page.getByRole("region", { name: "Captured matches" });
     if (outcome === "uncommitted") {
       await expect(history.getByText("No captured matches", { exact: true })).toBeVisible();
+      expect(matches).toEqual([]);
       expect(await readdir(join(parent, "records", "media"))).toHaveLength(1);
       expect(await readdir(join(parent, "records", "staging"))).toHaveLength(0);
     } else {
-      await expect(history.getByText(outcome === "confirm" ? "Confirmed" : "Not reviewed", { exact: true })).toBeVisible();
-      await expect(history.getByRole("img", { name: "Captured evidence", exact: true })).toBeVisible();
+      const confirmed = outcome === "confirm";
+      const reviewed = confirmed
+        ? (JSON.parse(receipt!) as { result: { match: Extract<Match, { disposition: "Confirmed" }> } }).result.match.reviewed_at_ms
+        : null;
+      const saved: Match = reviewed === null
+        ? { ...capture!, disposition: "NotReviewed", reviewed_at_ms: null }
+        : { ...capture!, disposition: "Confirmed", reviewed_at_ms: reviewed };
+      expect(matches).toEqual([saved]);
+      await expect(history.getByText(confirmed ? "Confirmed" : "Not reviewed", { exact: true })).toBeVisible();
+      await verifyEvidence(history, saved, evidence!.digest);
+      const reviewedTime = reviewed === null ? null : new Date(reviewed).toISOString();
+      if (reviewedTime) await expect(history.locator("time").last()).toHaveAttribute("datetime", reviewedTime);
+      const resultPath = `${session}/result`;
+      await page.goto(resultPath);
+      if (!confirmed) {
+        const unreviewed = page.locator("article").filter({ hasText: "Not reviewed" });
+        await verifyEvidence(unreviewed, saved, evidence!.digest);
+        await expect(unreviewed.locator("time")).toHaveCount(1);
+        return;
+      }
+
+      if (!reviewedTime) throw new Error("The committed confirmation is missing its review time");
+      const resultEvidence = page.getByRole("region", { name: "Confirmed evidence" });
+      await verifyEvidence(resultEvidence, saved, evidence!.digest);
+      await expect(resultEvidence.locator("time").last()).toHaveAttribute("datetime", reviewedTime);
+      await expect(summary.locator("dt").filter({ hasText: /^Ended$/ }).locator("+ dd time"))
+        .toHaveAttribute("datetime", reviewedTime);
+      await expect(page.getByRole("link", { name: "Search Again", exact: true })).toHaveCount(0);
+      await page.getByRole("link", { name: "View Object Details" }).click();
+      const originalObject = `${frontend}/objects/${saved.object_id}`;
+      await expect(page).toHaveURL(originalObject);
+      await verifyEvidence(resultEvidence, saved, evidence!.digest);
+      await expect(resultEvidence.locator("time").last()).toHaveAttribute("datetime", reviewedTime);
+      const objectRecord = page.getByRole("region", { name: "Object record", exact: true });
+      await expect(objectRecord.locator("dt").filter({ hasText: /^Confirmed$/ }).locator("+ dd time"))
+        .toHaveAttribute("datetime", reviewedTime);
+      await expect(page.getByRole("link", { name: "Open Search Setup" })).toHaveCount(0);
+      await page.getByRole("link", { name: "Register Another Object" }).click();
+      await chooseReference(page, sourceImage(), "Review target");
+      await setTargetCoordinates(page);
+      await page.getByRole("button", { name: "Register Object" }).click();
+      await expect(page.getByRole("heading", { name: "Object Details" })).toBeVisible();
+      await expect(page).toHaveURL(/\/objects\/(?!new$)[^/]+$/);
+      await expect(page).not.toHaveURL(originalObject);
+      await expect(page.getByText("Lost", { exact: true })).toBeVisible();
+      await startSavedSearch(page, "PS4 controller");
+      await page.getByRole("button", { name: "Stop Search", exact: true }).click();
+      await expect(page.getByText("The object remains Lost.", { exact: true })).toBeVisible();
+
+      writeFileSync(evidence!.path, "corrupt recording");
+      await page.goto(resultPath);
+      await expect(resultEvidence.getByText("Media corrupt", { exact: true })).toBeVisible();
+      unlinkSync(evidence!.path);
+      await page.reload();
+      await expect(resultEvidence.getByText("Media missing", { exact: true })).toBeVisible();
+      await expect(resultEvidence.locator("time").last()).toHaveAttribute("datetime", reviewedTime);
+      await expect(page.getByRole("heading", { name: "Match confirmed and saved" })).toBeVisible();
+      expect((await readReviewRecord<MatchPage>(page, session + "/matches")).items).toEqual([{
+        ...saved, evidence_media: { ...saved.evidence_media, availability: "Missing" },
+      }]);
     }
   });
 }

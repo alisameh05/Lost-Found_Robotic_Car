@@ -410,6 +410,9 @@ def test_confirm_receipt_is_recovered_with_a_new_boot_client_and_lease(tmp_path:
         path = f"{API}/sessions/{session['id']}"
         result = laf.http.post(path + "/actions", headers=headers, json=body)
         assert result.status_code == 200, result.text
+        stop = action_body(driver, match, session, "stop")
+        stopped = laf.http.post(path + "/actions", headers=headers, json=stop)
+        assert stopped.status_code == 409 and stopped.json()["code"] == "INVALID_TRANSITION", stopped.text
         original, previous_boot = result.content, driver.owner["backend_boot_id"]
 
     with service(tmp_path) as laf:
@@ -427,6 +430,7 @@ def test_confirm_receipt_is_recovered_with_a_new_boot_client_and_lease(tmp_path:
             changed = laf.http.post(path + "/actions", headers=headers, json={**retry, "candidate_id": "other"})
             assert changed.status_code == 409 and changed.json()["code"] == "ACTION_ID_CONFLICT"
             assert laf.http.get(path, headers=headers).json()["end_reason"] == "Confirmed"
+            assert laf.http.get(path + "/matches", headers=headers).json()["items"] == [result.json()["result"]["match"]]
             assert laf.http.get(API + "/snapshot", headers=headers).json()["active_session"] is None
 
 

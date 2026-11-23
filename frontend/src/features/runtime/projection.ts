@@ -56,6 +56,9 @@ export function openRuntimeProjection(transport: ApplicationTransport, recordsMo
   let handoffTimer: ReturnType<typeof setTimeout> | undefined;
   const searchActions = openSearchActions({ transport, signal: lifetime.signal,
     removed: (objectId, sessionId) => removeRecords([objectId], sessionId),
+    ownsStopLease: (body, submittedContext) => context === submittedContext && view.workspace?.eventsLive === true &&
+      view.snapshot?.active_session?.id === body.session_id &&
+      workspace?.actionScope(body.session_id)?.client_lease_id === body.client_lease_id,
     notify: (feedback) => update({ searchActions: feedback }), refresh: (code) => {
       if (code === "REVISION_CONFLICT") workspace?.resynchronize();
       else void refresh();

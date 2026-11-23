@@ -313,11 +313,14 @@ def test_source_and_worker_resets_keep_rejection_and_require_deliberate_recovery
             assert [entry["id"] for entry in wait_for(laf.http, f"/sessions/{paused['id']}/matches",
                                                      headers)["items"]] == [first["id"]]
             # A complete new witness after recovery can still make the candidate eligible.
+            # Hold each pose across two acquisitions so asynchronous decode has time to
+            # observe the full box and each border position in this positive replay.
+            def poses(positions: tuple[int, ...]) -> list[bytes]:
+                return [scene(x) for x in positions for _ in range(2)]
+
             match_at(spawned_matcher, BORDER)
-            exited = replay(laf, headers, driver, [
-                scene(x) for x in (INTERIOR, BORDER, 408, 432, 456)
-            ] + [scene()])
+            exited = replay(laf, headers, driver, poses((INTERIOR, BORDER, 408, 432, 456)) + [scene()])
             assert exited["pending_candidate"] is None and exited["active_session"]["state"] == "Searching"
-            replay(laf, headers, driver, [scene(x) for x in (456, 432, 408, BORDER)])
+            replay(laf, headers, driver, poses((456, 432, 408, BORDER)))
             second, _ = review(laf, headers)
             assert second["id"] != first["id"] and next_alert(driver) == second["id"]
