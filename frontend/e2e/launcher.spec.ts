@@ -59,7 +59,8 @@ function start(parent: string, frontend: number, backend: number, mode?: "fixtur
 }
 
 async function register(page: Page, origin: string, name: string) {
-  await page.goto(origin + "/objects/new");
+  await page.goto(origin);
+  await page.getByRole("link", { name: "Register Object", exact: true }).click();
   await page.getByRole("textbox", { name: "Object name" }).fill(name);
   await page.locator('input[type="file"]').setInputFiles(join(repo, "backend", "app", "preview_fixture", "robot.jpg"));
   await expect(page.getByRole("img", { name: "Normalized reference preview" })).toBeVisible();
@@ -71,7 +72,7 @@ async function register(page: Page, origin: string, name: string) {
   await expect(page.getByRole("heading", { name })).toBeVisible();
 }
 
-test("the installed Windows app registers and reopens a record through a disarmed restart", async ({ page }, info) => {
+test("the installed Windows app registers and reopens a record through a disarmed restart", { tag: "@records-qualification" }, async ({ page }, info) => {
   test.setTimeout(90_000);
   const parent = await mkdtemp(join(tmpdir(), "laf-launcher-"));
   const [frontend, backend, secondFrontend, secondBackend] = await Promise.all(
@@ -101,6 +102,8 @@ test("the installed Windows app registers and reopens a record through a disarme
     await expect(page.locator("summary").filter({ hasText: "Qualification profile" })).toContainText("Unavailable");
     await register(page, origin, "Launcher test wallet");
     const saved = page.url();
+    const reference = page.getByRole("img", { name: "Reference for Launcher test wallet", exact: true });
+    await expect(reference).toBeVisible();
 
     const duplicate = start(parent, secondFrontend, secondBackend);
     try {
@@ -124,8 +127,12 @@ test("the installed Windows app registers and reopens a record through a disarme
     expect(next.backend_boot_id).not.toBe(first.backend_boot_id);
     expect(next.capability).not.toBe(first.capability);
     expect((await fetch(api + "/api/v1/health", { headers: { "X-App-Capability": first.capability } })).status).toBe(403);
-    await page.goto(saved);
+    await page.goto(origin + "/objects");
+    await page.getByRole("searchbox", { name: "Search objects" }).fill("Launcher test wallet");
+    await page.getByRole("link", { name: "View details for Launcher test wallet", exact: true }).click();
+    await expect(page).toHaveURL(saved);
     await expect(page.getByRole("heading", { name: "Launcher test wallet" })).toBeVisible();
+    await expect(reference).toBeVisible();
     await page.getByRole("link", { name: "Start Search", exact: true }).click();
     await expect(page.getByRole("button", { name: "Start Search", exact: true })).toBeDisabled();
   } finally {
