@@ -1,23 +1,22 @@
 # Lost & Found frontend
 
-The frontend runs locally on Windows. Records mode connects to the protected SQLite backend. Fixture mode uses labeled synthetic records and device observations and requires only Node and a browser.
+The frontend runs locally on Windows and connects to the protected SQLite backend by default. Fixture mode uses labeled synthetic records and device observations and requires only Node and a browser.
 
 Phases 01–03 are completed at the fixture boundary. The 2026-11-17 amendment changes gesture guidance and fixture feedback to finger counts while retaining the screens, API shapes and recovery workflow. The [roadmap](../docs/IMPLEMENTATION_PLAN.md) and [reuse/environment assessment](../docs/TRD.md#21-reuse-and-license-assessment) cover the device and qualification phases.
 
 ## Setup and startup
 
-Install Node.js 24.19.0 LTS with npm 11.17.0. From PowerShell in the repository root:
+Install Node.js 24.19.0 LTS with npm 11.17.0 and start the [local backend](../backend/README.md#start). In a second PowerShell terminal at the repository root, run the frontend:
 
 ```powershell
 Set-Location frontend
 npm.cmd ci
-Copy-Item .env.example .env.local
 npm.cmd run dev
 ```
 
 Open [http://127.0.0.1:3000](http://127.0.0.1:3000). For a production preview, stop the development server and run `npm.cmd run build` followed by `npm.cmd start`.
 
-Both servers bind only to `127.0.0.1`. Set `$env:LAF_FRONTEND_PORT = '3100'` in PowerShell before starting to use another port. If the configured port is occupied, free it or explicitly choose a different port and restart.
+Both servers bind only to `127.0.0.1`. The frontend connects to `http://127.0.0.1:8000/api/v1` in records mode. Set `$env:LAF_FRONTEND_PORT = '3100'` in both terminals before starting to use another frontend port. The [backend setup guide](../backend/README.md#start) covers both port settings and the backend profiles for search. If an earlier setup copied `LAF_MODE=fixture` into `frontend/.env.local`, change that line to `LAF_MODE=records` and restart the frontend.
 
 `LAF_MODE=fixture` opts into sample data. Add `LAF_FIXTURE_HARNESS=1` to show development and test controls on the Dashboard. Select a scenario to replace the fixture transport and its snapshot. The selection follows in-app navigation. Reset repeats the selected scenario from its fixed time, and a browser reload returns to idle. The media preview uses temporary object URLs. Use **Expire sample media** to advance the fixture clock and clear an eligible image.
 
@@ -25,7 +24,7 @@ In **Shared control specimens**, choose **Commit** or **Fail**, enter a sample l
 
 Choose **searching**, **paused** or **expiry grace** to exercise **Return to Active Search** and **Emergency Stop**. Try **emergency pending**, **emergency failed** and **emergency network** while the sample save is held open. The shell reports logical motion permission separately from save progress. Press **Emergency Stop** again after an unconfirmed request to retry the same request ID. The opt-in **Fixture mutation requests** log shows the dispatches accepted by the fixture adapter. **Retry snapshot** reads the current snapshot and health again.
 
-Set `LAF_MODE=records` to connect to the local backend at `http://127.0.0.1:8000/api/v1`. Follow the [records setup guide](../backend/README.md) to install the backend and coordinate custom ports. Omit `LAF_MODE` or set it to `disconnected` for the unavailable application state. Fixture bootstrap context and the scripted cursor, preview and media paths use only in-memory synthetic values.
+Set `LAF_MODE=disconnected` to exercise the unavailable application state without opening a backend connection. Fixture bootstrap context and the scripted cursor, preview and media paths use only in-memory synthetic values.
 
 Install dependencies and the test browser while online. Normal fixture use works with local assets. Node.js 24 is an LTS line and Next.js 16 supports Node.js 20.9 or later. Exact direct dependency versions, including Next.js, React, TypeScript and testing tools, are recorded in [package.json](package.json). [Node.js release schedule](https://nodejs.org/en/about/previous-releases), [Next.js installation requirements](https://nextjs.org/docs/app/getting-started/installation).
 
@@ -48,7 +47,7 @@ npm.cmd run verify
 | `npm test` | Verify accessible navigation, fields, pending actions and read retry, and validate fixture responses and binary vectors. |
 | `npm run contracts:fixtures` | Run the public contract and fixture checks on their own. |
 | `npm run build` | Create the local production build. |
-| `npm run test:e2e` | Test the production build on ports 3100 (fixture with harness), 3101 (disconnected), 3102 (fixture without harness) and 3103 (records). Records tests start real temporary backends on 8110. |
+| `npm run test:e2e` | Test the production build on ports 3100 (fixture with harness), 3101 (disconnected), 3102 (fixture without harness) and 3103 (default connected startup). Records tests start real temporary backends on 8110. |
 
 The seed records the backend contract version and an export digest. Ajv validates fixture payloads against the published Draft 2020-12 definitions. The contract checks also validate relationships between resources, readiness and profile bounds, and binary frame envelopes. Backend tests compare these exports independently with the approved API, including the wire fields, required and nullable values, enums, and limits.
 

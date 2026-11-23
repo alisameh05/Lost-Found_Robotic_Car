@@ -158,7 +158,9 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const gestures = mode === "Gestures";
   const { integrated, localMatching, localGestures, localController } = localSearchPaths(profile);
   const deviceMode = profile?.evidence_kind === "Device";
-  const gestureInactive = !gestures && (localGestures || localController);
+  const usesLocalGestures = deviceMode || localGestures;
+  const usesLocalController = deviceMode || localController;
+  const gestureInactive = !gestures && (usesLocalGestures || usesLocalController);
   const webcamLive = !!workspace?.webcamLive && !gestureInactive;
   const recognitionReady = connected && readiness.components.some(
     ({ component, status }) => component === "Webcam" && status === "Ready",
@@ -178,8 +180,8 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
   const controllerInstruction = state === "Searching" && owner && ready && permission === "Disarmed"
     ? "Release the D-pad to neutral, then hold a direction."
     : "Hold a D-pad direction to move. Release to stop.";
-  const input = localGestures && gestures ? localGestureInput
-    : localController && !gestures ? localControllerInput
+  const input = usesLocalGestures && gestures ? localGestureInput
+    : usesLocalController && !gestures ? localControllerInput
     : recordsMode ? connectedInput : gestures ? gestureFeedback(sample) : sample === "invalid" ? "Conflicting D-pad input"
     : sample && sample !== "neutral" ? `Held ${sample}` : "No direction held";
   const searching = state === "Searching";
@@ -290,11 +292,11 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
         <div className={styles.cameras}>
           <Panel className={styles.camera} aria-labelledby="webcam-title">
             <header><h2 id="webcam-title"><Webcam aria-hidden="true" />Laptop webcam</h2>
-              <StatusBadge tone={webcamLive ? "success" : "muted"}>{webcamLive ? localGestures ? "Live • Mirrored" : "Live sample"
+              <StatusBadge tone={webcamLive ? "success" : "muted"}>{webcamLive ? usesLocalGestures ? "Live • Mirrored" : "Live sample"
                 : gestureInactive ? "Inactive" : "Unavailable"}</StatusBadge></header>
-            <div ref={webcam} className={`${styles.surface} ${gestures && !localGestures ? styles.mirrored : ""}`}
+            <div ref={webcam} className={`${styles.surface} ${gestures && !usesLocalGestures ? styles.mirrored : ""}`}
               data-live={webcamLive} aria-hidden={gestureInactive || undefined} />
-            {(!localGestures || !gestures) && <p>{gestures ? input : "Gesture control inactive"}</p>}
+            {(!usesLocalGestures || !gestures) && <p>{gestures ? input : "Gesture control inactive"}</p>}
           </Panel>
           <Panel className={styles.camera} aria-labelledby="robot-title">
             <header><h2 id="robot-title"><Video aria-hidden="true" />Robot camera</h2>
@@ -308,7 +310,7 @@ function Workspace({ sessionId, snapshot }: { sessionId: string; snapshot: Snaps
           <div role="status">
             <p>{input}</p>
             <p>Motion permission · {permission}</p>
-            {localController && !gestures && <p>{controllerInstruction} Press Circle for Emergency Stop.</p>}
+            {usesLocalController && !gestures && <p>{controllerInstruction} Press Circle for Emergency Stop.</p>}
             {!recordsMode && searching && ready && permission !== "Armed" && <p>{permission === "Arming" ? "Ready for a fresh hold." : "Release to neutral before holding a direction."}</p>}
           </div>
         </Panel>
