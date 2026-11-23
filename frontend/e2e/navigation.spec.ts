@@ -83,7 +83,7 @@ test.describe("fixture preview", () => {
   }
 });
 
-test("non-fixture startup keeps sample data unavailable", async ({ page }) => {
+test("explicit disconnected startup keeps sample data unavailable", async ({ page }) => {
   await page.goto("http://127.0.0.1:3101/objects/sample-wallet");
   await expect(page.getByRole("heading", { name: "Application data unavailable" })).toBeVisible();
   await expect(page.getByText(fixtureLabel, { exact: true })).toHaveCount(0);

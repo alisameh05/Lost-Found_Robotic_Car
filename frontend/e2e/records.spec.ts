@@ -214,7 +214,7 @@ test.afterEach(async ({ page }, info) => {
   await rm(parent, { recursive: true, force: true, maxRetries: 3 });
 });
 
-test("opens connected empty records and editable settings with one page identity", async ({ page }) => {
+test("default startup opens connected empty records and editable settings with one page identity", async ({ page }) => {
   await startBackend();
   const { requests, sockets } = observe(page);
   await page.goto("/");
@@ -285,6 +285,8 @@ for (const configured of [false, true]) {
     await expect(page.getByText("Proximity feedback is for the operator’s awareness only.")).toBeVisible();
     await page.getByRole("button", { name: "Emergency Stop" }).click();
     await expect(page.getByText("Motion permission revoked", { exact: true })).toBeVisible();
+    await page.getByRole("link", { name: "Open Control Guide" }).click();
+    await expect(page.getByRole("heading", { name: "Control Guide", exact: true })).toBeVisible();
     await page.getByRole("link", { name: "Return to Search Setup" }).click();
     await expect(page.getByRole("radio", { name: "PS4 controller" })).toBeChecked();
     await expect(page.getByRole("heading", { name: "Device test target" })).toBeVisible();
@@ -435,6 +437,8 @@ test("watches a protected simulated preview from a saved Lost target across tabs
 test("acquires, demonstrates readiness, and releases control in connected Search Setup", async ({ page, context }) => {
   test.setTimeout(60_000);
   await startBackend({ simulation: true });
+  await page.goto("/");
+  await expect(page.getByRole("region", { name: "Search status" })).toContainText("No active search");
   await observePreviewFrames(page);
   await selectTarget(page, sourceImage(), "Workspace control");
   await setTargetCoordinates(page);

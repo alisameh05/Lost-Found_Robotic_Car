@@ -56,7 +56,7 @@ function SearchStatus({ view, readiness: { snapshot, active, mode }, retry }: {
         <p>{sessionState === "Paused" ? "The search stays active until you end it." : "End this session before starting another."}</p>
       </div>
     </> : view.loading ? <LoadingState label="Loading search status" />
-      : snapshot && view.recordsMode ? <Notice title="Search unavailable">
+      : snapshot && view.recordsMode && !view.profile ? <Notice title="Search unavailable">
         <Link href="/devices">Check device and qualification status</Link>
       </Notice>
       : snapshot ? <p role="status">No active search</p>
