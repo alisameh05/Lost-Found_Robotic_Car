@@ -4,7 +4,7 @@ import { appendFileSync, existsSync, linkSync, mkdtempSync, readFileSync, rename
 import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { FrameMetadata, Match, MatchPage, SessionAction } from "../src/generated/api-v1";
+import type { FrameMetadata, Match, MatchPage, Object as ObjectRecord, SessionAction } from "../src/generated/api-v1";
 
 const frontend = "http://127.0.0.1:3103";
 const backend = "http://127.0.0.1:8110/api/v1";
@@ -214,14 +214,26 @@ test.afterEach(async ({ page }, info) => {
   await rm(parent, { recursive: true, force: true, maxRetries: 3 });
 });
 
-test("default startup opens connected empty records and editable settings with one page identity", async ({ page }) => {
+test("default startup opens connected empty records and editable settings with one page identity", { tag: "@records-qualification" }, async ({ page }) => {
   await startBackend();
+  await loopbackOnly(page);
   const { requests, sockets } = observe(page);
   await page.goto("/");
   await expect(page.getByText("Records connected · Search unavailable")).toBeVisible();
   await expect(page.getByText("No sessions for recent objects", { exact: true })).toBeVisible();
   await expect(page.getByText(/Fixture mode|Fixture scenario|Sample device observations/)).toHaveCount(0);
-  await page.getByRole("link", { name: "Objects / History" }).click();
+  const release = Promise.withResolvers<void>();
+  await page.route(backend + "/objects", async (route) => {
+    const response = await route.fetch();
+    await release.promise;
+    await route.fulfill({ response });
+  }, { times: 1 });
+  try {
+    await page.getByRole("link", { name: "Objects / History" }).click();
+    await expect(page.getByText("Loading objects", { exact: true })).toBeVisible();
+  } finally {
+    release.resolve();
+  }
   await expect(page.getByRole("heading", { name: "No objects registered" })).toBeVisible();
   await page.getByRole("link", { name: "Settings" }).click();
   await expect(page.getByRole("region", { name: "Saved retention" }).getByText("7 days", { exact: true })).toBeVisible();
@@ -525,7 +537,7 @@ test("preserves a 503 Health diagnostic during initialization", async ({ page })
   await expect(page.getByText("No objects registered")).toBeVisible({ timeout: 10_000 });
 });
 
-test("shows degraded storage without presenting an empty object history", async ({ page }) => {
+test("shows degraded storage without presenting an empty object history", { tag: "@records-qualification" }, async ({ page }) => {
   const root = join(parent, "records");
   execFileSync(python, [
     "-c", "import pathlib, sqlite3, sys; p = pathlib.Path(sys.argv[1]); p.mkdir(); " +
@@ -533,6 +545,7 @@ test("shows degraded storage without presenting an empty object history", async 
     root,
   ], { windowsHide: true });
   await startBackend();
+  await loopbackOnly(page);
   await page.goto("/devices");
   await expect(page.getByText("Device readiness degraded", { exact: true })).toBeVisible();
   await expect(page.getByText(/saved database schema is incompatible/)).toBeVisible();
@@ -557,7 +570,7 @@ test("recovers protected records after the backend dies and starts on the same p
   expect(requests.filter((value) => value === "GET /api/v1/bootstrap")).toHaveLength(2);
 });
 
-test("finds and pages real registrations, opens protected references and uses Dashboard details offline", async ({ page }) => {
+test("finds and pages real registrations, opens protected references and uses Dashboard details offline", { tag: "@records-qualification" }, async ({ page }) => {
   test.setTimeout(60_000);
   await startBackend();
   await loopbackOnly(page);
@@ -617,6 +630,8 @@ test("finds and pages real registrations, opens protected references and uses Da
   expect(await page.evaluate(async (url) => {
     try { await fetch(url!); return true; } catch { return false; }
   }, objectUrl)).toBe(false);
+  await field.fill("No matching belonging");
+  await expect(page.getByRole("heading", { name: "No matching objects" })).toBeVisible();
   await field.fill("🧭".repeat(121));
   await expect(page.getByText(/Enter no more than 120 characters/)).toBeVisible();
   expect(requests.filter((request) => request === "GET /api/v1/bootstrap")).toHaveLength(1);
@@ -637,7 +652,7 @@ function seedStoredHistory(now: number, interrupted = false) {
   ], { cwd: repo, windowsHide: true });
 }
 
-test("previews and cancels, rejects a changed impact, and retains the saved period", async ({ page }) => {
+test("previews and cancels, rejects a changed impact, and retains the saved period", { tag: "@records-qualification" }, async ({ page }) => {
   test.setTimeout(60_000);
   const clock = join(parent, "retention-clock");
   writeFileSync(clock, "0");
@@ -672,7 +687,70 @@ test("previews and cancels, rejects a changed impact, and retains the saved peri
   await expect(page.getByRole("region", { name: "Immediate impact" })).toContainText("1 object");
 });
 
-test("observes a pending settings transaction settle through a protected snapshot", async ({ page }) => {
+test("lengthens the original deadline and denies expired media even with the browser cache enabled", { tag: "@records-qualification" }, async ({ page }) => {
+  test.setTimeout(60_000);
+  const clock = join(parent, "retention-clock");
+  const fault = join(parent, "deny-cleanup");
+  const day = 86_400_000;
+  const registered = Date.now() - 6 * day;
+  writeFileSync(clock, "0");
+  writeFileSync(fault, "test fault");
+  await startBackend({ clockOffset: clock, cleanupFault: fault });
+  await seedLibrary([["old", "Kept reference", "Lost", registered]], ["old"]);
+  // Playwright routing disables Chromium's HTTP cache. Observe requests without routing here.
+  const origins = new Set<string>();
+  page.on("request", (request) => origins.add(new URL(request.url()).origin));
+  await page.goto("/settings");
+  const saved = page.getByRole("region", { name: "Saved retention" });
+  const proposed = page.getByRole("textbox", { name: "Proposed retention in days" });
+  const preview = page.getByRole("button", { name: "Preview Change" });
+  await expect(saved).toContainText("7 days");
+  for (const invalid of ["0", "1.5", "31"]) {
+    await proposed.fill(invalid);
+    await expect(page.getByText("Enter a whole number from 1 to 30.")).toBeVisible();
+    await expect(preview).toBeDisabled();
+  }
+  await proposed.fill("30");
+  await preview.click();
+  await expect(page.getByRole("region", { name: "Immediate impact" })).toContainText("0 objects");
+  await page.getByRole("button", { name: "Review Change", exact: true }).click();
+  await expect(saved).toContainText("7 days");
+  await page.getByRole("button", { name: "Confirm and Apply" }).click();
+  await expect(saved).toContainText("30 days");
+
+  writeFileSync(clock, String(2 * day));
+  const mediaUrl = backend + "/media/old-reference";
+  const mediaResponse = page.waitForResponse((response) => response.url() === mediaUrl && response.ok());
+  await page.goto("/objects/old");
+  const image = page.getByRole("img", { name: "Reference for Kept reference", exact: true });
+  await expect(image).toBeVisible();
+  const record = page.getByRole("region", { name: "Object record" });
+  await expect(record.getByText("30 days from registration")).toBeVisible();
+  await expect(record.locator("time").first()).toHaveAttribute("datetime", new Date(registered).toISOString());
+  await expect(record.locator("time").nth(1)).toHaveAttribute("datetime", new Date(registered + 30 * day).toISOString());
+  const received = await mediaResponse;
+  expect(received.headers()["cache-control"]).toBe("no-store");
+  const headers = { "X-App-Capability": (await received.request().allHeaders())["x-app-capability"] };
+  const fetchReference = (cache: RequestCache) => page.evaluate(async ({ mediaUrl, headers, cache }) => {
+    const response = await fetch(mediaUrl, { headers, cache });
+    return { status: response.status, type: (await response.blob()).type };
+  }, { mediaUrl, headers, cache });
+  expect(await fetchReference("default")).toEqual({ status: 200, type: "image/png" });
+
+  writeFileSync(clock, String(25 * day));
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.getByText("Record expired", { exact: true })).toBeVisible();
+  await expect(image).toHaveCount(0);
+  await expect(page.getByText("Deletion failed", { exact: true })).toBeVisible();
+  const file = join(parent, "records", "media", "old-reference.png");
+  expect(existsSync(file)).toBe(true);
+  expect(await fetchReference("force-cache")).toEqual({ status: 410, type: "application/json" });
+  unlinkSync(fault);
+  await expect.poll(() => existsSync(file), { timeout: 12_000 }).toBe(false);
+  expect(origins).toEqual(new Set([frontend, new URL(backend).origin]));
+});
+
+test("observes a pending settings transaction settle through a protected snapshot", { tag: "@records-qualification" }, async ({ page }) => {
   const gate = join(parent, "allow-settings-commit");
   await startBackend({ settingsGate: gate });
   await loopbackOnly(page);
@@ -697,7 +775,7 @@ test("observes a pending settings transaction settle through a protected snapsho
   await expect(page.getByRole("button", { name: "Retry Same Request" })).toHaveCount(0);
 });
 
-test("recovers a lost settings response and removes records and open evidence through failed cleanup and repair", async ({ page, context }) => {
+test("recovers a lost settings response and removes records and open evidence through failed cleanup and repair", { tag: "@records-qualification" }, async ({ page, context }) => {
   test.setTimeout(90_000);
   const clock = join(parent, "retention-clock");
   const fault = join(parent, "deny-cleanup");
@@ -872,7 +950,7 @@ test("recovers interrupted history after a process restart and revokes the captu
   }, objectUrl)).toBe(false);
 });
 
-test("discards overtaken search reads, resets an expired cursor and restarts with a new authority", async ({ page }) => {
+test("discards overtaken search reads, resets an expired cursor and restarts with a new authority", { tag: "@records-qualification" }, async ({ page }) => {
   test.setTimeout(60_000);
   await startBackend();
   await loopbackOnly(page);
@@ -929,7 +1007,7 @@ test("discards overtaken search reads, resets an expired cursor and restarts wit
   expect(requests.filter((request) => request === "GET /api/v1/bootstrap")).toHaveLength(2);
 });
 
-test("revokes an expired reference and keeps browsing the eligible page against the real service", async ({ page }) => {
+test("revokes an expired reference and keeps browsing the eligible page against the real service", { tag: "@records-qualification" }, async ({ page }) => {
   test.setTimeout(60_000);
   const offset = join(parent, "catalogue-clock");
   writeFileSync(offset, "0");
@@ -963,13 +1041,48 @@ test("revokes an expired reference and keeps browsing the eligible page against 
   await expect(page.getByText("Object not found", { exact: true })).toBeVisible();
 });
 
-test("registers an oriented reference and reopens its target after actual process restart", async ({ page }) => {
+test("rejects an invalid image and out-of-bounds target without creating a record", { tag: "@records-qualification" }, async ({ page }) => {
   await startBackend();
+  await loopbackOnly(page);
+  await page.goto("/");
+  await page.getByRole("link", { name: "Register Object", exact: true }).click();
+  await page.getByRole("textbox", { name: "Object name" }).fill("Invalid reference");
+  const picker = page.getByLabel("Reference image", { exact: true });
+  await picker.setInputFiles({ name: "bad.png", mimeType: "image/png", buffer: Buffer.from("not a PNG") });
+  await expect(page.getByRole("alert").filter({ hasText: "Choose a JPEG or PNG" })).toBeVisible();
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Select Target" })).toHaveCount(0);
+  await picker.setInputFiles(sourceImage());
+  await expect(page.getByRole("img", { name: "Normalized reference preview" })).toBeVisible();
+  await page.getByRole("button", { name: "Next", exact: true }).click();
+  await setTargetCoordinates(page, ["10", "20", "31", "60"]);
+  await expect(page.getByText("Width extends past the image.")).toBeVisible();
+  await expect(page.getByRole("button", { name: "Register Object", exact: true })).toBeDisabled();
+  await page.getByRole("link", { name: "Objects / History" }).click();
+  await expect(page.getByRole("heading", { name: "No objects registered" })).toBeVisible();
+  expect(await readdir(join(parent, "records", "media"))).toEqual([]);
+});
+
+test("registers an oriented reference and reopens its target after actual process restart", { tag: "@records-qualification" }, async ({ page }) => {
+  await startBackend();
+  await loopbackOnly(page);
   const source = sourceImage();
   const original = readFileSync(source);
   await selectTarget(page, source, " \u2003Cafe\u0301 card ");
-  await setTargetCoordinates(page);
+  const expectedRoi = { x: 10, y: 20, width: 30, height: 60 };
+  const preview = page.getByRole("img", { name: "Normalized reference for target selection" });
+  await expect(preview).toBeVisible();
+  const box = (await preview.boundingBox())!;
+  // Reverse drag from the inclusive far edge of the 40 × 80 oriented image.
+  await page.mouse.move(box.x + box.width - 1, box.y + box.height - 1);
+  await page.mouse.down();
+  await page.mouse.move(box.x + box.width / 4, box.y + box.height / 4, { steps: 4 });
+  await page.mouse.up();
   await expect(page.getByText("Valid rectangle · 30 × 60 px")).toBeVisible();
+  for (const [coordinate, value] of Object.entries(expectedRoi)) {
+    const label = coordinate[0].toUpperCase() + coordinate.slice(1) + " · px";
+    await expect(page.getByRole("textbox", { name: label, exact: true })).toHaveValue(String(value));
+  }
   await page.getByRole("button", { name: "Back", exact: true }).click();
   await expect(page.getByRole("textbox", { name: "Object name" })).toHaveValue("Café card");
   await page.getByRole("button", { name: "Next", exact: true }).click();
@@ -979,31 +1092,50 @@ test("registers an oriented reference and reopens its target after actual proces
   await expect(page.getByText("replacement.png", { exact: true })).toBeVisible();
   await page.getByRole("button", { name: "Next", exact: true }).click();
   await expect(page.getByRole("button", { name: "Register Object", exact: true })).toBeDisabled();
-  await setTargetCoordinates(page);
+  await expect(page.getByRole("textbox", { name: "X · px" })).toBeFocused();
+  for (const [index, value] of Object.values(expectedRoi).entries()) {
+    if (index > 0) await page.keyboard.press("Tab");
+    await page.keyboard.type(String(value));
+  }
+  const registration = page.waitForResponse((response) => response.url() === backend + "/objects" &&
+    response.request().method() === "POST" && response.status() === 201);
   await page.getByRole("button", { name: "Register Object", exact: true }).click();
   await expect(page.getByRole("heading", { name: "Object Details", exact: true })).toBeVisible();
   const reference = page.getByRole("img", { name: "Reference for Café card", exact: true });
   await expect(reference).toBeVisible();
+  const saved = (await (await registration).json()).result.object as ObjectRecord;
+  expect(saved.roi).toEqual(expectedRoi);
+  const registered = page.getByRole("region", { name: "Object record" }).locator("time").first();
+  const registeredAt = new Date(saved.registered_at_ms).toISOString();
+  await expect(registered).toHaveAttribute("datetime", registeredAt);
+  const managed = join(parent, "records", "media", saved.reference_media.id + ".png");
+  const managedBytes = readFileSync(managed);
   const location = page.url();
   expect(readFileSync(source)).toEqual(original);
   await rm(source);
   await rm(join(parent, "replacement.png"));
   await stopBackend();
   await startBackend();
+  const detailResponse = page.waitForResponse((response) => response.url() === backend + "/objects/" + saved.id && response.ok());
   const mediaResponse = page.waitForResponse((response) =>
-    response.url().startsWith(backend + "/media/") && response.status() === 200);
+    response.url() === backend + "/media/" + saved.reference_media.id && response.ok());
   await page.goto(location);
   await expect(reference).toBeVisible();
+  await expect(page.getByRole("img", { name: "Selected target from Reference for Café card", exact: true })).toBeVisible();
+  expect((await (await detailResponse).json()).roi).toEqual(expectedRoi);
+  await expect(registered).toHaveAttribute("datetime", registeredAt);
   await expect(page.getByText("Lost", { exact: true })).toBeVisible();
   expect(await reference.evaluate((image: HTMLImageElement) => [image.naturalWidth, image.naturalHeight]))
     .toEqual([40, 80]);
   const bytes = await mediaResponse;
+  expect(await bytes.body()).toEqual(managedBytes);
   expect(bytes.headers()["cache-control"]).toBe("no-store");
   expect(bytes.headers()["accept-ranges"]).toBe("none");
 });
 
-test("recovers a lost committed response with the same request after restart", async ({ page }) => {
+test("recovers a lost committed response with the same request after restart", { tag: "@records-qualification" }, async ({ page }) => {
   await startBackend({ crashAfterCommit: true });
+  await loopbackOnly(page);
   const submissionTimes: string[] = [];
   page.on("request", (request) => {
     if (request.method() !== "POST" || request.url() !== backend + "/objects") return;
@@ -1038,9 +1170,10 @@ test("recovers a lost committed response with the same request after restart", a
   await expect(page.getByRole("link", { name: "View details for Restart recovery card" })).toHaveCount(1);
 });
 
-test("keeps the user in the editor while a real registration is pending", async ({ page }) => {
+test("keeps the user in the editor while a real registration is pending", { tag: "@records-qualification" }, async ({ page }) => {
   const gate = join(parent, "finish-registration");
   await startBackend({ registrationGate: gate });
+  await loopbackOnly(page);
   await selectTarget(page, sourceImage(), "Pending card");
   await setTargetCoordinates(page);
   await page.getByRole("button", { name: "Register Object", exact: true }).click();
@@ -1052,21 +1185,19 @@ test("keeps the user in the editor while a real registration is pending", async 
   await expect(page.getByRole("img", { name: "Reference for Pending card", exact: true })).toBeVisible();
 });
 
-test("purges an expired object on startup before a direct link can fetch its image", async ({ page }) => {
-  await startBackend();
-  await page.goto("/objects");
-  await expect(page.getByText("Records connected · Search unavailable")).toBeVisible();
+test("purges an expired object on startup before a direct link can fetch its image", { tag: "@records-qualification" }, async ({ page }) => {
+  const clock = join(parent, "startup-clock");
+  const managed = join(parent, "records", "media", "old-reference.png");
+  writeFileSync(clock, "0");
+  await startBackend({ clockOffset: clock });
+  await loopbackOnly(page);
+  await seedLibrary([["old", "Expired reference", "Lost", Date.now() - 7 * 86_400_000 + 120_000]], ["old"]);
+  expect(existsSync(managed)).toBe(true);
   await stopBackend();
-  const database = join(parent, "records", "records.sqlite3");
-  execFileSync(python, [
-    "-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
-      "db.execute('PRAGMA foreign_keys = ON'); db.execute(\"INSERT INTO objects " +
-      "(id,name,status,registered_at_ms,roi_x,roi_y,roi_width,roi_height,revision,reference_media_id," +
-      "reference_width,reference_height) VALUES ('old','Expired reference','Lost',1,0,0,1,1,1,'old-media',1,1)\"); " +
-      "db.execute(\"INSERT INTO media VALUES ('old-media','old',NULL,'Reference','media/old-media.png'," +
-      "'image/png',1,1,1,?,1,'Ready')\", ('a'*64,)); db.commit(); db.close()", database,
-  ], { windowsHide: true });
-  await startBackend();
+  writeFileSync(clock, "180000");
+  await startBackend({ clockOffset: clock });
+  await waitForStorage();
+  expect(existsSync(managed)).toBe(false);
   const { requests } = observe(page);
   await page.goto("/objects/old");
   await expect(page.getByText("Object not found", { exact: true })).toBeVisible();
@@ -1074,7 +1205,7 @@ test("purges an expired object on startup before a direct link can fetch its ima
   expect(requests.some((request) => request.includes("/media/"))).toBe(false);
 });
 
-test("clears expired media on wake and reports failed cleanup through restart and repair", async ({ page }) => {
+test("clears expired media on wake and reports failed cleanup through restart and repair", { tag: "@records-qualification" }, async ({ page }) => {
   test.setTimeout(60_000);
   await loopbackOnly(page);
   const clock = join(parent, "retention-clock");
@@ -1122,7 +1253,7 @@ test("clears expired media on wake and reports failed cleanup through restart an
   await expect(reference).toHaveCount(0);
 });
 
-test("preserves grace during a slow refresh and rejects its stale response after session end", async ({ page }) => {
+test("preserves grace during a slow refresh and rejects its stale response after session end", { tag: "@records-qualification" }, async ({ page }) => {
   test.setTimeout(60_000);
   const clock = join(parent, "grace-clock");
   writeFileSync(clock, "0");
@@ -1130,13 +1261,33 @@ test("preserves grace during a slow refresh and rejects its stale response after
   await loopbackOnly(page);
   const started = Date.now() - 1000;
   await seedLibrary([["old", "Graced reference", "Lost", started - 7 * 86_400_000 + 120_000]], ["old"]);
+  await page.goto("/settings");
+  await page.getByRole("textbox", { name: "Proposed retention in days" }).fill("30");
+  await page.getByRole("button", { name: "Preview Change" }).click();
+  await page.getByRole("button", { name: "Review Change", exact: true }).click();
+  const confirmation = page.getByRole("dialog", { name: "Apply retention change?" });
+  await expect(confirmation.getByRole("button", { name: "Confirm and Apply" })).toBeEnabled();
+
   const database = join(parent, "records", "records.sqlite3");
   execFileSync(python, [
     "-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
-      "db.execute(\"INSERT INTO sessions VALUES ('paused','old','Controller','Paused',?,NULL,NULL,?,1)\", " +
-      "(int(sys.argv[2]), '[{\"cause\":\"ManualPause\",\"failure_id\":null}]')); db.commit()",
+      "db.execute(\"INSERT INTO sessions VALUES ('active','old','Controller','Searching',?,NULL,NULL,'[]',1)\", " +
+      "(int(sys.argv[2]),)); db.commit()",
     database, String(started),
   ], { windowsHide: true });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.getByText("Search is Searching", { exact: true })).toBeVisible();
+  await expect(confirmation).toHaveCount(0);
+  await expect(page.getByRole("button", { name: "Preview Change" })).toBeDisabled();
+
+  execFileSync(python, [
+    "-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
+      "db.execute(\"UPDATE sessions SET state='Paused', pause_causes=?, revision=2 WHERE id='active'\", " +
+      "('[{\"cause\":\"ManualPause\",\"failure_id\":null}]',)); db.commit()", database,
+  ], { windowsHide: true });
+  await page.evaluate(() => window.dispatchEvent(new Event("focus")));
+  await expect(page.getByText("Search is Paused", { exact: true })).toBeVisible();
+  await expect(page.getByRole("button", { name: "Preview Change" })).toBeDisabled();
   writeFileSync(clock, "180000");
   await page.goto("/objects/old");
   const image = page.getByRole("img", { name: "Reference for Graced reference", exact: true });
@@ -1162,7 +1313,7 @@ test("preserves grace during a slow refresh and rejects its stale response after
     execFileSync(python, [
       "-c", "import sqlite3, sys; db = sqlite3.connect(sys.argv[1]); " +
         "db.execute(\"UPDATE sessions SET state='Ended', end_reason='Stopped', ended_at_ms=?, pause_causes='[]' " +
-        "WHERE id='paused'\", (int(sys.argv[2]),)); db.commit()",
+        "WHERE id='active'\", (int(sys.argv[2]),)); db.commit()",
       database, String(Date.now() + 180_000),
     ], { windowsHide: true });
     await expect(page.getByText(/^(Record expired|Object not found)$/)).toBeVisible({ timeout: 12_000 });
