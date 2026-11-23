@@ -11,7 +11,7 @@ from concurrent.futures import Future
 from dataclasses import dataclass
 from multiprocessing.connection import Connection, wait
 from pathlib import Path
-from threading import Thread
+from threading import Lock, Thread
 from time import sleep
 from types import TracebackType
 from typing import TYPE_CHECKING, Literal, cast
@@ -35,6 +35,8 @@ STARTUP_SECONDS = 90.0
 PROGRESS_SECONDS = 2.5
 PROBE_INTERVAL = 0.25
 RESTART_INTERVAL = 2.0
+SHUTDOWN_DRAIN_SECONDS = 0.5
+SHUTDOWN_WAIT_SECONDS = 2.5
 IDENTIFIER = re.compile(r"[A-Za-z0-9_-]{1,128}")
 Box = tuple[float, float, float, float]
 RequestKind = Literal["probe", "prepare", "frame", "clear"]
@@ -47,6 +49,10 @@ class WorkerFault(RuntimeError):
     def __init__(self, detail: str, cause: str = "NOT_READY"):
         super().__init__(detail)
         self.cause = cause
+
+
+class _WorkerDisconnected(WorkerFault):
+    pass
 
 
 @dataclass(frozen=True)
@@ -86,7 +92,7 @@ def receive(pipe: LocalPipe) -> dict[str, object]:
         raw = json.loads(pipe.recv_bytes(HEADER_LIMIT).decode("utf-8"), object_pairs_hook=json_fields,
                          parse_constant=reject_nonfinite)
     except (EOFError, BrokenPipeError) as exc:
-        raise WorkerFault("Local YOLOE worker exited") from exc
+        raise _WorkerDisconnected("Local YOLOE worker exited") from exc
     except (OSError, ValueError, HttpError, RecursionError) as exc:
         raise WorkerFault("Worker header unreadable", "PROTOCOL_UNSUPPORTED") from exc
     if not isinstance(raw, dict) or type(raw.get("version")) is not int or raw.pop("version") != VERSION:
@@ -198,10 +204,11 @@ def run_worker(
                         box = model.infer(header, source)
                         last_frame = stream, clock, sequence, source_us
                 send(pipe, {**header, "box": box})
-        except (EOFError, BrokenPipeError):
+        except (_WorkerDisconnected, EOFError, BrokenPipeError):
             return
         except Exception as exc:
             print(f"Local YOLOE work failed: {exc}", flush=True)
+            raise
 
 
 class VisionProcess:
@@ -213,6 +220,8 @@ class VisionProcess:
         self.instance = uuid4().hex
         self.limits = limits
         self._request = 0
+        self.exitcode: int | None = None
+        self._pipe_lock = Lock()
         context = multiprocessing.get_context("spawn")
         self._pipe, self._child_pipe = context.Pipe()
         self.process = context.Process(
@@ -239,23 +248,46 @@ class VisionProcess:
             raise WorkerFault("Local YOLOE worker has not exited")
 
     def close(self) -> bool:
-        try:
-            if self.process.is_alive():
-                self.process.terminate()
-        except OSError:
-            # The process may exit between the liveness check and termination.
-            pass
-        finally:
-            self._pipe.close()
-        self.process.join(0.5)
+        if self.exitcode is not None:
+            return True
+        if self._pipe_lock.acquire(timeout=SHUTDOWN_DRAIN_SECONDS):
+            try:
+                # EOF lets an idle worker leave its request loop and release CUDA.
+                self._pipe.close()
+            finally:
+                self._pipe_lock.release()
+            self.process.join(SHUTDOWN_WAIT_SECONDS)
         if self.process.is_alive():
+            # An in-flight native call may never return. Termination also
+            # releases the pending pipe exchange before its handle is closed.
+            try:
+                self.process.terminate()
+            except OSError:
+                # The process may have exited after the liveness check.
+                pass
+            self.process.join(SHUTDOWN_WAIT_SECONDS)
+        if self.process.is_alive() or not self._pipe_lock.acquire(timeout=SHUTDOWN_DRAIN_SECONDS):
             return False
+        try:
+            self._pipe.close()
+        finally:
+            self._pipe_lock.release()
+        self.exitcode = self.process.exitcode
         self.process.close()
         return True
 
+    def _receive_reply(self) -> dict[str, object]:
+        # Closing a Windows worker can leave an overlapped pipe read pending.
+        # Wait for the process as well as the reply so exit releases the caller.
+        pipe = cast(Connection, self._pipe)  # Windows wait also accepts PipeConnection.
+        if pipe not in wait([pipe, self.process.sentinel]):
+            raise _WorkerDisconnected("Local YOLOE worker exited")
+        return receive(self._pipe)
+
     def initialize(self) -> None:
         tags = {"boot": self.boot, "worker": self.instance}
-        result = receive(self._pipe)
+        with self._pipe_lock:
+            result = self._receive_reply()
         if result == {"kind": "ready", **tags}:
             return
         cause = result.get("cause")
@@ -266,16 +298,17 @@ class VisionProcess:
 
     def exchange(self, kind: RequestKind, fields: dict[str, object] | None = None,
                  image: bytes | None = None) -> Box | None:
-        self._request += 1
-        header = {"kind": kind, "boot": self.boot, "worker": self.instance, "request": self._request,
-                  **(fields or {})}
-        request_fields(header, kind, self.limits)
-        if (len(image) if image is not None else None) != header.get("size"):
-            raise WorkerFault("Backend image length mismatch")
-        send(self._pipe, header)
-        if image is not None:
-            self._pipe.send_bytes(image)
-        reply = receive(self._pipe)
+        with self._pipe_lock:
+            self._request += 1
+            header = {"kind": kind, "boot": self.boot, "worker": self.instance, "request": self._request,
+                      **(fields or {})}
+            request_fields(header, kind, self.limits)
+            if (len(image) if image is not None else None) != header.get("size"):
+                raise WorkerFault("Backend image length mismatch")
+            send(self._pipe, header)
+            if image is not None:
+                self._pipe.send_bytes(image)
+            reply = self._receive_reply()
         if "box" not in reply:
             raise WorkerFault("Missing worker result", "PROTOCOL_UNSUPPORTED")
         raw = reply.pop("box")

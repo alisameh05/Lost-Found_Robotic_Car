@@ -26,6 +26,12 @@ CAMERA_ENUM_VERSION = "1.4.0"
 
 
 @dataclass(frozen=True)
+class AcquiredImage:
+    at: float
+    bgr: Any
+
+
+@dataclass(frozen=True)
 class WebcamFrame:
     epoch: str
     sequence: int
@@ -70,6 +76,7 @@ class Webcam:
         self._scope: InputScope | None = None
         self._frame: WebcamFrame | None = None
         self._result: Recognition | None = None
+        self._last_recognized: tuple[str, float] | None = None
         self._interruption: InputSample | None = None
         self._preview: Capture | None = None
         self._threads = [
@@ -92,7 +99,14 @@ class Webcam:
         with self._changed:
             frame, now = self._frame, self._clock()
             return (frame is not None and 0 <= now - frame.at < self._deadline
-                    and self._recent_recognition(frame, now) is not None)
+                    and self._recognition_at(frame, now) is not None)
+
+    def _recognition_at(self, frame: WebcamFrame, now: float) -> float | None:
+        recognized = self._last_recognized
+        if recognized is None:
+            return None
+        epoch, at = recognized
+        return at if epoch == frame.epoch and 0 <= now - at < self._deadline else None
 
     def _recent_recognition(self, frame: WebcamFrame, now: float) -> Recognition | None:
         result = self._result
@@ -111,9 +125,10 @@ class Webcam:
                 return WebcamObservation(None, None, None)
             if preview is not None and preview.stream_epoch != frame.epoch:
                 preview = None
+            recognition_at = self._recognition_at(frame, now)
             result = self._recent_recognition(frame, now)
             if result is None:
-                return WebcamObservation(preview, None, None)
+                return WebcamObservation(preview, recognition_at, None)
             at = result.frame.at
             sample = None
             if scope and result.frame.scope == scope:
@@ -128,7 +143,7 @@ class Webcam:
                     sample = InputSample(scope, at, result.intent)
             # Device health has its own capture clock. A fresh result across
             # scope rotation can prove progress, but has no motion authority.
-            return WebcamObservation(preview, at, sample)
+            return WebcamObservation(preview, recognition_at, sample)
 
     def _capture(self) -> None:
         while not self._stop.is_set():
@@ -139,8 +154,13 @@ class Webcam:
                     while not self._stop.is_set():
                         with self._changed:
                             at, scope = self._clock(), self._scope
-                        bgr = read()
-                        if self._clock() - at >= self._deadline:
+                        image = read()
+                        received_at = self._clock()
+                        if isinstance(image, AcquiredImage):
+                            if not at <= image.at <= received_at:
+                                raise OSError("Webcam acquisition time is outside its read interval.")
+                            at, image = image.at, image.bgr
+                        if received_at - at >= self._deadline:
                             # Opening a DirectShow device can delay its first
                             # frame. Discard it without repeatedly reopening.
                             self._clear_capture()
@@ -148,7 +168,7 @@ class Webcam:
                             continue
                         sequence += 1
                         with self._changed:
-                            self._frame = WebcamFrame(epoch, sequence, at, scope, bgr)
+                            self._frame = WebcamFrame(epoch, sequence, at, scope, image)
                             self._changed.notify_all()
             except Exception:
                 self._clear_capture()
@@ -158,6 +178,7 @@ class Webcam:
         with self._changed:
             self._frame = None
             self._result = None
+            self._last_recognized = None
             self._interruption = None
             self._preview = None
             self._changed.notify_all()
@@ -181,7 +202,13 @@ class Webcam:
                         pose = recognize(frame.bgr)
                         with self._changed:
                             latest = self._frame
-                            if latest is not frame or self._clock() - frame.at >= self._deadline:
+                            if (latest is None or latest.epoch != frame.epoch
+                                    or not 0 <= self._clock() - frame.at < self._deadline):
+                                continue
+                            # A timely result from this epoch proves recognition is working.
+                            # A superseded frame cannot drive gesture stabilization or motion.
+                            self._last_recognized = frame.epoch, frame.at
+                            if latest is not frame:
                                 continue
                             if frame.scope == self._scope:
                                 intent, label = stable.accept(pose, frame.at, frame.sequence)
@@ -194,6 +221,7 @@ class Webcam:
             except Exception:
                 with self._changed:
                     self._result = None
+                    self._last_recognized = None
                     self._interruption = None
                     self._changed.notify_all()
                 self._stop.wait(RETRY_SECONDS)

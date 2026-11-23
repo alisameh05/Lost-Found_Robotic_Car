@@ -17,6 +17,7 @@ from backend.app.runtime import RecordsRuntime
 from backend.app.simulation import load_simulation
 from backend.app.storage import RecordsStorage
 from backend.app.webcam import (
+    AcquiredImage,
     ReadFrame,
     Recognition,
     Recognize,
@@ -217,6 +218,7 @@ def test_realtime_reads_an_admitted_webcam_result_before_the_input_poll(tmp_path
     scope = InputScope(runtime.boot_id, "session", 1)
     frame = WebcamFrame("current", 2, 0.9, scope, replay.hands)
     adapter._frame = frame
+    adapter._last_recognized = frame.epoch, frame.at
     adapter._result = Recognition(frame, "forward", "1 finger - forward")
     interruption = InputSample(scope, 0.82, "invalid")
     adapter._interruption = interruption
@@ -234,15 +236,19 @@ def test_realtime_reads_an_admitted_webcam_result_before_the_input_poll(tmp_path
     assert router.component_cause("Webcam") == "NOT_READY"
 
 
-def test_late_recognition_cannot_refresh_health_after_the_next_acquisition() -> None:
+def test_overlapped_recognition_proves_health_without_authorizing_motion() -> None:
     composition = load_simulation("local-gestures-v1")
     assert composition
     captures: Queue[str] = Queue()
-    old_started, old_finish, newer_published, newer_started, newer_finish = (Event() for _ in range(5))
+    acquiring, old_started, old_finish, newer_published, newer_started, newer_finish = (Event() for _ in range(6))
 
     @contextmanager
     def camera() -> Iterator[ReadFrame]:
-        yield lambda: captures.get(timeout=.5)
+        def read() -> str:
+            acquiring.set()
+            return captures.get(timeout=.5)
+
+        yield read
 
     @contextmanager
     def recognizer() -> Iterator[Recognize]:
@@ -259,20 +265,64 @@ def test_late_recognition_cannot_refresh_health_after_the_next_acquisition() -> 
             newer_published.set()
         return b"preview"
 
-    adapter = Webcam(composition.profile, camera, recognizer, preview, lambda: 1.)
+    now = 1.0
+    scope = InputScope("boot", "session", 1)
+    adapter = Webcam(composition.profile, camera, recognizer, preview, lambda: now)
+    adapter.observe(scope)
     adapter.start()
     try:
+        assert acquiring.wait(1)
+        now = 1.1
         captures.put("old")
         assert old_started.wait(1)
         captures.put("new")
         assert newer_published.wait(1)
         old_finish.set()
         assert newer_started.wait(1)
-        assert adapter.observe(None).recognition_at is None
+        observation = adapter.observe(scope)
+        assert observation.recognition_at == 1.0
+        assert observation.input is None
+        assert adapter.recognition_ready()
+        now = 1.25
+        assert not adapter.recognition_ready()
+        assert adapter.observe(scope).recognition_at is None
     finally:
         old_finish.set()
         newer_finish.set()
         captures.put("stop")
+        adapter.close()
+
+
+def test_recorded_capture_uses_its_known_acquisition_time() -> None:
+    composition = load_simulation("local-gestures-v1")
+    assert composition
+    replay = WebcamReplay()
+    acquiring = Event()
+    samples: Queue[AcquiredImage] = Queue()
+    now = 1.0
+
+    @contextmanager
+    def camera() -> Iterator[ReadFrame]:
+        def read() -> AcquiredImage:
+            acquiring.set()
+            return samples.get(timeout=0.5)
+
+        yield read
+
+    adapter = Webcam(composition.profile, camera, replay.recognizer, replay.encode, lambda: now)
+    adapter.start()
+    try:
+        assert acquiring.wait(1)
+        now = 1.3  # Delivery was paced for longer than the sample deadline.
+        samples.put(AcquiredImage(now, replay.hands))
+        deadline = monotonic() + 1
+        while not adapter.recognition_ready() and monotonic() < deadline:
+            sleep(0.005)
+        assert adapter.observe(None).recognition_at == 1.3
+        now = 1.55
+        assert not adapter.recognition_ready()
+    finally:
+        samples.put(AcquiredImage(now, replay.hands))
         adapter.close()
 
 

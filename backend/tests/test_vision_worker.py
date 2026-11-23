@@ -82,6 +82,25 @@ def test_worker_cannot_refresh_progress_with_a_replayed_reply(tmp_path: Path) ->
             worker.exchange("probe")
 
 
+def worker_waiting_for_shutdown(
+    pipe: LocalPipe, boot: str, worker: str, assets: Path | None, settings: Path, limits: FrameLimits,
+) -> None:
+    with pipe:
+        send(pipe, {"kind": "ready", "boot": boot, "worker": worker})
+        try:
+            pipe.recv_bytes()
+        except EOFError:
+            (settings / "released").touch()
+
+
+def test_idle_worker_can_release_its_runtime_before_exit(tmp_path: Path) -> None:
+    with VisionProcess("test-boot", None, tmp_path, LIMITS, target=worker_waiting_for_shutdown) as worker:
+        worker.initialize()
+    assert (tmp_path / "released").is_file()
+    assert worker.exitcode == 0
+    assert worker.close()
+
+
 @pytest.mark.parametrize("bad_asset", ["missing", "changed"])
 def test_invalid_local_assets_fail_before_native_start(tmp_path: Path, bad_asset: str) -> None:
     if os.name != "nt":
@@ -148,4 +167,5 @@ def test_pinned_windows_gpu_worker(tmp_path: Path) -> None:
             "sequence": 9, "source_us": 9, "width": w, "height": h, "size": len(image),
         }
         print(f"wallet_box={worker.exchange('frame', fields, image)}")
-    print(f"worker_startup_ms={startup_ms:.2f}")
+    assert worker.exitcode == 0
+    print(f"worker_startup_ms={startup_ms:.2f} worker_exitcode={worker.exitcode}")
