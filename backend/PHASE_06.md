@@ -89,3 +89,50 @@ The Controller and native MediaPipe windows peaked at 38.1% and 91.5% system CPU
 The full backend regression run passed 377 cases and reported four failures. Three passed on a focused rerun. `test_source_and_worker_resets_keep_rejection_and_require_deliberate_recovery` timed out waiting for the second candidate both on this branch and on the original `main` commit `2dee839`. The integrated CUDA browser replay verified suppression and re-entry while Paused before an explicit Resume.
 
 Hands-on operator qualification remains open. On the selected Integrated Camera, check live hand mapping, occlusion and viewpoint, preview orientation, end-to-end response, and capture disconnect/reopen. On the selected DualShock 4, check all four directions, release and diagonal, Circle with a held direction, focus loss, unplug/reconnect and timing with the simulated sink. The prior adapter reports preserve the camera identity and SDL/HID observations already measured.
+
+## Phase 08 short native replay
+
+The baseline was `42fbfeb312228be51ee92cd42f7c50b04ba09548` on a Lenovo 82XV with an Intel Core i7-13620H, 13.0 GiB detected RAM, and Windows 11 26H2 build 26300.9974 on the Balanced power plan. The NVIDIA GeForce RTX 4050 Laptop GPU reported driver 560.94 and 6,141 MiB dedicated VRAM. The native runtime used CPython 3.11.14, SQLite 3.50.4, FastAPI 0.163.2, MediaPipe 0.10.32, OpenCV contrib 4.11.0.86, Ultralytics 8.4.23, and PyTorch 2.6.0+cu124 on CUDA device 0. The browser build used Node 24.21.0, npm 11.19.0, Next.js 16.4.6, Playwright 1.65.1 and Chromium 159.0.8154.6. Package locks record the complete dependencies.
+
+| Local file used | Observed SHA-256 |
+| --- | --- |
+| `yoloe-26s-seg.pt` | `48f24206bc8680d60cbbfa296b0140da849669b9515058b72f5a945142df0654` |
+| `hand_landmarker.task` | `fbc2a30080c3c557093b5ddfc334698132eb341044ccee322ccf8bcf3607cde1` |
+| `bus.jpg` | `c02019c4979c191eb739ddd944445ef408dad5679acab6fd520ef9d434bfbc63` |
+| `zidane.jpg` | `16d73869e3267a7d4ed00de8e860833bd1657c1b252e94c0c348277adc7b6edb` |
+| `right_hands.jpg` | `4b5134daa4cb60465535239535f9f74c2842aba3aa5fd30bf04ef5678f93d87f` |
+| `phase06/profile.json` | `4a168cec6fe6f8c84a65e94a599c77dffb90bf7b7593e46fea3cbe667e0d25ac` |
+| CPython `python.exe` | `77ce191aa5d30b17288a3d6adaf83813154998b8de82b82485d393d11ce47c58` |
+| `node.exe` | `ba4e6d110e8c1592a1ecd390f6b05f3da124b13871a5be62b341a07a853c6c32` |
+| `backend/requirements.lock` | `46198fdc2ede30712a3260163559a710fbecbf78aa0fe14628d1cda341ab3bb2` |
+| `experiments/vision/requirements.lock` | `7a268224173bfbaebcd315463b66839076ee123c77abfb0e3ffd6676e9933ff1` |
+| `frontend/package-lock.json` | `201cd3365da38f50820d72ba5712bf5fa61490f0e0dda207a7f5045fb748d3b2` |
+
+Run the same protected production browser workload. The browser driver creates the 640 × 360 quality-88 positive JPEG from `zidane.jpg` and uses the same size and quality for the flat RGB (45, 45, 45) negative frame. The reference and saved ROI are `bus.jpg` and (50, 390, 190, 510). The native webcam path crops `right_hands.jpg` to its first 360 columns, scales it to 480 px tall and centers it in a 640 × 480 frame. The replay driver uses the same 80 ms delivery cadence and sends the recorded pixels through the pinned CPU Hand Landmarker. The fixture stamps acquisition when it emits the pixels. The baseline counted the pacing wait in sample age, as DirectShow does for blocking reads without a source timestamp. The other selected-mode journeys simulate hand landmarks or DualShock 4 USB reports. Robot input, commands and proximity are fixtures. The matching model, protected HTTP/WebSocket traffic, browser drawing, and managed SQLite/media storage are real. The replay permits application traffic on loopback and denies network access in the worker. Windows network interfaces remained enabled. [Replay command](#replay-and-review-evidence) · [Browser driver](../frontend/e2e/records.spec.ts) · [Replay driver](tests/phase06_replay.py)
+
+### Baseline and isolation
+
+- The [Phase 07 repeat](PHASE_07_INTEGRATION.md#november-23-verification-record) recorded an `InputUnavailable` revocation, 222 Landmarker results across the run and zero YOLOE frame exchanges. The worker cannot exchange search frames after a required input pauses a search.
+- On current main, the first Chromium replay completed with 106 frame exchanges across the journey. The next two stopped at Search Setup with Webcam `Unavailable`, the other required paths Ready and zero frame exchanges. MediaPipe still returned 416 and 350 results. The baseline logs and browser traces retain all three outcomes.
+- The first standalone CUDA check returned detections and then raised `Local YOLOE worker has not exited`. The first focused retry passed. A deterministic spawned worker fixture reproduced an idle child being terminated before its EOF cleanup.
+- The deterministic webcam test reproduced the stale readiness signal when another acquisition arrived before MediaPipe completed. Timely results from the current capture epoch now prove recognition progress using their original acquisition timestamps. A result completed after a newer acquisition cannot stabilize or authorize a gesture. Camera loss and stale recognition still disarm under the 240 ms bound.
+- The worker receives EOF for orderly exit after draining an in-flight exchange. Shutdown can terminate and reap an unresponsive child. This timeout applies to process teardown. The worker startup, inference progress and input readiness bounds retain their existing values.
+- A focused run after separating recognition readiness still reproduced `InputUnavailable` during the simulated blocking read, with zero exchanges in the 10.18 s window. The prior acquisition was about 250 ms old when the next result arrived. The controlled replay now uses its known delivery timestamp. The real DirectShow adapter continues to use the start of the blocking read.
+- With the Windows launcher stdin pipe held open, the spawned worker never reported Ready. A protected supervisor regression showed AI stayed `Initializing` with missing assets. Polling the pipe for data or EOF before reading lets the worker report `MEDIA_UNAVAILABLE` and preserves launcher-driven shutdown.
+- After fixing supervised startup, one replay completed, one paused during a 296 ms MediaPipe call, and one lost webcam readiness at Start. All three workers exited with code 0. One-thread CPU preprocessing was evaluated but had no verified CUDA result before the host lost access to the GPU. The recorded results use the pinned model settings.
+
+### Changed revision evidence
+
+| Replay | Window | Robot acquisitions | Browser draws | YOLOE exchanges | Landmarker results |
+| --- | ---: | ---: | ---: | ---: | ---: |
+| Controller USB-report replay | 10.150 s | 101 | 101 | 101 | Inactive |
+| Real MediaPipe with recorded hand, temporary test shutdown signal | 10.173 s | 104 | 103 | 104 | 127 |
+| Real MediaPipe with recorded hand, production stdin supervision | 10.178 s | 101 | 102 | 101 | 126 |
+
+Both selected-mode journeys passed with the temporary test shutdown signal. The production-supervised native pass sustained the negative scene without a revocation, exercised a deliberate `InputUnavailable` pause and recovery, then displayed a positive match. Stop Search and launcher EOF ended the run. The backend and the original CUDA worker both exited with code 0. Both other production-supervised attempts also released their worker with code 0. One retained 31 exchanges before a timed-out gesture sample paused the session. The other lost webcam readiness during Start and stayed in Search Setup.
+
+The later installed-launcher check reached records readiness and exited cleanly. Its native retry reported `PROTOCOL_UNSUPPORTED` during worker startup. Windows listed the RTX 4050 as `Unknown / CM_PROB_PHANTOM`, PyTorch reported CUDA 12.4 with zero visible devices, and OpenCV 4.11.0 still exposed `aruco`. The later GPU-dependent browser and backend reruns were blocked. The short native workload has a complete production-supervised observation and repeatability remains open on this host.
+
+Local evidence is under `.local-runtime/results/issue109`. `baseline-browser` preserves the first run and both repeats. `baseline-pinned-models.xml` and `baseline-pinned-model-retry.xml` preserve the first worker-exit result and retry. `changed-native-stop-signal` preserves the focused zero-exchange result and protected transition trace. `final-phase06` and `supervised-native-repeat` contain the replay inputs, readiness transitions, resource and model-exchange samples, and worker exit rows. The missing-asset supervisor regression is recorded in `red-supervised-worker.xml` and `green-supervised-worker.xml`.
+
+The final focused backend run passed 34 checks, including the real CPU Hand Landmarker, with the CUDA worker benchmark gated off after the device disappeared. Five deterministic cases from the full-suite failures passed on focused retry. The full backend runs recorded 495/496 and 493/498 passes. The later run included the unavailable CUDA startup. Ruff, mypy, the contract export, frontend lint and type checking, the production build, and all 90 frontend unit tests passed. The raw backend reports are `changed-backend-full.xml`, `final-backend-full.xml`, `final-affected-tests.xml`, and `final-deterministic-retries.xml`.

@@ -25,12 +25,12 @@ from backend.app.motion import FixtureCommandSink
 from backend.app.simulation import load_simulation, read_sample
 from backend.app.storage import RecordsStorage
 from backend.app.vision_worker import VisionProcess
-from backend.app.webcam import Webcam, encode_preview, open_hand_landmarker
+from backend.app.webcam import AcquiredImage, Webcam, encode_preview, open_hand_landmarker
 from backend.tests.test_controller import SERIAL, device, fresh_reports
 from backend.tests.test_gestures import hand
 
 
-def replay_app(config: Config, *, held_owner: bool = False):
+def replay_app(config: Config, *, held_owner: bool = False, capability: str | None = None):
     directory = Path(sys.argv[1])
     mode = sys.argv[2]
     simulation = load_simulation(config.simulation_profile, config.recorded_robot_jpeg)
@@ -89,8 +89,18 @@ def replay_app(config: Config, *, held_owner: bool = False):
     class MeasuredWorker(VisionProcess):
         def initialize(self):
             initial = super().initialize()
-            mark("ready", elapsed=monotonic() - started)
+            mark("ready", pid=self.process.pid, elapsed=monotonic() - started)
             return initial
+
+        def close(self):
+            if self.exitcode is not None:
+                return True
+            pid = self.process.pid
+            begin = perf_counter()
+            closed = super().close()
+            mark("worker_exit" if closed else "worker_exit_timeout", pid=pid, exitcode=self.exitcode,
+                 elapsed=perf_counter() - begin)
+            return closed
 
         def exchange(self, kind, fields=None, payload=None):
             if kind == "frame" and state().get("worker_stalled") == "exchange":
@@ -181,9 +191,10 @@ def replay_app(config: Config, *, held_owner: bool = False):
             recording[:, left:left + scaled_width] = cv2.resize(hand_image, (scaled_width, 480))
 
             def native_camera_read():
-                # Match the observed DirectShow cadence for the single-hand workload.
+                # The fixture knows when it emits these recorded pixels after pacing delivery.
+                # DirectShow supplies no acquisition timestamp and uses the start of the read.
                 camera_read(0.080)
-                return recording
+                return AcquiredImage(monotonic(), recording)
 
             @contextmanager
             def measured_landmarker():
@@ -203,7 +214,7 @@ def replay_app(config: Config, *, held_owner: bool = False):
     realtime.VisionProcess = MeasuredWorker
     realtime.RejectedTrack = TracedTrack
     sessions.encode_evidence = measured_evidence
-    app = create_app(config, held_owner=held_owner, storage=RecordsStorage(config.data_root, checkpoint=checkpoint),
+    app = create_app(config, held_owner=held_owner, capability=capability, storage=RecordsStorage(config.data_root, checkpoint=checkpoint),
                      simulation=replace(simulation, adapter=RecordedRobot(), command_sink=sink),
                      controller=controller, webcam=webcam,
                      on_control_revoked=lambda revocation: mark("revocation", cause=revocation.reason))
@@ -215,7 +226,8 @@ def replay_app(config: Config, *, held_owner: bool = False):
         nvidia_smi = shutil.which("nvidia-smi")
         last_command = None
         with (directory / "trace.jsonl").open("w", encoding="utf-8", buffering=1) as report:
-            while not done.is_set():
+            while True:
+                finished = done.is_set()
                 journal = sink.journal
                 first_new = next((index + 1 for index, command in enumerate(journal) if command is last_command), 0)
                 for command in journal[first_new:]:
@@ -228,6 +240,8 @@ def replay_app(config: Config, *, held_owner: bool = False):
                     except Empty:
                         break
                     report.write(json.dumps(observation) + "\n")
+                if finished:
+                    break
                 if monotonic() >= next_resources_at:
                     with process.oneshot():
                         rss = process.memory_info().rss
@@ -268,7 +282,7 @@ def replay_app(config: Config, *, held_owner: bool = False):
             sink.close()
             done.set()
             driver.join(timeout=1)
-            reporter.join(timeout=1)
+            reporter.join(timeout=2)
 
     app.router.lifespan_context = lifespan
     return app
@@ -285,4 +299,4 @@ if __name__ == "__main__":
 
     sys.addaudithook(loopback_only)
     entry.create_app = replay_app
-    raise SystemExit(entry.main())
+    raise SystemExit(entry.main(sys.argv[3:]))

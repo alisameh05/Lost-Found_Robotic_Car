@@ -1,11 +1,11 @@
 import { expect, test, type Locator, type Page, type TestInfo } from "@playwright/test";
 import { execFileSync, spawn, type ChildProcess } from "node:child_process";
-import { createHash } from "node:crypto";
+import { createHash, randomBytes } from "node:crypto";
 import { appendFileSync, existsSync, linkSync, mkdtempSync, readFileSync, renameSync, unlinkSync, writeFileSync } from "node:fs";
 import { readdir, rm } from "node:fs/promises";
 import { tmpdir } from "node:os";
 import { join, resolve } from "node:path";
-import type { FrameMetadata, Match, MatchPage, Object as ObjectRecord, SessionAction } from "../src/generated/api-v1";
+import type { EventEnvelope, FrameMetadata, Match, MatchPage, Object as ObjectRecord, SessionAction } from "../src/generated/api-v1";
 
 const frontend = "http://127.0.0.1:3103";
 const backend = "http://127.0.0.1:8110/api/v1";
@@ -15,6 +15,8 @@ const python = process.env.LAF_TEST_PYTHON ?? (existsSync(localPython) ? localPy
 let parent: string;
 let backendProcess: ChildProcess | undefined;
 let backendLog: string;
+let supervisedBackend: ChildProcess | undefined;
+let phase06Transitions: EventEnvelope[];
 
 test.use({ baseURL: frontend });
 
@@ -47,7 +49,8 @@ async function startBackend(options: {
     : options.clockOffset ? ["backend.tests.crash_registration", "clock", options.clockOffset,
       ...(options.cleanupFault ? ["deny-purge", options.cleanupFault] : [])]
     : ["backend.app"];
-  const child = spawn(python, ["-m", ...entry], {
+  const supervised = options.phase06 !== undefined;
+  const child = spawn(python, ["-m", ...entry, ...(supervised ? ["--supervised"] : [])], {
     cwd: repo, windowsHide: true, env: {
       ...process.env, LOCALAPPDATA: parent, LAF_DATA_ROOT: join(parent, "records"),
       LAF_BACKEND_PORT: "8110", LAF_FRONTEND_PORT: "3103",
@@ -59,13 +62,16 @@ async function startBackend(options: {
       LAF_YOLOE_ASSETS: options.yoloe?.assets, LAF_RECORDED_ROBOT_JPEG: options.yoloe?.robot,
       LAF_WEBCAM_DEVICE_PATH: options.gestures?.devicePath, LAF_GESTURE_ASSETS: options.gestures?.assets,
       LAF_CONTROLLER_SERIAL: undefined,
+      LAF_LAUNCH_CAPABILITY: supervised ? randomBytes(32).toString("base64url") : undefined,
       LAF_TEST_NO_WEBCAM: options.noWebcam ? "1" : undefined,
     },
   });
   backendProcess = child;
+  supervisedBackend = supervised ? child : undefined;
   backendLog = "";
   child.stderr?.on("data", (chunk) => { backendLog += String(chunk); });
-  child.stdout?.resume();
+  if (supervised) child.stdout?.on("data", (chunk) => { backendLog += String(chunk); });
+  else child.stdout?.resume();
   child.on("error", (error) => { backendLog += error.message; });
   await expect.poll(async () => {
     if (child.exitCode !== null || backendLog.includes("ENOENT")) throw new Error(backendLog);
@@ -83,11 +89,21 @@ async function startBackend(options: {
 async function stopBackend() {
   const child = backendProcess;
   backendProcess = undefined;
-  if (!child?.pid || child.exitCode !== null || child.signalCode !== null) return;
-  await new Promise<void>((done) => {
-    child.once("exit", () => done());
-    child.kill();
-  });
+  if (!child?.pid) return;
+  const supervised = child === supervisedBackend;
+  if (child.exitCode === null && child.signalCode === null) {
+    const timeout = supervised ? setTimeout(() => child.kill(), 30_000) : undefined;
+    try {
+      await new Promise<void>((done) => {
+        child.once("close", () => done());
+        if (supervised) child.stdin?.end();
+        else child.kill();
+      });
+    } finally {
+      clearTimeout(timeout);
+    }
+  }
+  if (supervised) expect({ code: child.exitCode, signal: child.signalCode }, backendLog).toEqual({ code: 0, signal: null });
 }
 
 async function selectTarget(page: Page, source: string, name: string) {
@@ -445,19 +461,32 @@ function objectRows(page: Page) {
   return page.getByRole("list", { name: "Object records" }).getByRole("listitem");
 }
 
-test.beforeEach(() => { parent = mkdtempSync(join(tmpdir(), "laf-records-browser-")); });
+test.beforeEach(() => {
+  parent = mkdtempSync(join(tmpdir(), "laf-records-browser-"));
+  phase06Transitions = [];
+});
 test.afterEach(async ({ page }, info) => {
   if (info.title.startsWith("Phase 06") && info.status !== info.expectedStatus) {
-    const trace = join(parent, "trace.jsonl");
-    if (existsSync(trace)) {
-      await info.attach("failure-replay-trace", { path: trace, contentType: "application/x-ndjson" });
-    }
-    if (backendLog) await info.attach("failure-backend-stderr", { body: backendLog, contentType: "text/plain" });
     const text = await page.locator("body").innerText({ timeout: 2_000 }).catch(() => "");
     if (text) await info.attach("failure-page-text", { body: text, contentType: "text/plain" });
   }
-  await stopBackend();
-  await rm(parent, { recursive: true, force: true, maxRetries: 3 });
+  try {
+    await stopBackend();
+  } finally {
+    if (info.title.startsWith("Phase 06")) {
+      for (const [name, file] of [["phase06-replay-input", "state.jsonl"], ["phase06-trace", "trace.jsonl"]]) {
+        const path = join(parent, file);
+        if (existsSync(path)) await info.attach(name, { path, contentType: "application/x-ndjson" });
+      }
+      if (backendLog) await info.attach("phase06-backend-log", { body: backendLog, contentType: "text/plain" });
+    }
+    if (phase06Transitions.length) {
+      await info.attach("protected-readiness-transitions", {
+        body: JSON.stringify(phase06Transitions), contentType: "application/json",
+      });
+    }
+    await rm(parent, { recursive: true, force: true, maxRetries: 3 });
+  }
 });
 
 test("default startup opens connected empty records and editable settings with one page identity", { tag: "@records-qualification" }, async ({ page }) => {
@@ -2070,7 +2099,7 @@ type ReplayTrace = {
   kind: string; at: number; event?: string; output?: string | null; cause?: string;
   scene?: string; frame?: number; frame_id?: string; stream?: string; match?: boolean;
   box?: [number, number, number, number] | null;
-  reentered?: boolean;
+  reentered?: boolean; pid?: number; exitcode?: number | null;
 };
 
 function phase06Trace(): ReplayTrace[] {
@@ -2121,8 +2150,12 @@ async function openPhase06(page: Page, assets: string, mode: "gestures" | "contr
     if (socket.url().endsWith("/events")) {
       socket.on("framereceived", ({ payload }) => {
         if (typeof payload !== "string") return;
-        const event = JSON.parse(payload);
+        const event = JSON.parse(payload) as EventEnvelope;
         if (event.type === "candidate_pending") matches.push(event.payload.match);
+        if (event.type === "snapshot" || event.type === "session_changed"
+            || event.type === "readiness_changed" || event.type === "recovery_changed") {
+          phase06Transitions.push(event);
+        }
       });
     } else if (socket.url().endsWith("/video/robot")) {
       socket.on("framereceived", ({ payload }) => {
@@ -2134,7 +2167,9 @@ async function openPhase06(page: Page, assets: string, mode: "gestures" | "contr
   await startBackend({ phase06: mode, yoloe: { assets, robot: positive }, gestures: { assets } });
   await selectTarget(page, join(assets, "bus.jpg"), `Integrated ${mode} search`);
   await setTargetCoordinates(page, ["50", "390", "190", "510"]);
-  await page.getByRole("button", { name: "Register Object" }).click();
+  const register = page.getByRole("button", { name: "Register Object" });
+  await expect(register).toBeEnabled();
+  await register.click();
   await page.getByRole("link", { name: "Open Search Setup" }).click();
   await expect(page.getByText("Offline YOLOE · Recorded robot video and simulated commands")).toBeVisible();
   const selected = mode === "controller" ? "PS4 controller" : "Gestures";
@@ -2160,17 +2195,21 @@ async function recordPhase06Workload(page: Page, info: TestInfo, duration: numbe
     displayed: (window as unknown as { phase06DrawCount: number }).phase06DrawCount,
   }));
   const firstDrawing = await clock();
-  const firstSample = phase06Trace().at(-1)?.at ?? 0;
+  const first = phase06Trace().length;
   await expect.poll(() => page.evaluate(() => performance.now()), { timeout: duration + 4000, intervals: [1000] })
     .toBeGreaterThanOrEqual(firstDrawing.at + duration);
   const lastDrawing = await clock();
-  const trace = phase06Trace();
-  const window = trace.filter(({ at }) => at >= firstSample);
-  expect(window.filter(({ kind }) => kind === "inference").length).toBeGreaterThan(10);
+  const rows = phase06Trace().slice(first);
+  const count = (kind: string) => rows.filter((row) => row.kind === kind).length;
+  await info.attach("combined-workload", {
+    body: JSON.stringify({ firstDrawing, lastDrawing, first, length: rows.length,
+      capture: count("capture"), inference: count("inference"), gesture: count("gesture"),
+      webcamCapture: count("webcam_capture"), revocations: rows.filter(({ kind }) => kind === "revocation") }),
+    contentType: "application/json",
+  });
+  expect(count("inference")).toBeGreaterThan(10);
   expect(lastDrawing.displayed - firstDrawing.displayed).toBeGreaterThan(10);
-  const path = join(parent, "combined-workload.json");
-  writeFileSync(path, JSON.stringify({ firstDrawing, lastDrawing, firstSample, lastSample: trace.at(-1)?.at }));
-  await info.attach("combined-workload", { path, contentType: "application/json" });
+  return rows;
 }
 
 for (const mode of ["gestures", "controller"] as const) {
@@ -2481,18 +2520,47 @@ test("Phase 06 measures the native MediaPipe and CUDA workload with recorded vid
   test.skip(!assets, "Requires the pinned local Windows CUDA and MediaPipe assets");
   if (!assets) return;
   test.setTimeout(150_000);
-  await openPhase06(page, resolve(assets), "native-landmarker");
-  try {
-    await expect(page.getByRole("img", { name: "Mirrored webcam preview and recognition" })).toBeVisible();
-    await recordPhase06Workload(page, info, 10_000);
-    expect(phase06Trace().filter(({ kind }) => kind === "gesture").length).toBeGreaterThan(30);
-    await expect(page.getByText("Committed session · Searching")).toBeVisible();
-    await page.getByRole("button", { name: "Stop Search", exact: true }).click();
-    await expect(page.getByRole("heading", { name: "Search ended without confirmation" })).toBeVisible();
-  } finally {
-    await info.attach("phase06-native-trace", { path: join(parent, "trace.jsonl"), contentType: "application/x-ndjson" });
-    if (backendLog) await info.attach("backend-stderr", { body: backendLog, contentType: "text/plain" });
-  }
+  page.setDefaultTimeout(15_000);
+  const { replay, matches } = await openPhase06(page, resolve(assets), "native-landmarker");
+  const button = (name: string) => page.getByRole("button", { name, exact: true });
+  const searching = page.getByText("Committed session · Searching", { exact: true });
+  await expect(page.getByRole("img", { name: "Mirrored webcam preview and recognition" })).toBeVisible();
+  await expect(searching).toBeVisible();
+  const samples = await recordPhase06Workload(page, info, 10_000);
+  expect(samples.filter(({ kind }) => kind === "gesture").length).toBeGreaterThan(30);
+  expect(samples.filter(({ kind }) => kind === "revocation")).toEqual([]);
+  expect(matches).toEqual([]);
+
+  const beforeLoss = phase06Trace().length;
+  replay({ mask: null });
+  await expect(page.getByText("Committed session · Paused", { exact: true })).toBeVisible();
+  await expect(page.getByText("Motion permission · Disarmed", { exact: true })).toBeVisible();
+  await expect.poll(() => phase06Trace().slice(beforeLoss).some(({ kind, cause }) =>
+    kind === "revocation" && cause === "InputUnavailable"))
+    .toBe(true);
+  replay({ mask: 0 });
+  await expect(page.getByText("Restored · Awaiting acknowledgment")).toBeVisible();
+  await expect(button("Resume")).toBeDisabled();
+  if (await button("Acquire control").isVisible()) await button("Acquire control").click();
+  await expect(button("Acknowledge")).toBeEnabled();
+  await button("Acknowledge").click();
+  await expect(button("Resume")).toBeEnabled();
+  await button("Resume").click();
+  await expect(searching).toBeVisible();
+
+  replay({ scene: "positive" });
+  const review = page.getByRole("region", { name: "Review potential match" });
+  await expect(review.getByRole("img", { name: "Captured evidence", exact: true })).toBeVisible();
+  expect(matches).toHaveLength(1);
+  await review.getByRole("button", { name: "Stop Search", exact: true }).click();
+  await expect(page.getByRole("heading", { name: "Search ended without confirmation" })).toBeVisible();
+  await stopBackend();
+  const trace = phase06Trace();
+  const workers = trace.filter(({ kind }) => kind === "ready");
+  expect(workers).toHaveLength(1);
+  expect(trace.filter(({ kind }) => kind === "worker_exit")).toEqual([
+    expect.objectContaining({ pid: workers[0].pid, exitcode: 0 }),
+  ]);
 });
 
 for (const action of ["start", "resume"] as const) {

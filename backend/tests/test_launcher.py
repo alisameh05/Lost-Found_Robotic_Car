@@ -4,8 +4,12 @@ import socket
 import subprocess
 import sys
 from pathlib import Path
+from secrets import token_urlsafe
+from time import monotonic, sleep
 
+import httpx
 import pytest
+from PIL import Image
 
 pytestmark = pytest.mark.skipif(sys.platform != "win32", reason="Windows launcher")
 
@@ -64,3 +68,48 @@ def test_launcher_reports_occupied_port(service: str, tmp_path: Path) -> None:
         assert result.returncode != 0
         assert f"{service} cannot bind 127.0.0.1:{occupied}" in result.stdout + result.stderr
         assert not (tmp_path / "LostAndFound").exists()
+
+
+def test_supervised_backend_can_start_its_native_worker_with_stdin_open(tmp_path: Path) -> None:
+    with socket.socket() as listener:
+        listener.bind(("127.0.0.1", 0))
+        port = listener.getsockname()[1]
+    recording = tmp_path / "recording.jpg"
+    Image.new("RGB", (640, 360), (45, 45, 45)).save(recording)
+    capability = token_urlsafe(32)
+    env = {**{key: value for key, value in os.environ.items() if not key.startswith("LAF_")},
+           "LOCALAPPDATA": str(tmp_path), "LAF_DATA_ROOT": str(tmp_path / "records"),
+           "LAF_LAUNCH_CAPABILITY": capability, "LAF_BACKEND_PORT": str(port),
+           "LAF_BACKEND_MODE": "fixture", "LAF_SIMULATION_PROFILE": "phase-06-v1",
+           "LAF_RECORDED_ROBOT_JPEG": str(recording), "LAF_YOLOE_ASSETS": str(tmp_path / "missing-assets")}
+    with subprocess.Popen(
+        [sys.executable, "-m", "backend.app", "--supervised"], cwd=ROOT, env=env, stdin=subprocess.PIPE,
+        stdout=subprocess.PIPE, stderr=subprocess.STDOUT, creationflags=subprocess.CREATE_NEW_PROCESS_GROUP,
+    ) as backend:
+        assert backend.stdin is not None
+        ai = None
+        try:
+            deadline = monotonic() + 12
+            with httpx.Client(timeout=0.5, trust_env=False) as client:
+                while monotonic() < deadline and backend.poll() is None:
+                    try:
+                        response = client.get(f"http://127.0.0.1:{port}/api/v1/health",
+                                              headers={"X-App-Capability": capability})
+                    except httpx.RequestError:
+                        sleep(0.05)
+                        continue
+                    if response.status_code == 200:
+                        ai = next(path for path in response.json()["readiness"]["components"]
+                                  if path["component"] == "AI")
+                        if ai["cause_codes"] == ["MEDIA_UNAVAILABLE"]:
+                            break
+                    sleep(0.05)
+        finally:
+            backend.stdin.close()
+            try:
+                backend.wait(timeout=8)
+            except subprocess.TimeoutExpired:
+                backend.kill()
+                backend.wait(timeout=5)
+        assert ai == {"component": "AI", "status": "Unavailable", "cause_codes": ["MEDIA_UNAVAILABLE"]}
+        assert backend.returncode == 0

@@ -39,8 +39,23 @@ class RecordsServer(uvicorn.Server):
 def watch_launcher(stop: Event) -> None:
     # The launcher owns the writing end. EOF also covers launcher process loss.
     try:
-        while os.read(sys.stdin.fileno(), 1):
-            pass
+        fd = sys.stdin.fileno()
+        if sys.platform == "win32":
+            import msvcrt
+            from _winapi import PeekNamedPipe
+
+            msvcrt.setmode(fd, os.O_BINARY)
+            pipe = msvcrt.get_osfhandle(fd)
+            # A blocking CRT stdin read can stall the spawned Python worker.
+            # Peek for input or EOF before reading from the launcher pipe.
+            while not stop.is_set():
+                if not PeekNamedPipe(pipe)[0]:
+                    stop.wait(0.05)
+                elif not os.read(fd, 1):
+                    break
+        else:
+            while os.read(fd, 1):
+                pass
     except OSError:
         pass
     finally:
