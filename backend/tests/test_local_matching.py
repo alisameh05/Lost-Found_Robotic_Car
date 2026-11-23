@@ -204,9 +204,12 @@ def test_matcher_fault_revokes_logical_output_and_records_ai_recovery(
                 arm(laf, current_headers)
 
 
-def test_emergency_is_independent_of_a_blocked_spawned_matcher(tmp_path: Path, spawned_matcher: Path) -> None:
-    with service(tmp_path, local_vision=True) as laf, driving_search(laf) as (headers, _):
-        arm(laf, headers)
+@pytest.mark.parametrize("mode", ["Gestures", "Controller"])
+def test_emergency_is_independent_of_a_blocked_spawned_matcher(
+    tmp_path: Path, spawned_matcher: Path, mode: str,
+) -> None:
+    with service(tmp_path, local_vision=True) as laf, driving_search(laf, mode) as (headers, _):
+        arm(laf, headers, mode)
         publish(spawned_matcher / "request", "stall")
         await_file(spawned_matcher / "frame.json")
         response = laf.http.post(API + "/emergency-stop", headers=headers, json={"request_id": str(uuid4())})
